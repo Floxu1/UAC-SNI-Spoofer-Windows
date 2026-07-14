@@ -1,0 +1,7 @@
+{
+  "LISTEN_HOST": "0.0.0.0",
+  "LISTEN_PORT": 40443,
+  "CONNECT_IP": "188.114.98.0",
+  "CONNECT_PORT": 443,
+  "FAKE_SNI": "auth.vercel.com"
+}
