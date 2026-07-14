@@ -17,6 +17,8 @@ The application manages carrier-specific routes, scans and ranks SNI and Edge pa
 
 The desktop profiles are tuned separately for **MCI / Hamrah Aval** and **IranCell**, so changing one carrier does not overwrite or break the other carrier's settings.
 
+<img width="1438" height="922" alt="image" src="https://github.com/user-attachments/assets/5f3f0300-d1b1-45f7-9868-9eb8f1e14f71" />
+
 ## Features
 
 - Separate MCI, IranCell, and Auto carrier modes
