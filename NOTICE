@@ -1,0 +1,16 @@
+UAC SNI Spoofer Windows
+
+Copyright (C) 2026 Floxu1
+
+This project includes credits and upstream references to the Patterniha group for the SNI-spoofing method.
+
+Powered by Patterniha
+
+This project is licensed under the GNU General Public License v3.0.
+See the LICENSE file for details.
+
+Third-party notices:
+- Patterniha SNI Spoofing upstream source and related license files should remain included under:
+  third_party/patterniha_sni_spoofing/
+
+Do not remove Patterniha credits from this project or derivative distributions.
