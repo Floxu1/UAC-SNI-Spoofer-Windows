@@ -56,7 +56,7 @@ UAC-Spoofer-Desktop-v1.0.0-Windows-x64.zip
 4. فایل زیر را اجرا کنید:
 
 ```text
-UAC-Spoofer-Desktop-v1.0.0-Source.exe
+UAC-Spoofer-Desktop.exe
 ```
 
 5. در صورت نمایش پیام UAC ویندوز، آن را تأیید کنید.
