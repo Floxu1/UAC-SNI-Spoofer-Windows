@@ -5,6 +5,9 @@
 [فارسی](./README.md) | **English**
 
 ---
+[کانال تلگرام](https://t.me/UacSniSpoofer): `t.me/UacSniSpoofer`
+
+---
 
 ## Overview
 
