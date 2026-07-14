@@ -150,3 +150,11 @@ The integrated upstream source and GPL-3.0 license are included under:
 ```text
 third_party/patterniha_sni_spoofing/
 ```
+---
+## License
+
+This project is released under the **GNU General Public License v3.0 (GPL-3.0)**.
+
+You may use, study, and modify the software, but if you distribute modified or derivative versions, you must comply with GPL-3.0, provide access to the source code, and keep the same license terms.
+
+The full license text is available in [LICENSE](LICENSE).
