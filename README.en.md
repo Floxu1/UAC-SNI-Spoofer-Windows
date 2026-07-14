@@ -48,7 +48,7 @@ How to run:
 1. Download the following file from GitHub Releases:
 
 ```text
-UAC-Spoofer-Desktop-v1.5.0-Windows-x64.zip
+UAC-Spoofer-Desktop-v1.0.0-Windows-x64.zip
 ```
 
 2. Extract the full ZIP archive.
