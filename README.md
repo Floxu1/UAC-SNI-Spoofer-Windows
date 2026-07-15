@@ -50,7 +50,7 @@
 مراحل اجرا:
 
 1. فایل زیر را از بخش GitHub Releases دانلود کنید:
-<a href="https://floxu1.github.io/UAC-SNI-Spoofer-Windows](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/download/1.0.0/UAC-Spoofer-Desktop-v1.0.0-Windows-x64.zip" target="_blank">
+<a href="https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/download/1.0.0/UAC-Spoofer-Desktop-v1.0.0-Windows-x64.zip" target="_blank">
 UAC-Spoofer-Desktop-Windows-x64.zip
 </a>
 
