@@ -92,55 +92,6 @@ python main.py
 
 برای نتیجه دقیق‌تر و پایدارتر، بهتر است اپراتور فعلی به‌صورت دستی انتخاب شود.
 
-## تنظیم بخش آپدیت برنامه
-
-پیش از انتشار پروژه روی GitHub، فایل زیر را بررسی کنید:
-
-```text
-uac_desktop/app_config.py
-```
-
-قسمت‌های مربوط به آپدیت:
-
-```text
-UPDATE_REPOSITORY_URL
-GITHUB_RELEASES_URL
-LATEST_VERSION_URL
-UPDATE_CHECK_ENDPOINT
-PORTABLE_DOWNLOAD_URL
-```
-
-شماره نسخه برنامه در فایل زیر قرار دارد:
-
-```text
-uac_desktop/__init__.py
-```
-
-متغیر نسخه:
-
-```text
-__version__
-```
-
-پس از انتشار پروژه در GitHub، یک Release ایجاد کنید؛ برای مثال:
-
-```text
-v1.5.0
-```
-
-سپس فایل ZIP نسخه Portable ویندوز را در همان Release آپلود کنید.
-
-بررسی نسخه جدید توسط فایل زیر انجام می‌شود:
-
-```text
-uac_desktop/update_checker.py
-```
-
-تابع مربوطه:
-
-```text
-check_latest_release()
-```
 
 ## تشکر و اعتبار
 
