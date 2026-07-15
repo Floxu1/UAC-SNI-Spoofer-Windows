@@ -8,6 +8,12 @@
 [کانال تلگرام](https://t.me/UacSniSpoofer): `t.me/UacSniSpoofer`
 
 ---
+<a href="https://floxu1.github.io/UAC-SNI-Spoofer-Windows/" 
+style="display:inline-block;padding:10px 20px;background:#24292f;color:white;text-decoration:none;border-radius:8px;"
+target="_blank">
+آموزش ساده و قدم به قدم راه اندازی و استفاده از نرم‌افزار UAC Sni spoofing نسخه ویندوز
+
+---
 ## معرفی برنامه
 
 نرم افزار UAC SNI Spoofer Windows یک داشبورد شبکه برای ویندوز است که با استفاده از Xray و متد SNI Spoofing گروه Patterniha کار می‌کنه.
