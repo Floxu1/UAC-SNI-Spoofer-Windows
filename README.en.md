@@ -93,55 +93,6 @@ The application includes multiple carrier modes:
 
 For the most stable and deterministic result, select your current carrier manually.
 
-## Update configuration
-
-Before publishing the project on GitHub, check this file:
-
-```text
-uac_desktop/app_config.py
-```
-
-Update-related fields:
-
-```text
-UPDATE_REPOSITORY_URL
-GITHUB_RELEASES_URL
-LATEST_VERSION_URL
-UPDATE_CHECK_ENDPOINT
-PORTABLE_DOWNLOAD_URL
-```
-
-The current app version is stored here:
-
-```text
-uac_desktop/__init__.py
-```
-
-Version variable:
-
-```text
-__version__
-```
-
-After publishing the project on GitHub, create a Release, for example:
-
-```text
-v1.5.0
-```
-
-Then upload the Windows x64 portable ZIP file to that Release.
-
-Runtime release parsing is handled by:
-
-```text
-uac_desktop/update_checker.py
-```
-
-Function:
-
-```text
-check_latest_release()
-```
 
 ## Credits
 
