@@ -68,8 +68,8 @@ def run_event_loop(app, window) -> int:
     try:
         return int(app.exec())
     finally:
-        
-        
+        # Qt may already have called shutdown via aboutToQuit.  Every operation
+        # remains idempotent and later steps still run if an earlier one fails.
         try:
             window.shutdown()
         except Exception:
@@ -82,7 +82,7 @@ def run_event_loop(app, window) -> int:
             WindowsProxy.recover_stale(expected_pid=int(owner["pid"]),
                                        expected_create_time=float(owner["create_time"]))
         except Exception:
-            
+            # The detached owner/token watchdog retries once this process exits.
             pass
 
 
@@ -90,18 +90,18 @@ def main() -> int:
     watchdog_result = proxy_watchdog_mode(sys.argv[1:])
     if watchdog_result is not None:
         return watchdog_result
-    
-    
-    
-    
+    # HKCU proxy restoration does not require elevation.  Recover before the
+    # UAC prompt so declining elevation cannot leave a crashed session's proxy
+    # active.  Owner checks protect a currently running app instance; the
+    # post-mutex recovery below remains as an idempotent elevated retry.
     try:
         WindowsProxy.recover_stale()
     except Exception:
         pass
     if relaunch_as_admin():
         return 0
-    
-    
+    # Keep the detached watchdog lightweight: Qt and the full UI are imported
+    # only for the actual foreground application path.
     from PySide6.QtGui import QFont, QFontDatabase, QIcon
     from PySide6.QtWidgets import QApplication
     from uac_desktop.paths import ASSETS

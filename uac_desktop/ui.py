@@ -14,12 +14,12 @@ import psutil
 import requests
 from PySide6.QtCore import (
     QObject, Qt, QTimer, Signal, QSize, QRectF, QPointF, QPoint, QPropertyAnimation,
-    QEasingCurve,
+    QEasingCurve, Property, QParallelAnimationGroup,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QPainter, QPen, QLinearGradient, QIntValidator,
+    QColor, QFont, QIcon, QPainter, QPen, QLinearGradient, QIntValidator,
     QRadialGradient, QPainterPath,
-    QTextCursor, QTextCharFormat,
+    QTextCursor, QTextCharFormat, QAction,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
@@ -27,7 +27,8 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
     QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
     QTabWidget, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QGraphicsDropShadowEffect,
-    QGraphicsOpacityEffect, QBoxLayout, QToolButton,
+    QGraphicsOpacityEffect, QBoxLayout, QStyle, QStyleOptionButton, QToolButton,
+    QSystemTrayIcon, QMenu,
 )
 
 from . import __version__
@@ -80,6 +81,8 @@ FA_EN = {
     "کانفیگی انتخاب نشده": "No config selected", "کانفیگی موجود نیست": "No config available",
     "آماده اتصال": "Ready to connect", "در حال تست مسیرها و کانفیگ‌ها": "Testing routes and profiles",
     "ترافیک واقعی اینترنت تایید شد": "Real internet traffic verified",
+    "در حال تست مسیر…": "Testing route…", "تست مسیر واقعی تونل": "Live tunnel test",
+    "تست سریع لبه": "Quick edge test",
 }
 EN_FA = {value: key for key, value in FA_EN.items()}
 
@@ -88,6 +91,7 @@ class Bridge(QObject):
     log = Signal(str)
     state = Signal(bool)
     traffic = Signal(int, int)
+    latency = Signal(float, str)
     scan_progress = Signal(int, int, object, int)
     scan_done = Signal(object, int)
     scan_failed = Signal(str, int)
@@ -137,6 +141,157 @@ def ltr_isolate(value: object) -> str:
     return f"\u2066{value}\u2069"
 
 
+class MotionFrame(QFrame):
+    """Glass panel with a GPU-light hover glow instead of an abrupt QSS jump."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._glow = 0.0
+        self._glow_animation = QPropertyAnimation(self, b"glowProgress", self)
+        self._glow_animation.setDuration(280)
+        self._glow_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def _get_glow(self):
+        return self._glow
+
+    def _set_glow(self, value):
+        self._glow = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    glowProgress = Property(float, _get_glow, _set_glow)
+
+    def _animate_glow(self, target):
+        if not _animations_enabled():
+            self._set_glow(target)
+            return
+        self._glow_animation.stop()
+        self._glow_animation.setStartValue(self._glow)
+        self._glow_animation.setEndValue(float(target))
+        self._glow_animation.start()
+
+    def enterEvent(self, event):
+        self._animate_glow(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_glow(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._glow <= .001:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        radius = max(90.0, self.width() * .42)
+        anchor_x = self.width() * (.82 if self.layoutDirection() == Qt.LeftToRight else .18)
+        glow = QRadialGradient(QPointF(anchor_x, self.height() * .08), radius)
+        glow.setColorAt(0, QColor(74, 255, 235, int(27 * self._glow)))
+        glow.setColorAt(.46, QColor(44, 199, 255, int(11 * self._glow)))
+        glow.setColorAt(1, QColor(44, 199, 255, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(glow)
+        painter.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 2), 18, 18)
+        edge = QColor(111, 255, 242, int(52 * self._glow))
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(edge, 1.0))
+        painter.drawRoundedRect(QRectF(1.5, 1.5, self.width() - 3, self.height() - 3), 18, 18)
+
+
+class GlowButton(QPushButton):
+    """Standard push button with a soft, animated light sweep on hover."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._hover = 0.0
+        self._hover_animation = QPropertyAnimation(self, b"hoverProgress", self)
+        self._hover_animation.setDuration(230)
+        self._hover_animation.setEasingCurve(QEasingCurve.OutCubic)
+        self.setAttribute(Qt.WA_Hover, True)
+
+    def _get_hover(self):
+        return self._hover
+
+    def _set_hover(self, value):
+        self._hover = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    hoverProgress = Property(float, _get_hover, _set_hover)
+
+    def _animate_hover(self, target):
+        if not _animations_enabled():
+            self._set_hover(target)
+            return
+        self._hover_animation.stop()
+        self._hover_animation.setStartValue(self._hover)
+        self._hover_animation.setEndValue(float(target))
+        self._hover_animation.start()
+
+    def enterEvent(self, event):
+        self._animate_hover(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate_hover(0.0)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._hover <= .001 or not self.isEnabled():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        sweep_x = (-.18 + self._hover * 1.36) * self.width()
+        sweep = QLinearGradient(sweep_x - 45, 0, sweep_x + 45, self.height())
+        sweep.setColorAt(0, QColor(255, 255, 255, 0))
+        sweep.setColorAt(.5, QColor(220, 255, 252, int(22 * self._hover)))
+        sweep.setColorAt(1, QColor(255, 255, 255, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(sweep)
+        painter.drawRoundedRect(QRectF(1, 1, self.width() - 2, self.height() - 2), 11, 11)
+
+
+class LuminousPageHeader(MotionFrame):
+    """Readable page title surface with a restrained animated signal trace."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("pageHeader")
+        self.setMinimumHeight(112)
+        self._phase = 0.0
+        self._signal_timer = QTimer(self)
+        self._signal_timer.timeout.connect(self._tick_signal)
+        if _animations_enabled():
+            self._signal_timer.start(34)
+
+    def _tick_signal(self):
+        if self.isVisible():
+            self._phase = (self._phase + .0065) % 1.0
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        y = self.height() - 2.0
+        base = QLinearGradient(20, y, self.width() - 20, y)
+        base.setColorAt(0, QColor(35, 245, 224, 0))
+        base.setColorAt(.18, QColor(35, 245, 224, 78))
+        base.setColorAt(.62, QColor(44, 199, 255, 30))
+        base.setColorAt(1, QColor(124, 60, 255, 0))
+        painter.setPen(QPen(base, 1.2, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(20, y), QPointF(self.width() - 20, y))
+        if MOTION_ENABLED:
+            center = 20 + self._phase * max(1, self.width() - 40)
+            signal = QLinearGradient(center - 74, y, center + 74, y)
+            signal.setColorAt(0, QColor(35, 245, 224, 0))
+            signal.setColorAt(.5, QColor(191, 255, 249, 225))
+            signal.setColorAt(1, QColor(44, 199, 255, 0))
+            painter.setPen(QPen(signal, 2.2, Qt.SolidLine, Qt.RoundCap))
+            painter.drawLine(QPointF(max(20, center - 74), y), QPointF(min(self.width() - 20, center + 74), y))
+
+
 class HelpDot(QToolButton):
     """Keyboard-accessible question mark with a localized hover guide."""
 
@@ -163,9 +318,9 @@ class CyberRoot(QWidget):
         self._phase = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        
-        
-        
+        # Keep the full-window grid static. Repainting the entire translucent
+        # widget tree on a timer causes flicker on some Windows GPU drivers;
+        # localized hero/status animations remain active and inexpensive.
 
     def _tick(self):
         self._phase = (self._phase + 0.45) % 48
@@ -196,7 +351,7 @@ class CyberRoot(QWidget):
             painter.drawLine(0, y, width, y)
 
 
-class HeroCard(QFrame):
+class HeroCard(MotionFrame):
     """Cinematic hero surface with a restrained data wave and dot field."""
 
     def __init__(self, parent=None):
@@ -207,10 +362,10 @@ class HeroCard(QFrame):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         if _animations_enabled():
-            self._timer.start(80)
+            self._timer.start(32)
 
     def _tick(self):
-        self._phase = (self._phase + .045) % (math.pi * 2)
+        self._phase = (self._phase + .018) % (math.pi * 2)
         self.update()
 
     def paintEvent(self, event):
@@ -224,6 +379,17 @@ class HeroCard(QFrame):
         glow.setColorAt(.48, QColor(44, 199, 255, 9))
         glow.setColorAt(1, QColor(5, 11, 24, 0))
         painter.fillRect(self.rect(), glow)
+
+        # A slow optical beam adds depth without repainting the full window.
+        beam_x = width * (.12 + (.5 + .5 * math.sin(self._phase * .72)) * .76)
+        beam = QLinearGradient(beam_x - 92, 0, beam_x + 92, height)
+        beam.setColorAt(0, QColor(44, 199, 255, 0))
+        beam.setColorAt(.48, QColor(105, 250, 239, 10))
+        beam.setColorAt(.52, QColor(198, 255, 249, 23))
+        beam.setColorAt(1, QColor(44, 199, 255, 0))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(beam)
+        painter.drawRoundedRect(QRectF(1, 1, width - 2, height - 2), 26, 26)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(44, 199, 255, 24))
@@ -256,17 +422,34 @@ class NavButton(QPushButton):
         self.setAttribute(Qt.WA_Hover, True)
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.isChecked():
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        trailing_x = 18 if self.layoutDirection() == Qt.RightToLeft else self.width() - 18
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(35, 245, 224, 45))
-        painter.drawEllipse(QPointF(trailing_x, self.height() / 2), 8, 8)
-        painter.setBrush(QColor("#23f5e0"))
-        painter.drawEllipse(QPointF(trailing_x, self.height() / 2), 4, 4)
+        if self.layoutDirection() == Qt.RightToLeft:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.Antialiasing)
+            option = QStyleOptionButton()
+            self.initStyleOption(option)
+            option.text = ""
+            option.icon = QIcon()
+            self.style().drawControl(QStyle.CE_PushButton, option, painter, self)
+            icon_size = self.iconSize()
+            icon_x = self.width() - 16 - icon_size.width()
+            icon_y = (self.height() - icon_size.height()) // 2
+            text_rect = QRectF(34, 0, max(0, icon_x - 8 - 34), self.height())
+            painter.setPen(option.palette.buttonText().color())
+            painter.setFont(self.font())
+            painter.drawText(text_rect, Qt.AlignRight | Qt.AlignAbsolute | Qt.AlignVCenter | Qt.TextSingleLine, self.text())
+            self.icon().paint(painter, icon_x, icon_y, icon_size.width(), icon_size.height())
+        else:
+            super().paintEvent(event)
+        if self.isChecked():
+            if self.layoutDirection() != Qt.RightToLeft:
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.Antialiasing)
+            trailing_x = 10 if self.layoutDirection() == Qt.LayoutDirection.RightToLeft else self.width() - 18
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(35, 245, 224, 45))
+            painter.drawEllipse(QPointF(trailing_x, self.height() / 2), 8, 8)
+            painter.setBrush(QColor("#23f5e0"))
+            painter.drawEllipse(QPointF(trailing_x, self.height() / 2), 4, 4)
 
 
 class ToggleSwitch(QCheckBox):
@@ -278,6 +461,30 @@ class ToggleSwitch(QCheckBox):
         self.setFixedSize(48, 26)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
+        self._thumb_position = 0.0
+        self._thumb_animation = QPropertyAnimation(self, b"thumbPosition", self)
+        self._thumb_animation.setDuration(260)
+        self._thumb_animation.setEasingCurve(QEasingCurve.OutBack)
+        self.toggled.connect(self._animate_thumb)
+
+    def _get_thumb_position(self):
+        return self._thumb_position
+
+    def _set_thumb_position(self, value):
+        self._thumb_position = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    thumbPosition = Property(float, _get_thumb_position, _set_thumb_position)
+
+    def _animate_thumb(self, checked):
+        target = 1.0 if checked else 0.0
+        if not _animations_enabled() or not self.isVisible():
+            self._set_thumb_position(target)
+            return
+        self._thumb_animation.stop()
+        self._thumb_animation.setStartValue(self._thumb_position)
+        self._thumb_animation.setEndValue(target)
+        self._thumb_animation.start()
 
     def sizeHint(self):
         return QSize(48, 26)
@@ -297,12 +504,16 @@ class ToggleSwitch(QCheckBox):
         painter.setPen(QPen(QColor("#41e8df" if checked else "#34506f"), 1))
         painter.setBrush(track)
         painter.drawRoundedRect(QRectF(1, 2, 46, 22), 11, 11)
-        thumb_x = 35 if checked else 13
+        position = self._thumb_position
+        if abs(position - float(checked)) > .001 and not self._thumb_animation.state():
+            position = float(checked)
+        thumb_x = 13 + 22 * position
         if self.layoutDirection() == Qt.RightToLeft:
-            thumb_x = 13 if checked else 35
+            thumb_x = 35 - 22 * position
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(35, 245, 224, 35) if checked else QColor(0, 0, 0, 0))
-        painter.drawEllipse(QPointF(thumb_x, 13), 10, 10)
+        glow_alpha = int(10 + 38 * position) if checked or position > .01 else 0
+        painter.setBrush(QColor(35, 245, 224, glow_alpha))
+        painter.drawEllipse(QPointF(thumb_x, 13), 10 + position, 10 + position)
         painter.setBrush(QColor("#eaffff" if checked else "#8da3bd"))
         painter.drawEllipse(QPointF(thumb_x, 13), 7, 7)
         if self.hasFocus():
@@ -331,10 +542,10 @@ class PulseDot(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         if _animations_enabled():
-            self._timer.start(70)
+            self._timer.start(40)
 
     def _tick(self):
-        self._phase = (self._phase + .14) % (math.pi * 2)
+        self._phase = (self._phase + .08) % (math.pi * 2)
         self.update()
 
     def set_state(self, state):
@@ -399,7 +610,7 @@ class ActivityIndicator(QWidget):
         self._phase = 0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        if _animations_enabled(): self._timer.start(75)
+        if _animations_enabled(): self._timer.start(48)
 
     def _tick(self):
         if self.busy and MOTION_ENABLED:
@@ -550,7 +761,7 @@ class MiniSparkline(QWidget):
         painter.drawPath(path)
 
 
-class MetricCard(QFrame):
+class MetricCard(MotionFrame):
     def __init__(self, title, icon_name, value_widget=None, parent=None):
         super().__init__(parent)
         self.setObjectName("metricCard")
@@ -722,16 +933,46 @@ def badge(text, kind="neutral"):
 
 
 class ConnectionOrb(QWidget):
+    COLORS = {
+        "disconnected": QColor("#5f7fa6"),
+        "connecting": QColor("#ffd166"),
+        "connected": QColor("#23f5e0"),
+        "error": QColor("#ff5c7c"),
+    }
+
     def __init__(self):
         super().__init__()
         self.state = "disconnected"
         self._phase = 0.0
+        self._transition = 1.0
+        self._from_color = QColor(self.COLORS["disconnected"])
+        self._color_animation = QPropertyAnimation(self, b"transitionProgress", self)
+        self._color_animation.setDuration(480)
+        self._color_animation.setEasingCurve(QEasingCurve.InOutCubic)
         self.setFixedSize(224, 224)
         self.setAccessibleName("Connection security core")
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         if _animations_enabled():
-            self._timer.start(42)
+            self._timer.start(20)
+
+    def _get_transition(self):
+        return self._transition
+
+    def _set_transition(self, value):
+        self._transition = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    transitionProgress = Property(float, _get_transition, _set_transition)
+
+    def _current_color(self):
+        target = self.COLORS.get(self.state, self.COLORS["disconnected"])
+        mix = self._transition
+        return QColor(
+            round(self._from_color.red() + (target.red() - self._from_color.red()) * mix),
+            round(self._from_color.green() + (target.green() - self._from_color.green()) * mix),
+            round(self._from_color.blue() + (target.blue() - self._from_color.blue()) * mix),
+        )
 
     @property
     def connected(self):
@@ -742,11 +983,26 @@ class ConnectionOrb(QWidget):
         self.set_state("connected" if value else "disconnected")
 
     def set_state(self, state):
+        if state == self.state:
+            self.update()
+            return
+        self._from_color = self._current_color()
         self.state = state
-        self.update()
+        if not _animations_enabled():
+            self._set_transition(1.0)
+            return
+        self._color_animation.stop()
+        self._color_animation.setStartValue(0.0)
+        self._color_animation.setEndValue(1.0)
+        self._color_animation.start()
 
     def _tick(self):
-        speed = .08 if self.state == "connecting" else .025 if self.state == "connected" else .012
+        speed = {
+            "connecting": .047,
+            "connected": .014,
+            "disconnected": .0065,
+            "error": .009,
+        }.get(self.state, .0065)
         self._phase = (self._phase + speed) % (math.pi * 2)
         self.update()
 
@@ -754,20 +1010,20 @@ class ConnectionOrb(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         center = QPointF(self.width() / 2, self.height() / 2)
-        colors = {
-            "disconnected": QColor("#5f7fa6"),
-            "connecting": QColor("#ffd166"),
-            "connected": QColor("#23f5e0"),
-            "error": QColor("#ff5c7c"),
-        }
-        color = QColor(colors.get(self.state, colors["disconnected"]))
-        pulse = .5 + .5 * math.sin(self._phase * 2.2)
+        color = self._current_color()
+        pulse = .5 + .5 * math.sin(self._phase * 1.72) if MOTION_ENABLED else .55
 
         aura = QRadialGradient(center, 108)
         aura.setColorAt(0, QColor(color.red(), color.green(), color.blue(), 35 + int(pulse * 16)))
         aura.setColorAt(.52, QColor(color.red(), color.green(), color.blue(), 10))
         aura.setColorAt(1, QColor(color.red(), color.green(), color.blue(), 0))
         p.setPen(Qt.NoPen); p.setBrush(aura); p.drawEllipse(center, 108, 108)
+
+        core_glow = QRadialGradient(center, 64)
+        core_glow.setColorAt(0, QColor(225, 255, 252, 12 + int(pulse * 13)))
+        core_glow.setColorAt(.6, QColor(color.red(), color.green(), color.blue(), 16))
+        core_glow.setColorAt(1, QColor(5, 18, 35, 0))
+        p.setPen(Qt.NoPen); p.setBrush(core_glow); p.drawEllipse(center, 65, 65)
 
         for radius, alpha, width in ((103, 30, 1), (94, 55, 1.2), (80, 110, 1.7), (67, 62, 1)):
             ring = QColor(color); ring.setAlpha(alpha)
@@ -777,6 +1033,9 @@ class ConnectionOrb(QWidget):
         p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 205), 2.0, Qt.SolidLine, Qt.RoundCap))
         p.drawArc(QRectF(center.x() - 94, center.y() - 94, 188, 188), int((24 + rotation) * 16), 74 * 16)
         p.drawArc(QRectF(center.x() - 80, center.y() - 80, 160, 160), int((202 - rotation * .7) * 16), 66 * 16)
+        p.setPen(QPen(QColor(color.red(), color.green(), color.blue(), 92), 1.0, Qt.DashLine, Qt.RoundCap))
+        p.drawArc(QRectF(center.x() - 103, center.y() - 103, 206, 206), int((126 - rotation * .34) * 16), 132 * 16)
+        p.drawArc(QRectF(center.x() - 68, center.y() - 68, 136, 136), int((38 + rotation * .52) * 16), 94 * 16)
         if self.state == "connecting":
             p.setPen(QPen(QColor(255, 209, 102, 220), 3, Qt.SolidLine, Qt.RoundCap))
             p.drawArc(QRectF(center.x() - 70, center.y() - 70, 140, 140), int(rotation * 2.2 * 16), 44 * 16)
@@ -787,6 +1046,13 @@ class ConnectionOrb(QWidget):
             point = QPointF(center.x() + math.cos(angle) * radius, center.y() + math.sin(angle) * radius)
             dot = QColor(color); dot.setAlpha(120 + (index % 2) * 75)
             p.setBrush(dot); p.drawEllipse(point, 1.8 + (index % 2), 1.8 + (index % 2))
+
+            # Short fading packet trail makes the orbital motion easy to read.
+            for trail_index in range(1, 4):
+                trail_angle = angle - trail_index * (.035 + index * .003)
+                trail_point = QPointF(center.x() + math.cos(trail_angle) * radius, center.y() + math.sin(trail_angle) * radius)
+                trail = QColor(color); trail.setAlpha(max(12, 70 - trail_index * 18))
+                p.setBrush(trail); p.drawEllipse(trail_point, 1.2, 1.2)
 
         shield = QPainterPath()
         shield.moveTo(center.x(), center.y() - 54)
@@ -961,10 +1227,10 @@ class TuningDialog(QDialog):
             self.t("برای ایرانسل، Mux با ۴ تا ۸ جریان معمولاً شروع چند اتصال هم‌زمان مرورگر را سبک‌تر می‌کند.", "Mux with 4–8 streams usually reduces the initial Chrome connection burst.")))
 
         self.core_preset = QComboBox(); self.core_preset.addItems(["maximum", "streaming", "upload", "balanced", "low_latency", "compatibility"]); self.core_preset.setCurrentText(tuning.pattern_quality_preset if tuning.pattern_quality_preset in [self.core_preset.itemText(i) for i in range(self.core_preset.count())] else "balanced")
-        self.connect_ip = QLineEdit(tuning.pattern_connect_ip); self.connect_ip.setProperty("technical", True); self.connect_ip.setPlaceholderText("188.114.98.0")
+        self.connect_ip = QLineEdit(tuning.pattern_connect_ip); self.connect_ip.setProperty("technical", True); self.connect_ip.setPlaceholderText("104.18.32.47")
         self.fallback_ips = QLineEdit(tuning.pattern_fallback_ips); self.fallback_ips.setProperty("technical", True); self.fallback_ips.setPlaceholderText("188.114.99.0,104.18.8.83")
         self.profile_edges = QCheckBox(self.t("اولویت با IPهای داخل پروفایل", "Prefer IPs stored in each profile")); self.profile_edges.setChecked(tuning.pattern_use_profile_edges)
-        self.fake_sni = QLineEdit(tuning.pattern_fake_sni); self.fake_sni.setProperty("technical", True); self.fake_sni.setPlaceholderText("auth.vercel.com")
+        self.fake_sni = QLineEdit(tuning.pattern_fake_sni); self.fake_sni.setProperty("technical", True); self.fake_sni.setPlaceholderText("chatgpt.com")
         body_layout.addWidget(self._section(
             self.t(f"هسته {ltr_isolate('Patterniha')}", "Patterniha core"),
             self.t(f"تزریق {ltr_isolate('Wrong-Sequence')}؛ داده‌ی فایل در مسیر سریع Kernel باقی می‌ماند.", "Wrong-sequence injection while file payload stays in the kernel fast path."),
@@ -1066,7 +1332,7 @@ class TuningDialog(QDialog):
 
     def _apply_preset(self, mode):
         if self._loading_tuning or mode == "custom": return
-        
+        # Speed presets must not overwrite the user's proven carrier/edge/SNI.
         route = (self.carrier.currentText(), self.connect_ip.text(), self.fallback_ips.text(),
                  self.profile_edges.isChecked(), self.fake_sni.text())
         candidate = Tuning.preset(mode)
@@ -1153,6 +1419,11 @@ class MainWindow(QMainWindow):
         self._scan_generation = 0; self._scan_cancel_event = threading.Event(); self._scan_results_by_domain: dict[str, ScanResult] = {}; self._scan_context = {}
         self._update_generation = 0; self._update_in_progress = False; self._latest_update: UpdateInfo | None = None
         self._closing = False
+        self._force_quit = False
+        self._tray = None
+        self._tray_hint_shown = False
+        self.tray_show_action = None
+        self.tray_quit_action = None
         self._connect_generation = 0
         self._connect_cancel = threading.Event()
         self._connect_thread: threading.Thread | None = None
@@ -1161,6 +1432,7 @@ class MainWindow(QMainWindow):
         self._bypass_apply_timer.setInterval(550)
         self._bypass_apply_timer.timeout.connect(self._apply_bypass_changes)
         self._page_animation = None
+        self._animated_page = None
         self._entrance_done = False
         self._log_paused_lines: list[str] = []
         self._all_log_lines: list[str] = []
@@ -1170,7 +1442,7 @@ class MainWindow(QMainWindow):
         self._metrics_compact = None
         self._controls_compact = None
         self.engine = Engine(self.bridge.log.emit, self.bridge.state.emit, self.bridge.traffic.emit)
-        self._build(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
+        self._build(); self._setup_tray(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
         self.activity_bar.set_activity("", "idle", False)
         QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
 
@@ -1181,7 +1453,7 @@ class MainWindow(QMainWindow):
         return widget
 
     def _action_button(self, persian, english, icon_name, object_name="secondaryAction"):
-        button = QPushButton()
+        button = GlowButton()
         button.setObjectName(object_name)
         button.setIcon(cyber_icon(icon_name, "#bfefff", 18))
         button.setIconSize(QSize(18, 18))
@@ -1190,15 +1462,32 @@ class MainWindow(QMainWindow):
         return button
 
     def _page_header(self, persian_title, english_title, persian_subtitle, english_subtitle, trailing=None):
-        header = QFrame(); header.setObjectName("pageHeader")
-        layout = QHBoxLayout(header); layout.setContentsMargins(0, 0, 0, 8); layout.setSpacing(18)
-        copy = QVBoxLayout(); copy.setSpacing(5)
+        header_meta = {
+            "Connection Center": ("shield", "فرماندهی شبکه", "NETWORK COMMAND"),
+            "Configs": ("file-cog", "مدیریت مسیرها", "ROUTE LIBRARY"),
+            "SNI Lab": ("flask", "آزمایش و رتبه‌بندی", "SIGNAL LABORATORY"),
+            "Live Logs": ("activity", "رویدادهای زنده", "LIVE TELEMETRY"),
+            "App Bypass": ("route", "مسیریابی برنامه‌ها", "APPLICATION ROUTING"),
+            "Network Tools": ("wrench", "ابزارهای تشخیص", "DIAGNOSTIC TOOLKIT"),
+            "Support & Updates": ("headphones", "مرکز راهنما", "SUPPORT CENTER"),
+        }
+        icon_name, persian_kicker, english_kicker = header_meta.get(
+            english_title, ("shield", "رابط دسکتاپ", "FLOXU DESKTOP")
+        )
+        header = LuminousPageHeader()
+        layout = QHBoxLayout(header); layout.setContentsMargins(19, 14, 19, 15); layout.setSpacing(16)
+        icon = QLabel(); icon.setObjectName("pageHeaderIcon"); icon.setFixedSize(54, 54)
+        icon.setAlignment(Qt.AlignCenter); icon.setPixmap(cyber_pixmap(icon_name, "#8efff4", 27))
+        layout.addWidget(icon, 0, Qt.AlignVCenter)
+        copy = QVBoxLayout(); copy.setSpacing(3)
+        kicker = self._bind_text(QLabel(), persian_kicker, english_kicker); kicker.setObjectName("pageEyebrow")
         title = self._bind_text(QLabel(), persian_title, english_title); title.setObjectName("pageTitle")
         subtitle = self._bind_text(QLabel(), persian_subtitle, english_subtitle); subtitle.setObjectName("pageSubtitle"); subtitle.setWordWrap(True)
-        copy.addWidget(title); copy.addWidget(subtitle)
+        subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        copy.addWidget(kicker); copy.addWidget(title); copy.addWidget(subtitle)
         layout.addLayout(copy, 1)
         if trailing is not None:
-            layout.addWidget(trailing, 0, Qt.AlignTop)
+            layout.addWidget(trailing, 0, Qt.AlignVCenter)
         return header
 
     def _scroll_page(self):
@@ -1262,7 +1551,7 @@ class MainWindow(QMainWindow):
         self.status = QLabel(f"{ltr_isolate('VPN')} خاموش است"); self.status.setObjectName("heroStatus"); self.status.setWordWrap(True); self.status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); hero_copy.addWidget(self.status)
         self.connection_hint = QLabel("آماده اتصال"); self.connection_hint.setObjectName("heroHint"); self.connection_hint.setWordWrap(True); self.connection_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); hero_copy.addWidget(self.connection_hint)
         hero_copy.addStretch()
-        self.connect_button = QPushButton("اتصال"); self.connect_button.setObjectName("connectButton"); self.connect_button.setProperty("state", "idle"); self.connect_button.setIcon(cyber_icon("play", "#031422", 21)); self.connect_button.setIconSize(QSize(21, 21)); self.connect_button.setMinimumSize(216, 60); self.connect_button.setMaximumWidth(260); self.connect_button.setCursor(Qt.PointingHandCursor); hero_copy.addWidget(self.connect_button)
+        self.connect_button = GlowButton("اتصال"); self.connect_button.setObjectName("connectButton"); self.connect_button.setProperty("state", "idle"); self.connect_button.setIcon(cyber_icon("play", "#031422", 21)); self.connect_button.setIconSize(QSize(21, 21)); self.connect_button.setMinimumSize(216, 60); self.connect_button.setMaximumWidth(260); self.connect_button.setCursor(Qt.PointingHandCursor); hero_copy.addWidget(self.connect_button)
         hero_layout.addLayout(hero_copy, 3)
         orb_shell = QFrame(); self.orb_shell = orb_shell; orb_shell.setObjectName("orbShell"); orb_shell.setMinimumWidth(284); orb_layout = QVBoxLayout(orb_shell); orb_layout.setContentsMargins(18, 8, 18, 10); orb_layout.setSpacing(2)
         self.orb = ConnectionOrb(); orb_caption = QLabel("NETWORK CORE"); orb_caption.setObjectName("orbCaption"); orb_caption.setAlignment(Qt.AlignCenter); orb_layout.addWidget(self.orb, alignment=Qt.AlignCenter); orb_layout.addWidget(orb_caption)
@@ -1284,6 +1573,7 @@ class MainWindow(QMainWindow):
         controls = QFrame(); controls.setObjectName("quickControls"); self.controls_layout = QGridLayout(controls); self.controls_layout.setContentsMargins(16, 12, 16, 12); self.controls_layout.setHorizontalSpacing(12); self.controls_layout.setVerticalSpacing(10)
         self.auto_mode = ToggleSwitch(); self.auto_mode.setChecked(self.storage.settings.get("auto_mode", True)); self.auto_option = self._toggle_option(self.auto_mode, "حالت خودکار", "Auto Mode")
         self.pick_best = ToggleSwitch(); self.pick_best.setChecked(self.storage.settings.get("pick_best", False)); self.manual_option = self._toggle_option(self.pick_best, "انتخاب بهترین کانفیگ دستی", "Pick Best Manual Config")
+        self.close_to_tray = ToggleSwitch(); self.close_to_tray.setChecked(self.storage.settings.get("close_to_tray", False)); self.tray_option = self._toggle_option(self.close_to_tray, "بستن در System Tray", "Close to Tray")
         self.carrier = QComboBox(); self.carrier.addItems(["auto", "mci", "irancell"]); self.carrier.setCurrentText(self.storage.tuning.carrier_mode); self.carrier.setMinimumWidth(142); self.carrier.setAccessibleName("Carrier")
         self.carrier_control = QFrame(); self.carrier_control.setObjectName("carrierControl"); carrier_layout = QHBoxLayout(self.carrier_control); carrier_layout.setContentsMargins(10, 7, 10, 7); carrier_layout.setSpacing(9); self.carrier_label = self._bind_text(QLabel(), "اپراتور", "Carrier"); self.carrier_label.setObjectName("controlLabel"); carrier_layout.addWidget(self.carrier_label); carrier_layout.addWidget(self.carrier)
         self.tune_button = self._action_button("تنظیمات پیشرفته", "Advanced Settings", "settings", "advancedButton"); self.tune_button.setProperty("chevron", True); self.tune_button.setIconSize(QSize(19, 19)); self.tune_button.clicked.connect(self.open_tuning)
@@ -1330,17 +1620,21 @@ class MainWindow(QMainWindow):
         self._controls_compact = compact
         while self.controls_layout.count():
             self.controls_layout.takeAt(0)
+        for column in range(6):
+            self.controls_layout.setColumnStretch(column, 0)
         if compact:
             self.controls_layout.addWidget(self.auto_option, 0, 0)
             self.controls_layout.addWidget(self.manual_option, 0, 1)
-            self.controls_layout.addWidget(self.carrier_control, 1, 0)
-            self.controls_layout.addWidget(self.tune_button, 1, 1)
+            self.controls_layout.addWidget(self.tray_option, 1, 0)
+            self.controls_layout.addWidget(self.carrier_control, 1, 1)
+            self.controls_layout.addWidget(self.tune_button, 2, 0, 1, 2)
         else:
             self.controls_layout.addWidget(self.auto_option, 0, 0)
             self.controls_layout.addWidget(self.manual_option, 0, 1)
-            self.controls_layout.addWidget(self.carrier_control, 0, 2)
-            self.controls_layout.setColumnStretch(3, 1)
-            self.controls_layout.addWidget(self.tune_button, 0, 4)
+            self.controls_layout.addWidget(self.tray_option, 0, 2)
+            self.controls_layout.addWidget(self.carrier_control, 0, 3)
+            self.controls_layout.setColumnStretch(4, 1)
+            self.controls_layout.addWidget(self.tune_button, 0, 5)
 
     def _configs_page(self):
         page = QWidget(); root = QVBoxLayout(page); root.setContentsMargins(34, 28, 34, 26); root.setSpacing(15)
@@ -1461,9 +1755,9 @@ class MainWindow(QMainWindow):
             ("terminal", "باز کردن فایل لاگ", "Open Log File", "مشاهده فایل لاگ دائمی", "Open the persistent diagnostic log", self._open_log_file, LOG_FILE.exists()),
         ]
         for index, (icon_name, fa_title, en_title, fa_desc, en_desc, action, available) in enumerate(tool_specs):
-            box = QFrame(); box.setObjectName("toolCard"); l = QVBoxLayout(box); l.setContentsMargins(18, 18, 18, 17); l.setSpacing(10)
+            box = MotionFrame(); box.setObjectName("toolCard"); l = QVBoxLayout(box); l.setContentsMargins(18, 18, 18, 17); l.setSpacing(10)
             top = QHBoxLayout(); icon_label = QLabel(); icon_label.setObjectName("toolIcon"); icon_label.setFixedSize(42, 42); icon_label.setPixmap(cyber_pixmap(icon_name, "#23f5e0", 23)); status = QLabel(); self._bind_text(status, "آماده" if available else "در دسترس نیست", "Ready" if available else "Unavailable"); status.setObjectName("toolStatus"); status.setProperty("available", available); top.addWidget(icon_label); top.addStretch(); top.addWidget(status); l.addLayout(top)
-            title = self._bind_text(QLabel(), fa_title, en_title); title.setObjectName("toolTitle"); desc = self._bind_text(QLabel(), fa_desc, en_desc); desc.setObjectName("toolDescription"); desc.setWordWrap(True); l.addWidget(title); l.addWidget(desc); l.addStretch()
+            title = self._bind_text(QLabel(), fa_title, en_title); title.setObjectName("toolTitle"); desc = self._bind_text(QLabel(), fa_desc, en_desc); desc.setObjectName("toolDescription"); desc.setWordWrap(True); desc.setTextInteractionFlags(Qt.TextSelectableByMouse); l.addWidget(title); l.addWidget(desc); l.addStretch()
             button = self._action_button("اجرا", "Run", "play", "toolAction"); button.setEnabled(available); button.clicked.connect(action); l.addWidget(button)
             self.tool_cards.append(box)
         self._layout_tool_cards(self.width() < 1180)
@@ -1479,12 +1773,12 @@ class MainWindow(QMainWindow):
     def _support_page(self):
         page, body = self._scroll_page(); root = QVBoxLayout(body); root.setContentsMargins(34, 28, 34, 26); root.setSpacing(16)
         root.addWidget(self._page_header("پشتیبانی و بروزرسانی", "Support & Updates", "UAC Spoofer Desktop — سازگار با کانفیگ‌های نسخه موبایل", "Help, project resources and trusted support channels"))
-        hero = QFrame(); hero.setObjectName("supportHero"); hero_layout = QHBoxLayout(hero); hero_layout.setContentsMargins(24, 22, 24, 22); hero_layout.setSpacing(20)
+        hero = MotionFrame(); hero.setObjectName("supportHero"); hero_layout = QHBoxLayout(hero); hero_layout.setContentsMargins(24, 22, 24, 22); hero_layout.setSpacing(20)
         icon_box = QLabel(); icon_box.setObjectName("supportIcon"); icon_box.setFixedSize(72, 72); icon_box.setPixmap(cyber_pixmap("shield", "#23f5e0", 38)); hero_layout.addWidget(icon_box)
-        copy_box = QVBoxLayout(); support_title = self._bind_text(QLabel(), "پشتیبانی رسمی UAC Spoofer", "Official UAC Spoofer Support"); support_title.setObjectName("supportTitle"); support_desc = self._bind_text(QLabel(), "برای خبرهای نسخه، راهنما و ارتباط با جامعه از کانال‌های رسمی استفاده کنید.", "Use the official channels for release news, help and community updates."); support_desc.setObjectName("supportDescription"); support_desc.setWordWrap(True); copy_box.addWidget(support_title); copy_box.addWidget(support_desc); hero_layout.addLayout(copy_box, 1)
+        copy_box = QVBoxLayout(); support_title = self._bind_text(QLabel(), "پشتیبانی رسمی UAC Spoofer", "Official UAC Spoofer Support"); support_title.setObjectName("supportTitle"); support_desc = self._bind_text(QLabel(), "برای خبرهای نسخه، راهنما و ارتباط با جامعه از کانال‌های رسمی استفاده کنید.", "Use the official channels for release news, help and community updates."); support_desc.setObjectName("supportDescription"); support_desc.setWordWrap(True); support_desc.setTextInteractionFlags(Qt.TextSelectableByMouse); copy_box.addWidget(support_title); copy_box.addWidget(support_desc); hero_layout.addLayout(copy_box, 1)
         actions = QVBoxLayout(); github = self._action_button("پروژه GitHub", "GitHub Project", "external-link", "primaryAction"); github.clicked.connect(lambda: webbrowser.open(self.storage.settings.get("update_repo_url", DEFAULT_UPDATE_REPO_URL))); telegram = self._action_button("کانال تلگرام", "Telegram Channel", "external-link", "secondaryAction"); telegram.clicked.connect(lambda: webbrowser.open("https://t.me/UacSniSpoofer")); actions.addWidget(github); actions.addWidget(telegram); hero_layout.addLayout(actions); root.addWidget(hero)
 
-        self.update_card = QFrame(); self.update_card.setObjectName("updateCard"); self.update_card.setProperty("state", "idle")
+        self.update_card = MotionFrame(); self.update_card.setObjectName("updateCard"); self.update_card.setProperty("state", "idle")
         update_layout = QHBoxLayout(self.update_card); update_layout.setContentsMargins(20, 17, 20, 17); update_layout.setSpacing(16)
         update_icon = QLabel(); update_icon.setObjectName("updateIcon"); update_icon.setFixedSize(48, 48); update_icon.setPixmap(cyber_pixmap("refresh", "#23f5e0", 25)); update_layout.addWidget(update_icon)
         update_copy = QVBoxLayout(); update_copy.setSpacing(4)
@@ -1503,27 +1797,104 @@ class MainWindow(QMainWindow):
             ("flask", "بهترین SNI", "Best SNI", "SNI Lab فقط نتیجه‌های واقعی اسکن را ذخیره می‌کند و برای اتصال خودکار پیشنهاد می‌دهد.", "SNI Lab stores real scan results and makes them available to Auto Mode."),
         ]
         for index, (icon_name, fa_title, en_title, fa_body, en_body) in enumerate(support_cards):
-            box = QFrame(); box.setObjectName("helpCard"); l = QVBoxLayout(box); l.setContentsMargins(18, 17, 18, 17); l.setSpacing(9); icon_label = QLabel(); icon_label.setPixmap(cyber_pixmap(icon_name, "#2cc7ff", 23)); icon_label.setFixedSize(28, 28); title = self._bind_text(QLabel(), fa_title, en_title); title.setObjectName("helpTitle"); text = self._bind_text(QLabel(), fa_body, en_body); text.setObjectName("helpText"); text.setWordWrap(True); l.addWidget(icon_label); l.addWidget(title); l.addWidget(text); l.addStretch(); info_grid.addWidget(box, 0, index)
+            box = MotionFrame(); box.setObjectName("helpCard"); l = QVBoxLayout(box); l.setContentsMargins(18, 17, 18, 17); l.setSpacing(9); icon_label = QLabel(); icon_label.setObjectName("helpIcon"); icon_label.setPixmap(cyber_pixmap(icon_name, "#2cc7ff", 23)); icon_label.setFixedSize(38, 38); icon_label.setAlignment(Qt.AlignCenter); title = self._bind_text(QLabel(), fa_title, en_title); title.setObjectName("helpTitle"); text = self._bind_text(QLabel(), fa_body, en_body); text.setObjectName("helpText"); text.setWordWrap(True); text.setTextInteractionFlags(Qt.TextSelectableByMouse); l.addWidget(icon_label); l.addWidget(title); l.addWidget(text); l.addStretch(); info_grid.addWidget(box, 0, index)
         root.addLayout(info_grid); credits = QLabel(f"UAC Spoofer Desktop {__version__}  •  Credits to behroozuac"); credits.setObjectName("credits"); credits.setAlignment(Qt.AlignCenter); credits.setLayoutDirection(Qt.LeftToRight); root.addWidget(credits); root.addStretch(); return page
 
     def _wire(self):
-        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed)
-        self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.edit_btn.clicked.connect(self.edit_profile); self.delete_btn.clicked.connect(self.delete_profile); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.auto_mode.toggled.connect(lambda v: self._save_flag("auto_mode", v)); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v))
+        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed)
+        self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.edit_btn.clicked.connect(self.edit_profile); self.delete_btn.clicked.connect(self.delete_profile); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.auto_mode.toggled.connect(lambda v: self._save_flag("auto_mode", v)); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v)); self.close_to_tray.toggled.connect(self._set_close_to_tray)
         self.manual_list.itemClicked.connect(self._profile_clicked); self.suggested_list.itemClicked.connect(self._profile_clicked)
         self.scan_tabs.currentChanged.connect(self._update_scan_selection)
 
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = QApplication.windowIcon()
+        if icon.isNull():
+            icon = cyber_icon("shield", "#23f5e0", 24)
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray_menu = QMenu()
+        self.tray_show_action = QAction(self._tray_menu)
+        self.tray_show_action.setIcon(cyber_icon("home", "#23f5e0", 18))
+        self.tray_show_action.triggered.connect(self._restore_from_tray)
+        self._tray_menu.addAction(self.tray_show_action)
+        self._tray_menu.addSeparator()
+        self.tray_quit_action = QAction(self._tray_menu)
+        self.tray_quit_action.setIcon(cyber_icon("power", "#ff7891", 18))
+        self.tray_quit_action.triggered.connect(self._quit_from_tray)
+        self._tray_menu.addAction(self.tray_quit_action)
+        self._tray.setContextMenu(self._tray_menu)
+        self._tray.activated.connect(self._tray_activated)
+        self._update_tray_text()
+        self._tray.setVisible(self.close_to_tray.isChecked())
+
+    def _update_tray_text(self):
+        if self._tray is None:
+            return
+        if self.tray_show_action is not None:
+            self.tray_show_action.setText(self.tr("نمایش برنامه", "Show App"))
+        if self.tray_quit_action is not None:
+            self.tray_quit_action.setText(self.tr("خروج کامل", "Quit"))
+        self._tray.setToolTip(self.tr("UAC Spoofer Desktop — در حال اجرا", "UAC Spoofer Desktop — Running"))
+
+    def _set_close_to_tray(self, enabled):
+        self._save_flag("close_to_tray", bool(enabled))
+        if self._tray is not None:
+            self._tray.setVisible(bool(enabled))
+        if not enabled and not self.isVisible():
+            self._restore_from_tray()
+
+    def _tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._force_quit = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     def show_page(self, index):
+        previous_index = self.stack.currentIndex()
+        if self._page_animation is not None:
+            self._page_animation.stop()
+        if self._animated_page is not None:
+            self._animated_page.setGraphicsEffect(None)
+            self._animated_page = None
         self.stack.setCurrentIndex(index)
         for i, button in enumerate(self.nav):
             active = i == index
             button.setChecked(active)
             button.setIcon(cyber_icon(button.property("iconName"), "#23f5e0" if active else "#9fb4d8", 22))
-        if MOTION_ENABLED and QApplication.platformName() != "offscreen":
+        if _animations_enabled():
             page = self.stack.currentWidget()
             effect = QGraphicsOpacityEffect(page); page.setGraphicsEffect(effect); effect.setOpacity(0.0)
-            animation = QPropertyAnimation(effect, b"opacity", self); animation.setDuration(220); animation.setStartValue(0.0); animation.setEndValue(1.0); animation.setEasingCurve(QEasingCurve.OutCubic)
-            animation.finished.connect(lambda p=page: p.setGraphicsEffect(None))
-            self._page_animation = animation; animation.start()
+            end_position = page.pos()
+            direction = -1 if index < previous_index else 1
+            start_position = end_position + QPoint(direction * 26, 7)
+            page.move(start_position)
+            group = QParallelAnimationGroup(self)
+            fade = QPropertyAnimation(effect, b"opacity", group); fade.setDuration(360); fade.setStartValue(0.0); fade.setEndValue(1.0); fade.setEasingCurve(QEasingCurve.OutCubic)
+            slide = QPropertyAnimation(page, b"pos", group); slide.setDuration(430); slide.setStartValue(start_position); slide.setEndValue(end_position); slide.setEasingCurve(QEasingCurve.OutExpo)
+            group.addAnimation(fade); group.addAnimation(slide)
+
+            def finish_page_transition(target=page, target_position=end_position):
+                target.move(target_position)
+                target.setGraphicsEffect(None)
+                if self._animated_page is target:
+                    self._animated_page = None
+
+            group.finished.connect(finish_page_transition)
+            self._animated_page = page
+            self._page_animation = group
+            group.start()
 
     def _update_config_actions(self, *_):
         if not hasattr(self, "profile_tabs"):
@@ -1559,8 +1930,8 @@ class MainWindow(QMainWindow):
             widget.setLayoutDirection(Qt.LeftToRight)
             widget.setProperty("technical", True)
             if isinstance(widget, QLabel): widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        
-        
+        # Persian tables keep their controls/header flow RTL. Only the actual
+        # technical cell values are left-aligned/LTR-friendly.
         table_direction = Qt.LeftToRight if self.language == "en" else Qt.RightToLeft
         for table in (self.results_table, self.bookmarks_table, self.process_table):
             table.setLayoutDirection(table_direction)
@@ -1611,6 +1982,7 @@ class MainWindow(QMainWindow):
             button.setIcon(cyber_icon(icon_name, "#23f5e0" if index == self.stack.currentIndex() else "#9fb4d8", 22))
         self.language_button.setText("فارسی" if self.language == "en" else "English")
         self.data_button.setText(self.tr("باز کردن پوشه داده‌ها", "Open Data Folder"))
+        self._update_tray_text()
         self.status_pill.set_language(self.language); self.activity_bar.set_language(self.language)
         if not self.scanning: self.scan_progress.set_language(self.language)
         if self._latest_update:
@@ -1664,7 +2036,7 @@ class MainWindow(QMainWindow):
                         float(value.get("download_first_byte_ms", 999999) or 999999),
                         -float(value.get("download_mbps", 0) or 0),
                         float(value.get("startup_ms", 999999)))
-            
+            # Keep IranCell's existing upload/startup ordering byte-for-byte.
             return (value.get("upload_ok") is not True,
                     -float(value.get("score", 0)),
                     float(value.get("startup_ms", 999999)))
@@ -1822,7 +2194,7 @@ class MainWindow(QMainWindow):
         bucket = scoped.get(carrier, {})
         bucket = dict(bucket) if isinstance(bucket, dict) else {}
         signature = profile.source_uri or f"{profile.protocol}:{profile.config_host}:{profile.config_port}"
-        live_edge = str(getattr(getattr(self, "engine", None), "fragment", None).active_edge or "").strip()\
+        live_edge = str(getattr(getattr(self, "engine", None), "fragment", None).active_edge or "").strip() \
             if getattr(getattr(self, "engine", None), "fragment", None) is not None else ""
         bucket[profile.id] = {
             "compatible": bool(compatible),
@@ -1889,8 +2261,8 @@ class MainWindow(QMainWindow):
             pins = {}
         legacy_active = str(getattr(self.storage.tuning, "carrier_mode", "auto") or "auto")
         if not pins and carrier == legacy_active:
-            
-            
+            # Storage migrates these into only the active carrier. Keep this
+            # read fallback for an already-open legacy settings object.
             legacy_pins = self.storage.settings.get("pattern_profile_sni_pins", {})
             pins = legacy_pins if isinstance(legacy_pins, dict) else {}
         scoped_globals = self.storage.settings.get("pattern_global_sni_pin_by_carrier", {})
@@ -1905,13 +2277,21 @@ class MainWindow(QMainWindow):
         remembered_at = float(self.storage.settings.get(f"working_pattern_sni_at_{carrier}", 0) or 0)
         if remembered and time.time() - remembered_at < 7 * 24 * 3600:
             add(remembered)
-        
-        
-        
+        # A recently verified real-page route must precede a newer lab score.
+        # This avoids spending several full timeouts on unproven SNI candidates
+        # every time the user reconnects.
         if ranked:
             add(ranked[0])
         for domain in ranked:
             add(domain)
+        if not candidates:
+            configured = str(getattr(self.storage.tuning, "pattern_fake_sni", "") or "").strip().lower()
+            try:
+                encoded = configured.encode("idna")
+            except UnicodeError:
+                encoded = b""
+            if configured and b"." in encoded and len(encoded) <= 219:
+                candidates.append(configured)
         return candidates[:max(1, limit)]
 
     def _verified_route_result(self, domain, carrier):
@@ -1937,11 +2317,15 @@ class MainWindow(QMainWindow):
         if cancel_event.is_set():
             raise EngineCancelled("Connection attempt cancelled")
         tuning = self.storage.tuning
-        ping_host = tuning.pattern_connect_ip or "188.114.98.0"
-        
-        
+        ping_host = tuning.pattern_connect_ip or "104.18.32.47"
+        # Every profile uses the same Pattern edge and port. Probe it once;
+        # the old six identical concurrent TLS pings delayed connect and loaded NAT.
         ok, latency = profile_ping(ping_host, 443, fake_sni, 3.5)
         self.bridge.log.emit(f"PATTERN EDGE PING 1/1 {ping_host}:443 sni={fake_sni} => {'OK' if ok else 'FAIL'}")
+        if ok and latency > 0:
+            latency_signal = getattr(self.bridge, "latency", None)
+            if latency_signal is not None:
+                latency_signal.emit(latency, "edge")
         for profile in candidates:
             profile.last_ping_ok = ok
             profile.last_ping_ms = latency
@@ -1964,9 +2348,9 @@ class MainWindow(QMainWindow):
                 benchmark_known = bool(result) and result.get("engine") == "patterniha-wrong-seq-v1"
                 download_failed = (result.get("download_ok") is False
                                    or result.get("download_state") == "failed")
-                
-                
-                
+                # This tier is intentionally global rather than nested under
+                # page_ok: an untested profile gets one chance before a route
+                # that was freshly measured below 1 Mbps.
                 if page_ok and download_verified and download_mbps >= 1.0:
                     tier = 0
                 elif page_ok and not download_verified and not download_failed:
@@ -2046,14 +2430,14 @@ class MainWindow(QMainWindow):
                 upload_ok = True if previous_verified_upload else None
                 effective_state = previous_state if previous_upload_valid else "inconclusive"
         else:
-            
-            
+            # Endpoint timeout/not-tested telemetry never overwrites a verified
+            # capability, speed sample, latency or failure counter.
             upload_ok = previous.get("upload_ok") if previous_upload_valid else None
             effective_state = previous_state if previous_upload_valid else state
 
-        
-        
-        
+        # Real download telemetry is carrier-scoped and only participates in
+        # MCI ranking. IranCell continues through the original upload/startup
+        # scoring path below without reading or writing these fields.
         measured_download_state = (download_state
                                    or getattr(self.engine, "last_download_state", "not_tested")
                                    or "not_tested")
@@ -2069,7 +2453,7 @@ class MainWindow(QMainWindow):
         download_failures = int(previous.get("consecutive_download_failures", 0) or 0)
         download_samples = int(previous.get("download_sample_count", 0) or 0)
         download_tested_at = float(previous.get("download_tested_at", 0) or 0)
-        if carrier == "mci" and measured_download_state == "verified"\
+        if carrier == "mci" and measured_download_state == "verified" \
                 and getattr(self.engine, "last_download_ok", None) is True:
             measured_mbps = float(getattr(self.engine, "last_download_mbps", 0) or 0)
             measured_speed_valid = bool(getattr(self.engine, "last_download_speed_valid", measured_mbps > 0))
@@ -2097,8 +2481,8 @@ class MainWindow(QMainWindow):
                 download_ok = True if previous_verified_download else None
                 effective_download_state = previous_download_state if previous_download_valid else "inconclusive"
         else:
-            
-            
+            # Cloudflare timeout/status/short-read is advisory. Preserve the
+            # last verified speed and keep a page-verified route healthy.
             download_ok = previous.get("download_ok") if previous_download_valid else None
             effective_download_state = (previous_download_state
                                         if previous_download_valid else measured_download_state)
@@ -2163,8 +2547,8 @@ class MainWindow(QMainWindow):
         delay = max(10, min(300, int(getattr(tuning, "background_quality_probe_delay_s", 30))))
         if cancel.wait(delay) or self._attempt_cancelled(generation, cancel):
             return
-        
-        
+        # The setting may have been disabled while this delayed task was
+        # waiting. Never compete with the user's traffic after an opt-out.
         if not getattr(self.storage.tuning, "background_quality_probe_enabled", False):
             self.bridge.log.emit("BACKGROUND QUALITY skipped (disabled during delay)")
             return
@@ -2200,8 +2584,8 @@ class MainWindow(QMainWindow):
         except EngineCancelled:
             raise
         except Exception as exc:
-            
-            
+            # The page probe remains authoritative. A telemetry endpoint or
+            # parser failure must not turn a working MCI route into a failure.
             self.engine.last_download_ok = None
             self.engine.last_download_state = "inconclusive"
             self.engine.last_download_reason = type(exc).__name__
@@ -2226,8 +2610,8 @@ class MainWindow(QMainWindow):
         if carrier != "mci" or cancel.is_set():
             return False
         def work():
-            
-            
+            # Let the one-shot YouTube warmup finish first; never compete with
+            # the user's initial page burst.
             if cancel.wait(2.2) or self._attempt_cancelled(generation, cancel):
                 return
             try:
@@ -2249,6 +2633,16 @@ class MainWindow(QMainWindow):
         return True
 
     def toggle_connection(self):
+        if self.connecting:
+            self.connecting = False
+            self.connection_error = ""
+            self._set_connection_visual("disconnecting")
+            self._set_activity("در حال لغو عملیات اتصال…", "Cancelling the connection attempt…")
+            self.bridge.log.emit("CONNECT CANCEL requested by user")
+            self._cancel_connect_attempt(notify=True)
+            self._set_state(False)
+            self._set_activity("عملیات اتصال لغو شد.", "Connection attempt cancelled.", "warning", False)
+            return
         if self.engine.running:
             self.connecting = False; self.connection_error = ""; self._set_connection_visual("disconnecting"); self._set_activity("در حال توقف تونل امن و بازگردانی پروکسی سیستم…", "Stopping the secure tunnel and restoring the system proxy…")
             self._cancel_connect_attempt(notify=True)
@@ -2265,15 +2659,15 @@ class MainWindow(QMainWindow):
             message = self.tr("هیچ SNI معتبر در مخزن اسکن پیدا نشد", "No valid SNI was found in the scan repository")
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
             return
-        self.connecting = True; self.connection_error = ""; self._set_connection_visual("connecting")
+        self.connecting = True; self.connection_error = ""; self._set_connection_visual("connecting"); self._set_latency(0.0, "testing")
         self._set_activity("در حال آماده‌سازی مسیر امن…", "Preparing secure route…")
         self.bridge.log.emit("SNI REPOSITORY candidates=" + ",".join(seed_snis))
 
         def work():
             connected = False
             last_error = ""
-            
-            
+            # Split only MCI's first TLS ClientHello into valid records. IranCell
+            # keeps its existing wrong-sequence behavior byte-for-byte.
             strategy = "tls_sni_records" if carrier == "mci" else "wrong_seq"
             try:
                 self.bridge.activity.emit(self.tr(f"در حال آزمایش دسترسی {ltr_isolate('SNI')}…", "Testing SNI reachability…"), "running", True)
@@ -2306,9 +2700,9 @@ class MainWindow(QMainWindow):
                             self.bridge.activity.emit(self.tr("در حال بررسی دسترسی واقعی صفحات…", "Testing real page reachability…"), "running", True)
                             preferred_urls = {
                                 "irancell": "https://www.youtube.com/generate_204",
-                                
-                                
-                                
+                                # The MCI TLS-record path reaches this small page in
+                                # about one second and it avoids IP-service-specific
+                                # false negatives.
                                 "mci": "https://www.gstatic.com/generate_204",
                             }
                             preferred_url = preferred_urls.get(carrier)
@@ -2317,9 +2711,9 @@ class MainWindow(QMainWindow):
                                                                 cancel_event=cancel)
                             if (not page_ok and carrier == "mci"
                                     and attempt_strategy == "tls_sni_records"):
-                                
-                                
-                                
+                                # Some MCI cells still require the injected Fake
+                                # SNI handshake. Retry only this MCI route; the
+                                # IranCell path never enters this branch.
                                 self.bridge.log.emit(
                                     f"MCI TLS FALLBACK {profile.name} fakeSni={fake_sni}"
                                 )
@@ -2335,9 +2729,9 @@ class MainWindow(QMainWindow):
                                     require_preferred=True, cancel_event=cancel,
                                 )
                             if not page_ok and base_tuning.xray_mux_enabled and attempt_tuning.xray_mux_enabled:
-                                
-                                
-                                
+                                # Mux accelerates page bursts on compatible Xray servers. Test
+                                # a bounded no-Mux fallback for each route. An earlier bad
+                                # profile/SNI must not consume compatibility recovery globally.
                                 self.bridge.log.emit(f"MUX FALLBACK {profile.name} fakeSni={fake_sni}")
                                 self.engine.stop(notify=False)
                                 fallback_tuning = replace(attempt_tuning, xray_mux_enabled=False)
@@ -2355,6 +2749,14 @@ class MainWindow(QMainWindow):
                             if self._attempt_cancelled(generation, cancel):
                                 raise EngineCancelled("Connection attempt cancelled")
                             if page_ok:
+                                route_latency = float(self.engine.last_probe_ms or 0.0)
+                                if route_latency > 0:
+                                    profile.last_ping_ok = True
+                                    profile.last_ping_ms = route_latency
+                                    self.storage.save_profiles()
+                                    latency_signal = getattr(self.bridge, "latency", None)
+                                    if latency_signal is not None:
+                                        latency_signal.emit(route_latency, "tunnel")
                                 if base_tuning.xray_mux_enabled and attempt_tuning.xray_mux_enabled:
                                     self._remember_profile_mux(profile, True, attempt_tuning, carrier)
                                 download_state = "not_tested"
@@ -2368,9 +2770,9 @@ class MainWindow(QMainWindow):
                                 self.storage.settings[f"working_pattern_sni_{carrier}"] = fake_sni
                                 self.storage.settings[f"working_pattern_sni_at_{carrier}"] = time.time()
                                 self.storage.settings["selected_id"] = profile.id
-                                
-                                
-                                
+                                # Keep the working edge/SNI visible in Advanced for this
+                                # carrier only. Do not persist a temporary no-Mux fallback
+                                # over the user's carrier preset.
                                 working_tuning = replace(base_tuning, pattern_fake_sni=fake_sni)
                                 active_edge = str(getattr(self.engine.fragment, "active_edge", "") or "").strip()
                                 if active_edge:
@@ -2446,14 +2848,14 @@ class MainWindow(QMainWindow):
     def _set_connection_visual(self, state):
         states = {
             "disconnected": (f"{ltr_isolate('VPN')} خاموش است", "VPN is OFF", "اتصال امن فعال نیست", "Your connection is not active", "اتصال", "Connect", "play", "idle", True),
-            "connecting": ("در حال اتصال…", "Connecting…", "در حال ایجاد مسیر امن…", "Establishing secure route…", "در حال اتصال…", "Connecting…", "loader", "loading", False),
+            "connecting": ("در حال اتصال…", "Connecting…", "در حال ایجاد مسیر امن…", "Establishing secure route…", "قطع اتصال", "Disconnect", "x-circle", "cancel", True),
             "connected": (f"{ltr_isolate('VPN')} متصل است", "VPN is ON", "تونل امن فعال است", "Secure tunnel is active", "قطع اتصال", "Disconnect", "power", "connected", True),
             "disconnecting": ("در حال قطع اتصال…", "Disconnecting…", "در حال بازگردانی پروکسی سیستم…", "Restoring system proxy…", "در حال قطع…", "Disconnecting…", "loader", "loading", False),
             "error": ("خطای اتصال", "Connection Error", f"اتصال ناموفق بود؛ {ltr_isolate('Live Logs')} را بررسی کنید.", "Connection failed. Check Live Logs for details.", "تلاش دوباره", "Retry", "refresh", "error", True),
         }
         fa_status, en_status, fa_hint, en_hint, fa_button, en_button, icon_name, button_state, enabled = states[state]
         self.status.setText(self.tr(fa_status, en_status)); self.connection_hint.setText(self.tr(fa_hint, en_hint)); self.connect_button.setText(self.tr(fa_button, en_button)); self.connect_button.setEnabled(enabled)
-        self.connect_button.setProperty("state", button_state); self.connect_button.setIcon(cyber_icon(icon_name, "#031422" if state in {"disconnected", "connecting"} else "#eaffff", 20)); _restyle(self.connect_button)
+        self.connect_button.setProperty("state", button_state); self.connect_button.setIcon(cyber_icon(icon_name, "#031422" if state == "disconnected" else "#eaffff", 20)); _restyle(self.connect_button)
         visual_state = "connecting" if state == "disconnecting" else state
         self.status_pill.set_state(visual_state); self.orb.set_state(visual_state)
         self.status.setObjectName("heroStatusOn" if state == "connected" else "heroStatusError" if state == "error" else "heroStatus")
@@ -2473,6 +2875,24 @@ class MainWindow(QMainWindow):
             if was_running: self._set_activity("تونل متوقف و پروکسی سیستم بازگردانی شد.", "Tunnel stopped and system proxy restored.", "success", False)
 
     def _set_traffic(self, up, down): self.up_label.setText(format_bytes(up)); self.down_label.setText(format_bytes(down))
+
+    def _set_latency(self, milliseconds, source="tunnel"):
+        if source == "testing":
+            self.ping_label.setText("…")
+            self.latency_card.set_secondary(self.tr("در حال تست مسیر…", "Testing route…"))
+            return
+        try:
+            value = float(milliseconds)
+        except (TypeError, ValueError):
+            return
+        if value <= 0:
+            return
+        self.ping_label.setText(f"{value:.0f} ms")
+        self.latency_card.set_secondary(self.tr(
+            "تست مسیر واقعی تونل" if source == "tunnel" else "تست سریع لبه",
+            "Live tunnel test" if source == "tunnel" else "Quick edge test",
+        ))
+        self.latency_card.sparkline.add_value(value)
 
     def _append_log(self, message):
         stamp = __import__('datetime').datetime.now().strftime("%H:%M:%S"); line = f"[{stamp}] {message}"; self._all_log_lines.append(line); self._all_log_lines = self._all_log_lines[-5000:]
@@ -2498,8 +2918,8 @@ class MainWindow(QMainWindow):
             except OSError:
                 if attempt + 1 < attempts:
                     time.sleep(0.05)
-        
-        
+        # Keep a bounded, ordered retry buffer; logging must never stall page
+        # traffic. A transient failure is retried even if no new log arrives.
         self._pending_file_log_lines = (lines + self._pending_file_log_lines)[-1000:]
         self._log_flush_failures = min(5, self._log_flush_failures + 1)
         if not self._closing:
@@ -2548,8 +2968,8 @@ class MainWindow(QMainWindow):
             self.storage.settings["update_repo_url"] = repo_url; self.storage.save_settings()
             self._set_activity("تنظیمات ذخیره شد.", "Settings saved.", "success", False)
             if changed_repo:
-                
-                
+                # Invalidate an in-flight check for the previous repository.
+                # Its generation-tagged callback will be ignored.
                 self._update_generation += 1
                 self._update_in_progress = False
                 self._latest_update = None
@@ -2722,8 +3142,8 @@ class MainWindow(QMainWindow):
         self.activity_bar.set_activity(message, "error", False); self.show_toast(message, "danger")
 
     def _persist_scan_repository(self, results):
-        
-        
+        # Persist every successful scan, not only manually bookmarked rows.
+        # This is the measured SNI repository consumed by auto-connect.
         def repository_key(item):
             return (
                 str(item.get("carrier", "") or "").strip().lower(),
@@ -3074,9 +3494,9 @@ class MainWindow(QMainWindow):
         self.storage.settings["bypass_processes"] = self.selected_processes()
         self.storage.save_settings()
         self._update_process_count()
-        
-        
-        
+        # Xray routing rules are generated at start. Debounce rapid row changes,
+        # then perform one controlled restart so the visible switch immediately
+        # affects the active tunnel instead of only the next app launch.
         if self.engine.running or self.connecting:
             self._bypass_apply_timer.start()
             self._set_activity("در حال اعمال عبور مستقیم برنامه‌ها…", "Applying app bypass changes…", "running", True)
@@ -3128,6 +3548,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        if self._tray is not None:
+            self._tray.hide()
         self._bypass_apply_timer.stop()
         self.scan_cancelled = True; self._scan_cancel_event.set(); self._scan_generation += 1; self._update_generation += 1
         try:
@@ -3135,8 +3557,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._pending_file_log_lines.append(f"Shutdown cleanup retry: {exc}")
         try:
-            
-            
+            # Retry independently: proxy restoration must not be skipped if
+            # cancelling a worker or stopping Xray raised first.
             self.engine.stop(notify=False)
         except Exception as exc:
             self._pending_file_log_lines.append(f"Shutdown proxy restore pending: {exc}")
@@ -3144,6 +3566,21 @@ class MainWindow(QMainWindow):
             self._flush_log_buffer(final=True)
 
     def closeEvent(self, event):
+        if (not self._force_quit and self.close_to_tray.isChecked()
+                and self._tray is not None):
+            event.ignore()
+            self.hide()
+            self._tray.show()
+            if not self._tray_hint_shown:
+                self._tray.showMessage(
+                    "UAC Spoofer Desktop",
+                    self.tr("برنامه در System Tray در حال اجراست؛ برای بازگشت روی آیکن آن کلیک کنید.",
+                            "The app is still running in the system tray. Click its icon to restore it."),
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3200,
+                )
+                self._tray_hint_shown = True
+            return
         self.shutdown()
         event.accept()
 
@@ -3176,7 +3613,7 @@ QLabel#logoMark { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 $accent
 QLabel#brand { font-size: 17px; font-weight: 900; color: #f7fdff; }
 QLabel#version { color: #59e9f0; font-size: 10px; font-weight: 800; letter-spacing: 1.5px; }
 QPushButton#navButton { text-align: left; background: transparent; border: 1px solid transparent; border-radius: 14px; padding: 12px 29px 12px 16px; color: #b3c5dc; font-size: 14px; font-weight: 650; }
-QPushButton#navButton[rtl="true"] { text-align: right; padding: 12px 16px 12px 29px; }
+QPushButton#navButton[rtl="true"] { text-align: left; padding: 12px 16px 12px 29px; }
 QPushButton#navButton:hover { background: rgba(18,50,76,0.72); border-color: rgba(54,211,255,0.18); color: #f7fcff; }
 QPushButton#navButton:focus { border-color: $borderstrong; }
 QPushButton#navButton:pressed { background: rgba(16,67,83,0.82); }
@@ -3191,10 +3628,12 @@ QLabel#ratingText { font-size: 11px; color: #b7addc; }
 QPushButton#ratingButton { min-height: 30px; background: rgba(76,42,146,0.34); border: 1px solid rgba(158,115,255,0.42); color: #e5dbff; padding: 5px 9px; }
 QPushButton#ratingButton:hover { background: rgba(106,57,200,0.52); border-color: #a88aff; }
 
-QFrame#pageHeader { background: transparent; }
-QLabel#pageTitle { font-size: 34px; font-weight: 900; color: #f6f9ff; }
-QLabel#pageSubtitle { color: $muted; font-size: 13px; }
-QLabel#summaryPill { min-height: 24px; min-width: 92px; padding: 6px 12px; color: #aeeff5; background: rgba(9,39,68,0.82); border: 1px solid rgba(54,211,255,0.26); border-radius: 12px; font-size: 11px; font-weight: 750; }
+QFrame#pageHeader { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(10,30,57,0.92),stop:0.52 rgba(7,24,47,0.86),stop:1 rgba(17,26,63,0.84)); border: 1px solid rgba(54,211,255,0.22); border-radius: 21px; }
+QLabel#pageHeaderIcon { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(18,91,103,0.76),stop:1 rgba(17,45,83,0.88)); border: 1px solid rgba(81,249,235,0.38); border-radius: 17px; qproperty-alignment: AlignCenter; }
+QLabel#pageEyebrow { color: #6ee9ef; font-size: 9px; font-weight: 900; letter-spacing: 1.8px; }
+QLabel#pageTitle { font-size: 29px; font-weight: 900; color: #f8fcff; }
+QLabel#pageSubtitle { color: #b3c7df; font-size: 13px; font-weight: 520; }
+QLabel#summaryPill { min-height: 24px; min-width: 92px; padding: 6px 12px; color: #c9fbff; background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(7,51,68,0.86),stop:1 rgba(15,38,76,0.88)); border: 1px solid rgba(64,229,235,0.34); border-radius: 12px; font-size: 11px; font-weight: 800; }
 QFrame#statusPill { background: rgba(7,22,44,0.86); border: 1px solid rgba(54,211,255,0.22); border-radius: 16px; }
 QFrame#statusPill[state="connected"] { border-color: rgba(35,245,166,0.46); background: rgba(7,43,47,0.76); }
 QFrame#statusPill[state="connecting"] { border-color: rgba(255,209,102,0.45); }
@@ -3239,6 +3678,8 @@ QPushButton#primaryButton:disabled, QPushButton#scanPrimaryButton:disabled, QPus
 QPushButton#connectButton { border-radius: 15px; font-size: 17px; }
 QPushButton#connectButton:hover, QPushButton#scanPrimaryButton:hover, QPushButton#primaryAction:hover, QPushButton#modalPrimary:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #5ffbe9,stop:1 #61dcff); border-color: #e3ffff; }
 QPushButton#connectButton[state="connected"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #0c877d,stop:1 #12b99f); color: #effffd; }
+QPushButton#connectButton[state="cancel"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #82502f,stop:1 #9f3150); border-color: #ffc56f; color: #fffaf2; }
+QPushButton#connectButton[state="cancel"]:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #9c6037,stop:1 #bd3b60); border-color: #ffe1a3; color: #ffffff; }
 QPushButton#connectButton[state="loading"]:disabled { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #295168,stop:1 #1e6874); border-color: #4d9aa3; color: #d5fffb; }
 QPushButton#connectButton[state="error"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #7f2944,stop:1 #a82f55); border-color: #ff7891; color: #fff5f7; }
 QPushButton#secondaryAction, QPushButton#modalSecondary, QPushButton#advancedButton { background: rgba(13,35,64,0.94); border-color: rgba(88,135,183,0.54); }
@@ -3285,8 +3726,8 @@ QListWidget#configList::item:selected { background: qlineargradient(x1:0,y1:0,x2
 
 QFrame#scanControlCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(10,31,62,0.94),stop:1 rgba(7,22,45,0.92)); border: 1px solid rgba(54,211,255,0.26); border-radius: 19px; }
 QFrame#scanOptions { background: rgba(7,24,48,0.82); border: 1px solid rgba(54,211,255,0.18); border-radius: 14px; }
-QLabel#helperText, QLabel#settingsSubtitle, QLabel#modalSubtitle { color: $muted; font-size: 12px; }
-QPlainTextEdit#domainEditor { font-family: "Cascadia Mono", "Consolas"; font-size: 12px; background: rgba(3,13,28,0.96); border-radius: 12px; }
+QLabel#helperText, QLabel#settingsSubtitle, QLabel#modalSubtitle { color: #aebfd5; font-size: 12px; }
+QPlainTextEdit#domainEditor { font-family: "Cascadia Mono", "Consolas"; font-size: 13px; color: #d9f8f5; background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(3,15,31,0.98),stop:1 rgba(5,21,40,0.98)); border-radius: 12px; padding: 12px; }
 QFrame#scanProgressPanel { background: rgba(8,25,49,0.9); border: 1px solid rgba(54,211,255,0.2); border-radius: 14px; }
 QLabel#scanStatus { color: #a8bad0; font-size: 11px; font-weight: 800; }
 QLabel#scanStatus[state="running"] { color: #71ecfa; }
@@ -3310,7 +3751,7 @@ QFrame#terminalCard { background: rgba(3,12,25,0.96); border: 1px solid rgba(54,
 QFrame#terminalToolbar { background: rgba(9,27,49,0.96); border-bottom: 1px solid rgba(54,211,255,0.2); border-top-left-radius: 16px; border-top-right-radius: 16px; }
 QLabel#terminalLive { color: $success; font-size: 10px; font-weight: 900; letter-spacing: 1.5px; }
 QLineEdit#logFilter { min-height: 30px; background: rgba(3,14,29,0.8); }
-QTextEdit#logs { font-family: "Cascadia Mono", "Consolas"; font-size: 12px; background: rgba(2,9,20,0.98); border: 0; border-radius: 0; padding: 14px; }
+QTextEdit#logs { font-family: "Cascadia Mono", "Consolas"; font-size: 13px; color: #d7e8f5; background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 rgba(2,10,22,0.99),stop:1 rgba(3,15,28,0.99)); border: 0; border-radius: 0; padding: 18px; selection-background-color: #12646b; }
 QFrame#searchWrap { min-height: 42px; background: rgba(4,15,31,0.9); border: 1px solid rgba(66,118,161,0.5); border-radius: 11px; }
 QFrame#searchWrap:focus { border-color: $accent; }
 QLineEdit#processSearch { min-height: 30px; background: transparent; border: 0; padding: 4px; }
@@ -3318,11 +3759,11 @@ QLineEdit#processSearch:focus { background: transparent; border: 0; }
 
 QFrame#toolCard, QFrame#helpCard { min-height: 180px; background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(11,32,63,0.94),stop:1 rgba(7,22,44,0.9)); border: 1px solid rgba(54,211,255,0.22); border-radius: 19px; }
 QFrame#toolCard:hover, QFrame#helpCard:hover { border-color: rgba(54,211,255,0.52); background: rgba(12,39,70,0.94); }
-QLabel#toolIcon, QLabel#supportIcon, QLabel#modalIcon { background: rgba(8,50,69,0.7); border: 1px solid rgba(35,245,224,0.25); border-radius: 13px; qproperty-alignment: AlignCenter; }
+QLabel#toolIcon, QLabel#supportIcon, QLabel#modalIcon, QLabel#helpIcon { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(12,76,87,0.82),stop:1 rgba(12,39,75,0.84)); border: 1px solid rgba(35,245,224,0.30); border-radius: 13px; qproperty-alignment: AlignCenter; }
 QLabel#toolStatus { padding: 4px 8px; border-radius: 8px; color: #ffbdca; background: rgba(73,17,36,0.7); border: 1px solid rgba(255,92,124,0.3); font-size: 10px; font-weight: 800; }
 QLabel#toolStatus[available="true"] { color: #8ff8bc; background: rgba(8,58,42,0.72); border-color: rgba(35,245,166,0.3); }
-QLabel#toolTitle, QLabel#supportTitle, QLabel#helpTitle { color: #f5fbff; font-size: 17px; font-weight: 850; }
-QLabel#toolDescription, QLabel#supportDescription, QLabel#helpText { color: #9fb4d0; font-size: 12px; }
+QLabel#toolTitle, QLabel#supportTitle, QLabel#helpTitle { color: #f7fcff; font-size: 18px; font-weight: 880; }
+QLabel#toolDescription, QLabel#supportDescription, QLabel#helpText { color: #b4c7dc; font-size: 13px; font-weight: 500; }
 QFrame#supportHero { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(8,42,62,0.92),stop:0.7 rgba(8,27,55,0.94),stop:1 rgba(32,18,75,0.82)); border: 1px solid rgba(54,211,255,0.32); border-radius: 21px; }
 QFrame#updateCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(8,31,57,0.96),stop:1 rgba(9,24,52,0.94)); border: 1px solid rgba(54,211,255,0.24); border-radius: 18px; }
 QFrame#updateCard[state="checking"] { border-color: rgba(44,199,255,0.56); }

@@ -90,8 +90,8 @@ def _trace_once(domain: str, timeout: float, edge_ip: str | None = None) -> dict
         try:
             result["edge"] = str(raw.getpeername()[0])
         except (OSError, AttributeError, IndexError, TypeError):
-            
-            
+            # A custom/test socket may not expose peer metadata.  Never invent
+            # an edge from Cloudflare's trace ``ip=`` field: that is the client.
             pass
         raw.settimeout(timeout)
         tls_start = time.perf_counter()
@@ -150,9 +150,9 @@ def scan_domain(domain: str, tries: int = 3, timeout: int = 12, cancelled=None,
     for _ in range(max(1, tries)):
         if cancelled and cancelled():
             break
-        
-        
-        
+        # Keep the legacy two-argument call shape when no explicit edge was
+        # requested.  Existing integrations that wrap _trace_once continue to
+        # work, while edge-aware scans receive the captured destination.
         trace = (_trace_once(domain, timeout, edge_ip) if edge_ip
                  else _trace_once(domain, timeout))
         measured_edge = str(trace.get("edge", "") or "").strip()
@@ -164,9 +164,9 @@ def scan_domain(domain: str, tries: int = 3, timeout: int = 12, cancelled=None,
         body = trace["body"]
         success = "ip=" in body
         if success:
-            
-            
-            
+            # Aggregate metrics may span several attempts. Bind the result to
+            # the peer that actually produced a valid trace, not an earlier
+            # TCP/TLS attempt that closed before application traffic.
             if measured_edge and not out.edge:
                 out.edge = measured_edge
                 out.edge_verified = bool(edge_ip)
@@ -201,8 +201,8 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
                  edge_ip: str | None = None) -> list[ScanResult]:
     results: list[ScanResult] = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(100, threads)))
-    
-    
+    # Capture once before workers start.  A UI carrier/Advanced change during
+    # the scan must not silently relabel later results with another edge.
     captured_edge = str(edge_ip or "").strip() or None
     futures = {
         pool.submit(scan_domain, domain, tries, timeout, cancelled, captured_edge): domain
@@ -229,7 +229,7 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
                 try:
                     result = future.result()
                 except Exception:
-                    
+                    # A single resolver/TLS failure must not strand the scanner UI.
                     result = ScanResult(domain=domain)
                 done += 1
                 if result.success:
@@ -241,9 +241,9 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
         if was_cancelled or cancelled():
             for future in futures:
                 future.cancel()
-            
-            
-            
+            # Do not let a new scan start while sockets from the cancelled scan
+            # are still active. Running probes have bounded timeouts and observe
+            # cancellation before another try; queued probes are cancelled here.
             pool.shutdown(wait=True, cancel_futures=True)
         else:
             pool.shutdown(wait=True)

@@ -73,21 +73,21 @@ class Tuning:
     startup_boost: str = "fast"
     warm_tcp_pool_enabled: bool = True
     warm_tcp_pool_size: int = 2
-    
-    
-    
+    # Xray transport/session controls.  A small mux fan-in prevents a browser
+    # tab from creating a new spoofed transport for every asset while keeping
+    # enough independent carriers to avoid head-of-line blocking.
     xray_mux_enabled: bool = True
     xray_mux_concurrency: int = 8
-    
+    # Quality checks must never compete with the user's first page/video load.
     background_quality_probe_enabled: bool = False
     background_quality_probe_delay_s: int = 30
     log_level: str = "normal"
     # patterniha/SNI-Spoofing wrong-sequence core quality controls.
     pattern_quality_preset: str = "upload"
-    pattern_connect_ip: str = "188.114.98.0"
-    pattern_fallback_ips: str = "188.114.99.0,104.18.8.83,104.18.9.83"
+    pattern_connect_ip: str = "104.18.32.47"
+    pattern_fallback_ips: str = "172.64.155.209"
     pattern_use_profile_edges: bool = False
-    pattern_fake_sni: str = "auth.vercel.com"
+    pattern_fake_sni: str = "chatgpt.com"
     pattern_inject_delay_ms: int = 1
     pattern_ack_timeout_ms: int = 3000
     pattern_connect_timeout_ms: int = 2500
@@ -162,10 +162,10 @@ class Tuning:
         if normalized == "mci":
             tuning = cls.preset("maximum")
             tuning.carrier_mode = "mci"
-            
-            
-            
-            
+            # Live MCI measurements: .98/.99 answer quickly while the IranCell
+            # 104.19 pair times out. Mux stays off for the current WS/Trojan
+            # profiles, but parallel Pattern handshakes and kernel buffers stay
+            # high enough for browser/video bursts.
             tuning.xray_mux_enabled = False
             tuning.xray_mux_concurrency = 4
             tuning.pattern_connect_ip = "188.114.98.0"

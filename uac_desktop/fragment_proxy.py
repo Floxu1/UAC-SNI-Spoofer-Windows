@@ -153,10 +153,10 @@ class FragmentProxy:
         if carrier == "mci":
             return [("mci", ["104.18.8.83", "104.18.9.83"])]
         if carrier == "irancell":
-            
-            
+            # Race IranCell-specific and Cloudflare anycast fallbacks once,
+            # then keep the live winner for the rest of the session.
             return [("irancell", ["104.19.229.21", "104.19.230.21", "104.18.8.83", "104.18.9.83"])]
-        
+        # Desktop Auto mirrors the mobile AUTO_CARRIER race.
         return [("mci", ["104.18.8.83", "104.18.9.83"]),
                 ("irancell", ["104.19.229.21", "104.19.230.21"])]
 
@@ -169,9 +169,9 @@ class FragmentProxy:
                       "tls_record_frag": max(1, t.tls_record_delay_ms),
                       "half": max(1, t.half_delay_ms)}
             names = [self._forced_strategy]
-            
-            
-            
+            # IranCell changes behavior between parallel TLS sessions. Keep a
+            # zero-cost raw/half fallback inside the same Xray dial instead of
+            # waiting for Xray to retry the whole outbound several seconds later.
             if carrier == "irancell" and self._forced_strategy in {"raw", "half"}:
                 names.append("half" if self._forced_strategy == "raw" else "raw")
             preferred = self._preferred.get(host)
@@ -235,8 +235,8 @@ class FragmentProxy:
             remote.close()
             return None
         first_byte = response[0] if response else -1
-        
-        
+        # Same validation used by the mobile service: never accept TLS alerts or
+        # tiny incomplete records as a successful adaptive strategy.
         if not response or first_byte == 0x15 or (len(response) < 8 and first_byte in {0x14, 0x16, 0x17}):
             self.log(f"STRATEGY_REJECT {carrier}/{host} {strategy} response={len(response)}B first=0x{first_byte & 0xff:02x}")
             remote.close()
@@ -305,9 +305,9 @@ class FragmentProxy:
         if race_stop and race_stop.is_set():
             return None
         combined = "combined" in (profile.method or "").lower() or "fake" in (profile.method or "").lower()
-        
-        
-        
+        # Fast/disabled means exactly zero probes. Previously a "combined"
+        # profile silently forced a fake ClientHello before every Xray
+        # connection, causing IranCell resets and multi-second retries.
         probe_count = (max(1, self._tuning.fake_probe_count) if combined else self._tuning.fake_probe_count) if self._tuning.fake_probe_enabled else 0
         if probe_count:
             for _ in range(probe_count):

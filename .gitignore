@@ -1,0 +1,33 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local build and release output
+build/
+dist/
+github_release/
+github_release_stage/
+*.exe
+*.sys
+*.zip
+
+# Downloaded Xray runtime (install-engine.ps1 restores it)
+bin/
+
+# Local QA, screenshots, probes, and reversible Codex backups
+qa_artifacts*/
+codex_backups/
+nav_alignment_probe.png
+*.bak
+.last_*
+
+# Runtime/editor noise
+*.log
+*.tmp
+New Text Document.txt
+.idea/
+.vscode/

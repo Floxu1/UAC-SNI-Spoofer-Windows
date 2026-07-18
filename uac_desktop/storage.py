@@ -61,16 +61,16 @@ class Storage:
         self.scan_results = _read(SNI_RESULTS_FILE, [])
         if not isinstance(self.scan_results, list):
             self.scan_results = []
-        
-        
-        
+        # Older builds only persisted bookmarks. Seed the searchable result
+        # repository from them so the Pattern core can immediately select a
+        # measured Fake SNI without forcing the user to rescan.
         if not self.scan_results and isinstance(self.bookmarks, list):
             self.scan_results = [dict(item) for item in self.bookmarks if isinstance(item, dict)]
             if self.scan_results:
                 self.save_scan_results()
         self._migrate_update_repository()
-        
-        
+        # Speed migration must run first so its mode-aware Pattern defaults are
+        # not pre-filled with generic values by the older core migration.
         self._migrate_speed_core()
         self._migrate_pattern_core()
         self._migrate_carrier_tunings()
@@ -112,8 +112,8 @@ class Storage:
         for key, value in defaults.items():
             if key.startswith("pattern_"):
                 tuning.setdefault(key, value)
-        
-        
+        # Legacy probes/fragment races are not part of the new core and caused
+        # connection amplification during large uploads.
         tuning["fake_probe_enabled"] = False
         tuning["fake_probe_count"] = 0
         tuning["initial_race_enabled"] = False
@@ -141,8 +141,8 @@ class Storage:
             "compatibility": "compatibility", "stealth": "stealth",
             "balanced": "balanced",
         }
-        
-        
+        # Named app modes are authoritative. Custom/legacy modes fall back to
+        # the Pattern preset, while their explicit values remain untouched.
         preset_name = preset_aliases.get(mode)
         if preset_name is None:
             preset_name = preset_aliases.get(pattern_preset, "balanced")
@@ -167,24 +167,24 @@ class Storage:
             "compatibility": "compatibility", "stealth": "compatibility",
         }.get(mode)
 
-        
-        
+        # Only throughput-oriented modes lift the old 4-6 cap. A small cap in
+        # a custom/unknown or compatibility mode is an intentional choice.
         if mode_family in {"fast", "streaming"} and session_cap <= 6:
             tuning["pattern_max_sessions"] = 10
 
-        
-        
+        # Streaming and compatibility intentionally avoid mux head-of-line
+        # blocking. This also corrects the generic value written by v2.
         previous_mux = tuning.get("xray_mux_enabled")
         if mode_family in {"streaming", "compatibility"}:
             tuning["xray_mux_enabled"] = False
 
-        
-        
+        # Restore the exact v2-generated compatibility shape without changing
+        # other explicit low or custom caps.
         if (mode_family == "compatibility" and previous_version == 2
                 and previous_mux is True and session_cap == 10):
             tuning["pattern_max_sessions"] = defaults["pattern_max_sessions"]
-        
-        
+        # The former echo probe started four seconds after connect and competed
+        # with the user's first page/video. Keep it explicitly opt-in.
         tuning.setdefault("background_quality_probe_enabled", False)
         self.settings["tuning"] = tuning
         self.settings["speed_core_version"] = _SPEED_CORE_VERSION
@@ -222,10 +222,10 @@ class Storage:
         route_primary = str(tuning.pattern_connect_ip or "").strip() or turbo.pattern_connect_ip
         raw_fallbacks = str(tuning.pattern_fallback_ips or "")
 
-        
-        
-        
-        
+        # A verified edge was sometimes copied into both the primary and
+        # fallback slots. Keep the user's fallback order, but remove the
+        # primary and repeated entries. If nothing remains, seed one distinct
+        # MCI default so failover is still possible.
         seen = {route_primary.casefold()}
         route_fallbacks: list[str] = []
         for item in raw_fallbacks.split(","):
@@ -281,8 +281,8 @@ class Storage:
                 value = self._upgrade_mci_turbo(value)
             tunings[carrier] = value.to_dict()
 
-        
-        
+        # Migrate global SNI pins only into the active carrier. Per-carrier
+        # remembered winners seed the other carrier without leaking edits.
         scoped_pins = self.settings.get("pattern_profile_sni_pins_by_carrier", {})
         scoped_pins = dict(scoped_pins) if isinstance(scoped_pins, dict) else {}
         legacy_pins = self.settings.get("pattern_profile_sni_pins", {})
@@ -298,8 +298,8 @@ class Storage:
             if remembered:
                 scoped_globals.setdefault(carrier, remembered)
 
-        
-        
+        # Route old Mux evidence to the carrier whose working profile produced
+        # it. Unknown entries remain only under the active carrier.
         scoped_mux = self.settings.get("profile_mux_compatibility_by_carrier", {})
         scoped_mux = dict(scoped_mux) if isinstance(scoped_mux, dict) else {}
         legacy_mux = self.settings.get("profile_mux_compatibility", {})
@@ -330,9 +330,9 @@ class Storage:
                     migrated["mci"] = self._upgrade_mci_turbo(mci).to_dict()
                     self.settings["carrier_tunings"] = migrated
 
-        
-        
-        
+        # The active tuning is persisted separately for startup. Do not copy
+        # the map entry over it: upgrade it only when it independently has the
+        # same MCI compatibility signature, preserving its own route/SNI.
         raw_active = self.settings.get("tuning")
         if isinstance(raw_active, dict):
             active = Tuning.from_dict(raw_active)
