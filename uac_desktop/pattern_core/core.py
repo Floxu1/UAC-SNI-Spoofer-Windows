@@ -121,9 +121,9 @@ class PacketInjector:
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
         self.error: Exception | None = None
-        # SNIFF keeps original handshake packets in the Windows stack.  Only
-        # the synthetic wrong-sequence ClientHello is injected, so bulk upload
-        # and download packets never cross the Python/WinDivert loop.
+
+
+
         self.w = WinDivert(packet_filter, flags=Flag.SNIFF)
         self.thread: threading.Thread | None = None
         self.fake_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="pattern-fake")
@@ -178,7 +178,7 @@ class PacketInjector:
 
     def _send(self, packet: Packet, recalculate: bool = False) -> None:
         if not recalculate:
-            # The handle is SNIFF-only; the original packet was never removed.
+
             return
         try:
             self.w.send(packet, recalculate)
@@ -187,8 +187,8 @@ class PacketInjector:
                 raise
 
     def _abort_spoof(self, packet: Packet, connection: InjectiveConnection, reason: str) -> None:
-        # Do not kill the whole core or swallow the packet.  Let this flow fail
-        # normally so the route fallback can retry without damaging other flows.
+
+
         connection.monitor = False
         connection.signal("unexpected_close")
         self.log(f"PATTERN flow fallback: {reason}")
@@ -230,8 +230,8 @@ class PacketInjector:
                 return
             connection.monitor = False
             connection.signal("fake_data_ack_recv")
-            # This ACK acknowledges the out-of-window fake segment only; matching
-            # upstream behavior, it is intentionally not returned to the stack.
+
+
             return
         self._abort_spoof(packet, connection, "unexpected inbound packet")
 
@@ -436,17 +436,17 @@ class PatternSniCore:
 
     def _ordered_edges(self) -> list[str]:
         now = time.monotonic()
-        # Failed edges stay out of the hot path during their cooldown.  The old
-        # `or all edges` fallback made every queued browser connection retry an
-        # already-failed route and recreated the modem connection storm.
+
+
+
         healthy = [edge for edge in self._edges if self._failed_until.get(edge, 0) <= now]
         healthy.sort(key=lambda edge: (edge != self._preferred_edge, self._edges.index(edge)))
         return healthy
 
     def _tune_socket(self, sock: socket.socket) -> None:
         size = self._quality.socket_buffer_kb * 1024
-        # Compatibility mode deliberately uses a smaller send queue and Nagle;
-        # optimized/maximum modes use the configured full buffer + TCP_NODELAY.
+
+
         send_size = size if self._quality.upload_optimized else min(size, 256 * 1024)
         for option, option_size in ((socket.SO_SNDBUF, send_size), (socket.SO_RCVBUF, size)):
             try:
@@ -479,10 +479,10 @@ class PatternSniCore:
             self._connections.pop(connection.id, None)
 
     async def _connect_edge(self, incoming: socket.socket) -> socket.socket | None:
-        # Normal handshakes fan out through the known edge. If that edge dies,
-        # callers may all observe the same failure, but only one of them is
-        # allowed to discover a replacement. Waiters then fan out again through
-        # the replacement instead of racing every fallback and flooding NAT.
+
+
+
+
         if self._edge_lock is None:
             return await self._connect_edge_unlocked(incoming)
         while True:
@@ -492,9 +492,9 @@ class PatternSniCore:
                 if outgoing is not None:
                     return outgoing
             async with self._edge_lock:
-                # Another caller may have selected a replacement while this
-                # connection was failing or waiting. Leave the lock before
-                # connecting so queued browser handshakes remain concurrent.
+
+
+
                 if self._preferred_edge:
                     continue
                 return await self._connect_edge_unlocked(incoming)
@@ -504,9 +504,9 @@ class PatternSniCore:
                                      ) -> socket.socket | None:
         loop = asyncio.get_running_loop()
         candidates = self._ordered_edges() if edges is None else edges
-        # MCI's verified 188.114.98/99 path connects directly, then the first
-        # Xray ClientHello is split below into two valid TLS records. The UI
-        # retries the route with wrong-sequence mode if its page probe fails.
+
+
+
         if self._strategy_override == "tls_sni_records":
             for edge in candidates:
                 outgoing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -582,9 +582,9 @@ class PatternSniCore:
             incoming.close()
             return
         if self._strategy_override == "tls_sni_records":
-            # MCI delays Xray's large TLS ClientHello while small OpenSSL
-            # handshakes pass immediately. Split only the first handshake into
-            # two valid TLS records, then keep the bulk relay fully untouched.
+
+
+
             loop = asyncio.get_running_loop()
             try:
                 first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
@@ -625,8 +625,8 @@ class PatternSniCore:
                 except OSError:
                     pass
                 return
-            # asyncio.sock_sendall returns None on success.  Never compare it
-            # with len(data); doing so was the upstream one-chunk upload bug.
+
+
             await loop.sock_sendall(destination, data)
             if upload:
                 self.upload += len(data)
@@ -644,8 +644,8 @@ class PatternSniCore:
                     await task
                 except (OSError, ConnectionError, asyncio.CancelledError):
                     pass
-            # Allow the opposite direction a short flush window (for example,
-            # an HTTP response after request EOF) before it is cancelled.
+
+
             if pending:
                 done2, pending = await asyncio.wait(pending, timeout=0.35)
                 for task in done2:

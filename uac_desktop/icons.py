@@ -14,14 +14,14 @@ from typing import Final
 from PySide6.QtCore import QByteArray, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 
-try:  # QtSvg ships with the normal PySide6 wheel, but keep imports resilient.
+try:
     from PySide6.QtSvg import QSvgRenderer
-except (ImportError, ModuleNotFoundError):  # pragma: no cover - minimal Qt build
-    QSvgRenderer = None  # type: ignore[assignment]
+except (ImportError, ModuleNotFoundError):
+    QSvgRenderer = None
 
 
-# SVG bodies only.  The shared wrapper below supplies the viewBox, colour,
-# stroke width, rounded caps and joins so every icon has the same visual weight.
+
+
 _ICONS: Final[dict[str, str]] = {
     "home": """
         <path d="M3 10.8 12 3l9 7.8"/>
@@ -247,7 +247,7 @@ def pixmap(name: str, color: str = "#9fb4d8", size: int = 22) -> QPixmap:
     result = QPixmap(icon_size, icon_size)
     result.fill(Qt.GlobalColor.transparent)
     renderer = QSvgRenderer(QByteArray(_svg(key, colour)))
-    if not renderer.isValid():  # Defensive fallback for a damaged SVG body.
+    if not renderer.isValid():
         return _fallback_pixmap(key, colour, icon_size)
     painter = QPainter(result)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)

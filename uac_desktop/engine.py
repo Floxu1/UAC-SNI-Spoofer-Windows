@@ -22,7 +22,7 @@ from .pattern_core import PatternSniCore
 from .paths import BIN, DATA_DIR, XRAY_CONFIG, XRAY_OWNER_FILE
 
 
-# Keep desktop listeners separate from common Android/emulator and local vpnnnnnnnnnnnnn ports
+
 SOCKS_PORT = 20808
 HTTP_PORT = 20809
 FRAGMENT_PORT = 40443
@@ -174,9 +174,9 @@ class WindowsProxy:
         try:
             created = float(psutil.Process(pid).create_time())
         except (psutil.Error, OSError) as exc:
-            # PID reuse protection is only valid with the real kernel process
-            # creation time.  Refuse to enable the system proxy rather than
-            # launch a watchdog with an unsafe guessed identity.
+
+
+
             raise RuntimeError("Could not determine proxy owner process identity") from exc
         owner: dict[str, object] = {"pid": pid, "create_time": created}
         if token:
@@ -219,8 +219,8 @@ class WindowsProxy:
                 "values": values,
             }
 
-        # The old schema was {name: value}; a JSON null meant that the value
-        # did not exist before the app enabled its proxy.
+
+
         values = {}
         if isinstance(raw, dict):
             for name in cls._NAMES:
@@ -236,8 +236,8 @@ class WindowsProxy:
                         "type": winreg.REG_DWORD if name == "ProxyEnable" else winreg.REG_SZ,
                     }
         if "ProxyEnable" not in values:
-            # A corrupt legacy file cannot reveal the exact original state;
-            # disabling the app proxy is the safest connectivity recovery.
+
+
             values["ProxyEnable"] = {
                 "exists": True, "value": 0, "type": winreg.REG_DWORD,
             }
@@ -287,8 +287,8 @@ class WindowsProxy:
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return False
         except (psutil.AccessDenied, OSError):
-            # Unknown is treated as alive.  Restoring another process's proxy
-            # is more damaging than waiting for a later confirmed check.
+
+
             return True
         except (TypeError, ValueError):
             return False
@@ -337,10 +337,10 @@ class WindowsProxy:
             "close_fds": True,
         }
         if getattr(sys, "frozen", False):
-            # A child launched from a PyInstaller one-folder executable may
-            # otherwise inherit the parent's bootloader environment and reuse
-            # it as an ordinary child process instead of starting watchdog
-            # mode in a fresh application instance.
+
+
+
+
             environment = os.environ.copy()
             environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
             kwargs["env"] = environment
@@ -348,7 +348,7 @@ class WindowsProxy:
             kwargs["creationflags"] = (
                 getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                | 0x00000008  # DETACHED_PROCESS
+                | 0x00000008
             )
         else:
             kwargs["start_new_session"] = True
@@ -357,6 +357,55 @@ class WindowsProxy:
     def enable(self, bypass: str = "<local>;localhost;127.*") -> None:
         with _proxy_state_guard():
             self._enable_locked(bypass)
+
+    def _owned_pending_state(self) -> dict[str, object] | None:
+        state = self._load_state()
+        if state is not None and state.get("_corrupt") and self._previous:
+            state = self._previous
+        if state is None:
+            return None
+        owner = state.get("owner", {})
+        current = self.process_identity()
+        if not self._owner_matches(owner, int(current["pid"]),
+                                   float(current["create_time"])):
+            return None
+        token = str(owner.get("token", "")) if isinstance(owner, dict) else ""
+        if self._state_token and token != self._state_token:
+            return None
+        self._previous = state
+        self._state_token = token
+        return state
+
+    @staticmethod
+    def _write_app_proxy_values(bypass: str, enabled: bool) -> None:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ,
+                              f"http=127.0.0.1:{HTTP_PORT};https=127.0.0.1:{HTTP_PORT};socks=127.0.0.1:{SOCKS_PORT}")
+            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, bypass)
+            if enabled:
+                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+
+    def resume(self, bypass: str = "<local>;localhost;127.*") -> None:
+        with _proxy_state_guard():
+            state = self._owned_pending_state()
+            if state is None:
+                self._enable_locked(bypass)
+                return
+            self._write_app_proxy_values(bypass, True)
+            self._refresh()
+            self.log(f"Windows system proxy resumed HTTP={HTTP_PORT} SOCKS={SOCKS_PORT}")
+
+    def suspend(self) -> bool:
+        with _proxy_state_guard():
+            state = self._owned_pending_state()
+            if state is None:
+                return False
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+            self._refresh()
+            self.log("Windows system proxy suspended")
+            return True
 
     def _enable_locked(self, bypass: str) -> None:
         existing = self._load_state()
@@ -378,19 +427,10 @@ class WindowsProxy:
         self._previous = state
         self._state_token = token
         try:
-            # Start the independent owner watcher before the first registry
-            # mutation, closing the forced-exit window entirely.
+
+
             self._launch_watchdog(owner)
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
-                # The user's original proxy may already be enabled.  Disable
-                # selection while endpoint values change so Windows can never
-                # observe a half-written active proxy configuration.
-                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ,
-                                  f"http=127.0.0.1:{HTTP_PORT};https=127.0.0.1:{HTTP_PORT};socks=127.0.0.1:{SOCKS_PORT}")
-                winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, bypass)
-                # Enable last after the complete endpoint/bypass set exists.
-                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+            self._write_app_proxy_values(bypass, True)
             self._refresh()
         except BaseException:
             try:
@@ -433,9 +473,9 @@ class WindowsProxy:
         values = state.get("values", {})
         if not isinstance(values, dict):
             values = {}
-        # Disable selection, restore endpoint/bypass, then restore the exact
-        # original ProxyEnable value/type last.  If restoration fails, the
-        # state file deliberately remains for retry/watchdog use.
+
+
+
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
             for name in ("ProxyServer", "ProxyOverride"):
@@ -462,7 +502,7 @@ class WindowsProxy:
                 except FileNotFoundError:
                     pass
         self._refresh()
-        # Do not delete a newer owner's snapshot in the tiny handoff window.
+
         latest = self._load_state()
         latest_corrupt = bool(latest and latest.get("_corrupt"))
         state_owner = state.get("owner", {})
@@ -494,11 +534,11 @@ class WindowsProxy:
             if not cls._owner_matches(owner, expected_pid, expected_create_time, expected_token):
                 return False
         elif owner and cls._owner_is_alive(owner):
-            # Never let a second process disable the proxy of a live owner.
+
             return False
         elif not owner and cls._other_app_instance_alive():
-            # Legacy state has no PID/token.  Defer it until the elevated
-            # single-instance check rather than disrupting a live old build.
+
+
             return False
         helper = cls(log or (lambda _: None))
         helper._previous = state
@@ -536,8 +576,8 @@ class WindowsProxy:
             except Exception:
                 pass
             time.sleep(delay)
-        # Keep the state file for startup recovery if Windows is shutting down
-        # too quickly for the registry write to complete.
+
+
         return 1
 
     @staticmethod
@@ -571,8 +611,8 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         raise ValueError(f"Unsupported protocol: {parsed['protocol']}")
     tls = {"serverName": parsed["sni"]}
     if tuning.carrier_mode == "mci" and parsed["network"] in {"ws", "httpupgrade"}:
-        # Keep the MCI Cloudflare route on HTTP/1.1.  An h2 ALPN selection can
-        # leave legacy WS/HTTPUpgrade configs waiting for an upgrade response.
+
+
         tls["alpn"] = ["http/1.1"]
     if parsed["fingerprint"]:
         tls["fingerprint"] = parsed["fingerprint"]
@@ -589,7 +629,7 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         stream["wsSettings"] = {"path": parsed["path"], "host": parsed["host_header"],
                                 "headers": {"Host": parsed["host_header"]}}
     rules = [{"type": "field", "network": "udp", "port": "443", "outboundTag": "block"}]
-    # Xray accepts process matching on supported desktop builds; unsupported builds simply ignore empty lists.
+
     if bypass_processes:
         rules.insert(0, {"type": "field", "process": bypass_processes, "outboundTag": "direct"})
     requested_log_level = str(tuning.log_level or "normal").strip().lower()
@@ -605,8 +645,8 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
     if bool(tuning.xray_mux_enabled):
         proxy_outbound["mux"] = {
             "enabled": True,
-            # Keep fan-in bounded: very high values trade fewer handshakes for
-            # head-of-line stalls and can overload a mobile modem/NAT table.
+
+
             "concurrency": max(1, min(32, int(tuning.xray_mux_concurrency))),
         }
     return {
@@ -726,8 +766,8 @@ class Engine:
             process = psutil.Process(pid)
             name = process.name().lower()
             executable = self._normalize_path(process.exe())
-            # Ownership checks must also work in a clean source checkout where
-            # install-engine.ps1 has not downloaded Xray yet.
+
+
             binary_name = "xray.exe" if platform.system() == "Windows" else "xray"
             expected = self._normalize_path(str(BIN / binary_name))
             command = process.cmdline()
@@ -737,18 +777,18 @@ class Engine:
                 return False
             owner = self._read_owner_record()
             if owner:
-                # Owner records remain valid if a newer build is launched from
-                # another extraction directory: compare against the actual
-                # stale process, not only the current bundle path.
+
+
+
                 return (int(owner.get("pid", -1)) == pid
                         and abs(float(owner.get("create_time", -1)) - process.create_time()) < 0.01
                         and self._normalize_path(str(owner.get("exe", ""))) == executable
                         and self._normalize_path(str(owner.get("config", ""))) == config_marker)
             if executable == expected:
                 return True
-            # Legacy builds had no owner record. An orphan from another app
-            # folder is still safely identifiable by the exact private config,
-            # dead parent and ownership of our private listener ports.
+
+
+
             parent_pid = process.ppid()
             return parent_pid <= 0 or not psutil.pid_exists(parent_pid)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error, OSError, ValueError, TypeError):
@@ -766,7 +806,7 @@ class Engine:
         processed: set[int] = set()
         for port, pid in sorted(owners.items()):
             if pid == os.getpid():
-                # self.stop() should have closed our fragment listener already.
+
                 continue
             if pid in processed:
                 continue
@@ -883,9 +923,19 @@ class Engine:
             if not self.running:
                 raise RuntimeError("Cannot enable Windows proxy before the engine is running")
             if not self._proxy_enabled:
-                self.system_proxy.enable()
+                self.system_proxy.resume()
                 self._proxy_enabled = True
             self._check_cancel(cancel_event)
+
+    def disable_system_proxy(self) -> None:
+        """Restore Windows proxy state without stopping Xray or Patterniha."""
+        with self._lifecycle_lock:
+            if self._proxy_enabled or self.system_proxy.has_pending_restore:
+                try:
+                    self.system_proxy.suspend()
+                finally:
+                    self._proxy_enabled = False
+            self.log("Windows system proxy mode disabled; tunnel remains active")
 
     def probe(self, timeout: float = 10, preferred_url: str | None = None,
               require_preferred: bool = False,
@@ -929,8 +979,8 @@ class Engine:
                 self.last_probe_ms = preferred_result[4]
                 return False, f"{preferred_url}: {preferred_result[3]}"
         errors = []
-        # Sequential fallbacks avoid leaving non-cancellable Requests workers
-        # connected to the next Xray generation after a profile switch.
+
+
         for url in urls:
             self._check_cancel(cancel_event)
             ok, checked_url, status, detail, elapsed_ms = check(url)
@@ -983,9 +1033,9 @@ class Engine:
                 endpoint,
                 proxies=proxies,
                 stream=True,
-                # Requests has no total streaming deadline. Short per-read
-                # timeouts plus the explicit monotonic deadline below keep the
-                # entire advisory sample around two seconds even on a stall.
+
+
+
                 timeout=(min(0.8, budget), min(0.55, budget)),
                 allow_redirects=False,
                 headers={"Accept-Encoding": "identity",
@@ -1120,8 +1170,8 @@ class Engine:
         self.last_upload_mbps = 0.0
         self.last_upload_speed_valid = False
         self.last_upload_ms = None
-        # The public echo service is a capability check, not a speed test. Keep
-        # it small so its JSON response cannot compete with browser startup.
+
+
         requested = max(4 * 1024, min(int(size), 16 * 1024))
         proxies = {"http": f"http://127.0.0.1:{HTTP_PORT}",
                    "https": f"http://127.0.0.1:{HTTP_PORT}"}
@@ -1166,8 +1216,8 @@ class Engine:
                         echoed = False
                 if echoed:
                     self.last_upload_ms = elapsed * 1000
-                    # Response time includes a much larger JSON echo download,
-                    # so it is deliberately not advertised as upstream Mbps.
+
+
                     self.last_upload_mbps = 0.0
                     self.last_upload_speed_valid = False
                     self.last_upload_ok = True
@@ -1246,9 +1296,9 @@ class Engine:
                     pass
                 self._remove_owner_record(process.pid)
         finally:
-            # Proxy restoration must not depend on Xray/WinDivert cleanup.  A
-            # pending transactional snapshot is sufficient reason to restore,
-            # even if enable() failed before _proxy_enabled became True.
+
+
+
             try:
                 self.fragment.stop()
             finally:

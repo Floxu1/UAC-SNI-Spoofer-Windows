@@ -205,3 +205,37 @@ def test_cancelled_scan_waits_until_running_workers_exit(monkeypatch):
         assert slow_workers_finished == 3
     assert results == []
     assert progress_calls == [(1, 4, "fast.example")]
+
+
+def test_current_location_uses_tunnel_proxy_and_returns_geo_country(monkeypatch):
+    calls = []
+
+    class Response:
+        ok = True
+
+        def json(self):
+            return {
+                "success": True, "ip": "8.221.169.111",
+                "country": "Japan", "country_code": "JP", "city": "Tokyo",
+            }
+
+    class Session:
+        trust_env = True
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(network.requests, "Session", Session)
+
+    result = network.current_location(proxy=True, timeout=3.5)
+
+    assert result == network.GeoLocation(
+        ip="8.221.169.111", country_code="JP", country="Japan",
+        city="Tokyo", source="ipwho.is",
+    )
+    assert calls[0][1]["proxies"]["https"] == "http://127.0.0.1:20809"
+    assert calls[0][1]["timeout"] == 3.5

@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -95,6 +96,35 @@ def test_proxy_round_trip_re_deletes_all_originally_absent_values(proxy_registry
     assert proxy.disable()
 
     assert registry.values == {}
+    assert not state_file.exists()
+
+
+def test_proxy_suspend_and_resume_toggle_immediately_without_losing_snapshot(proxy_registry):
+    registry, state_file, launched = proxy_registry
+    original = {
+        "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
+        "ProxyServer": ("original-proxy", engine_module.winreg.REG_SZ),
+        "ProxyOverride": ("original-bypass", engine_module.winreg.REG_SZ),
+    }
+    registry.values = dict(original)
+    proxy = WindowsProxy(lambda _message: None)
+
+    proxy.enable()
+    assert registry.values["ProxyEnable"][0] == 1
+    assert registry.values["ProxyServer"][0].startswith("http=127.0.0.1:")
+
+    assert proxy.suspend()
+    assert registry.values["ProxyEnable"][0] == 0
+    assert state_file.exists()
+    assert proxy.has_pending_restore
+
+    proxy.resume()
+    assert registry.values["ProxyEnable"][0] == 1
+    assert registry.values["ProxyServer"][0].startswith("http=127.0.0.1:")
+    assert len(launched) == 1
+
+    assert proxy.disable()
+    assert registry.values == original
     assert not state_file.exists()
 
 
@@ -248,11 +278,35 @@ class _PendingProxy:
     def __init__(self):
         self.has_pending_restore = True
         self.disable_calls = 0
+        self.suspend_calls = 0
 
     def disable(self):
         self.disable_calls += 1
         self.has_pending_restore = False
         return True
+
+    def suspend(self):
+        self.suspend_calls += 1
+        return True
+
+
+def test_engine_can_restore_windows_proxy_without_stopping_tunnel():
+    logs = []
+    engine = object.__new__(Engine)
+    engine._lifecycle_lock = threading.RLock()
+    engine._proxy_enabled = True
+    engine.system_proxy = _PendingProxy()
+    engine.log = logs.append
+    engine._active = True
+
+    Engine.disable_system_proxy(engine)
+
+    assert engine._active is True
+    assert engine.system_proxy.suspend_calls == 1
+    assert engine.system_proxy.disable_calls == 0
+    assert engine._proxy_enabled is False
+    assert engine.system_proxy.has_pending_restore is True
+    assert "tunnel remains active" in logs[-1]
 
 
 class _BrokenFragment:

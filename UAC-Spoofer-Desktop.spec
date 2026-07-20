@@ -1,4 +1,3 @@
-# -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_data_files
 
 datas = [('assets', 'assets'), ('bin', 'bin'),
@@ -31,9 +30,6 @@ exe = EXE(
     upx=True,
     console=False,
     icon='assets/icon.png',
-    # Start unelevated so main.py can restore a stale HKCU proxy before the
-    # UAC prompt. main.py then relaunches the foreground app as administrator
-    # for WinDivert.
     uac_admin=False,
 )
 coll = COLLECT(

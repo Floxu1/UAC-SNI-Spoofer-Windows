@@ -120,7 +120,7 @@ class SemVersion:
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SemVersion):
             return NotImplemented
-        # SemVer build metadata does not participate in precedence.
+
         return self._precedence_compare(other) == 0
 
     def __lt__(self, other: object) -> bool:
@@ -129,8 +129,8 @@ class SemVersion:
         return self._precedence_compare(other) < 0
 
     def __hash__(self) -> int:
-        # Keep hashing consistent with precedence equality: build metadata is
-        # intentionally ignored by both.
+
+
         return hash((self.major, self.minor, self.patch, self.prerelease))
 
 

@@ -36,6 +36,15 @@ class ScanResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class GeoLocation:
+    ip: str = ""
+    country_code: str = ""
+    country: str = ""
+    city: str = ""
+    source: str = ""
+
+
 def tcp_ping(host: str, port: int, timeout: float = 3) -> tuple[bool, float]:
     started = time.perf_counter()
     try:
@@ -90,8 +99,8 @@ def _trace_once(domain: str, timeout: float, edge_ip: str | None = None) -> dict
         try:
             result["edge"] = str(raw.getpeername()[0])
         except (OSError, AttributeError, IndexError, TypeError):
-            # A custom/test socket may not expose peer metadata.  Never invent
-            # an edge from Cloudflare's trace ``ip=`` field: that is the client.
+
+
             pass
         raw.settimeout(timeout)
         tls_start = time.perf_counter()
@@ -150,9 +159,9 @@ def scan_domain(domain: str, tries: int = 3, timeout: int = 12, cancelled=None,
     for _ in range(max(1, tries)):
         if cancelled and cancelled():
             break
-        # Keep the legacy two-argument call shape when no explicit edge was
-        # requested.  Existing integrations that wrap _trace_once continue to
-        # work, while edge-aware scans receive the captured destination.
+
+
+
         trace = (_trace_once(domain, timeout, edge_ip) if edge_ip
                  else _trace_once(domain, timeout))
         measured_edge = str(trace.get("edge", "") or "").strip()
@@ -164,9 +173,9 @@ def scan_domain(domain: str, tries: int = 3, timeout: int = 12, cancelled=None,
         body = trace["body"]
         success = "ip=" in body
         if success:
-            # Aggregate metrics may span several attempts. Bind the result to
-            # the peer that actually produced a valid trace, not an earlier
-            # TCP/TLS attempt that closed before application traffic.
+
+
+
             if measured_edge and not out.edge:
                 out.edge = measured_edge
                 out.edge_verified = bool(edge_ip)
@@ -201,8 +210,8 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
                  edge_ip: str | None = None) -> list[ScanResult]:
     results: list[ScanResult] = []
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(100, threads)))
-    # Capture once before workers start.  A UI carrier/Advanced change during
-    # the scan must not silently relabel later results with another edge.
+
+
     captured_edge = str(edge_ip or "").strip() or None
     futures = {
         pool.submit(scan_domain, domain, tries, timeout, cancelled, captured_edge): domain
@@ -229,7 +238,7 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
                 try:
                     result = future.result()
                 except Exception:
-                    # A single resolver/TLS failure must not strand the scanner UI.
+
                     result = ScanResult(domain=domain)
                 done += 1
                 if result.success:
@@ -241,9 +250,9 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
         if was_cancelled or cancelled():
             for future in futures:
                 future.cancel()
-            # Do not let a new scan start while sockets from the cancelled scan
-            # are still active. Running probes have bounded timeouts and observe
-            # cancellation before another try; queued probes are cancelled here.
+
+
+
             pool.shutdown(wait=True, cancel_futures=True)
         else:
             pool.shutdown(wait=True)
@@ -254,3 +263,61 @@ def current_ip(proxy: bool = False) -> str:
     proxies = {"http": "http://127.0.0.1:20809", "https": "http://127.0.0.1:20809"} if proxy else None
     response = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=8)
     return response.json().get("ip", "unknown")
+
+
+def current_location(proxy: bool = False, timeout: float = 5.0) -> GeoLocation | None:
+    """Resolve the exit IP and country, preferably through the active tunnel.
+
+    ipwho.is is used first because it returns the same GeoIP-style country that
+    public IP-check websites expose.  Two small fallbacks keep country
+    verification available when that provider is temporarily rate-limited.
+    """
+    proxies = ({"http": "http://127.0.0.1:20809",
+                "https": "http://127.0.0.1:20809"} if proxy else None)
+    session = requests.Session()
+    session.trust_env = False
+    headers = {"User-Agent": "UAC-Spoofer-Desktop/exit-country"}
+    try:
+        try:
+            response = session.get("https://ipwho.is/", proxies=proxies,
+                                   timeout=timeout, headers=headers)
+            value = response.json()
+            code = str(value.get("country_code", "") or "").upper()
+            ip = str(value.get("ip", "") or "")
+            if response.ok and value.get("success", True) and len(code) == 2 and ip:
+                return GeoLocation(
+                    ip=ip, country_code=code,
+                    country=str(value.get("country", "") or ""),
+                    city=str(value.get("city", "") or ""), source="ipwho.is",
+                )
+        except (OSError, ValueError, requests.RequestException):
+            pass
+
+        try:
+            response = session.get("https://api.country.is/", proxies=proxies,
+                                   timeout=timeout, headers=headers)
+            value = response.json()
+            code = str(value.get("country", "") or "").upper()
+            ip = str(value.get("ip", "") or "")
+            if response.ok and len(code) == 2 and ip:
+                return GeoLocation(ip=ip, country_code=code, source="api.country.is")
+        except (OSError, ValueError, requests.RequestException):
+            pass
+
+        try:
+            response = session.get("https://www.cloudflare.com/cdn-cgi/trace",
+                                   proxies=proxies, timeout=timeout, headers=headers)
+            values = {}
+            for line in response.text.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip()
+            code = str(values.get("loc", "") or "").upper()
+            ip = str(values.get("ip", "") or "")
+            if response.ok and len(code) == 2 and ip:
+                return GeoLocation(ip=ip, country_code=code, source="cloudflare-trace")
+        except (OSError, requests.RequestException):
+            pass
+        return None
+    finally:
+        session.close()

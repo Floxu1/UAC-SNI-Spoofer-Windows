@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 
 from uac_desktop import __version__
+import uac_desktop.ui as ui_module
 from uac_desktop.models import ProxyProfile, Tuning
 from uac_desktop.network import ScanResult
 from uac_desktop.ui import DEFAULT_UPDATE_REPO_URL, MainWindow
@@ -125,6 +126,19 @@ def test_cached_update_is_rejected_after_repo_or_app_version_change():
                             _render_update_info=lambda _info: None)
 
     assert MainWindow._restore_cached_update(dummy) is False
+
+
+def test_new_update_notification_is_emitted_once_per_version():
+    storage = StorageStub(settings={})
+    shown = []
+    dummy = SimpleNamespace(storage=storage, _show_update_notification=shown.append)
+    info = SimpleNamespace(is_update_available=True, latest_version="2.0.0")
+
+    assert MainWindow._announce_update(dummy, info) is True
+    assert MainWindow._announce_update(dummy, info) is False
+    assert shown == [info]
+    assert storage.settings["notified_update_version"] == "2.0.0"
+    assert storage.saved_settings == 1
 
 
 def test_profile_benchmark_uses_captured_connection_carrier():
@@ -256,7 +270,7 @@ def test_latency_card_shows_testing_then_live_tunnel_result():
     assert sparkline.values == [87.6]
 
 
-def test_close_event_hides_window_when_close_to_tray_is_enabled():
+def test_close_event_hides_window_when_user_chooses_system_tray():
     class EventStub:
         def __init__(self):
             self.ignored = False
@@ -268,27 +282,12 @@ def test_close_event_hides_window_when_close_to_tray_is_enabled():
         def accept(self):
             self.accepted = True
 
-    class TrayStub:
-        def __init__(self):
-            self.shown = 0
-            self.messages = []
-
-        def show(self):
-            self.shown += 1
-
-        def showMessage(self, *args):
-            self.messages.append(args)
-
     event = EventStub()
-    tray = TrayStub()
     calls = []
     dummy = SimpleNamespace(
         _force_quit=False,
-        close_to_tray=SimpleNamespace(isChecked=lambda: True),
-        _tray=tray,
-        _tray_hint_shown=False,
-        hide=lambda: calls.append("hide"),
-        tr=lambda _fa, en: en,
+        _ask_close_action=lambda: "tray",
+        _hide_to_tray=lambda: calls.append("tray") or True,
         shutdown=lambda: calls.append("shutdown"),
     )
 
@@ -296,7 +295,146 @@ def test_close_event_hides_window_when_close_to_tray_is_enabled():
 
     assert event.ignored is True
     assert event.accepted is False
-    assert calls == ["hide"]
-    assert tray.shown == 1
-    assert len(tray.messages) == 1
-    assert dummy._tray_hint_shown is True
+    assert calls == ["tray"]
+
+
+def test_close_event_shuts_down_only_when_user_chooses_quit():
+    class EventStub:
+        def __init__(self):
+            self.ignored = False
+            self.accepted = False
+
+        def ignore(self):
+            self.ignored = True
+
+        def accept(self):
+            self.accepted = True
+
+    event = EventStub()
+    calls = []
+    dummy = SimpleNamespace(
+        _force_quit=False,
+        _ask_close_action=lambda: "quit",
+        _hide_to_tray=lambda: False,
+        shutdown=lambda: calls.append("shutdown"),
+    )
+
+    MainWindow.closeEvent(dummy, event)
+
+    assert event.accepted is True
+    assert event.ignored is False
+    assert calls == ["shutdown"]
+    assert dummy._force_quit is True
+
+
+def test_proxy_mode_off_keeps_engine_running_and_restores_only_windows_proxy(monkeypatch):
+    class EngineStub:
+        running = True
+
+        def __init__(self):
+            self.enable_calls = 0
+            self.disable_calls = 0
+
+        def enable_system_proxy(self, *_args):
+            self.enable_calls += 1
+
+        def disable_system_proxy(self):
+            self.disable_calls += 1
+
+    class ProxyOptionStub:
+        def __init__(self):
+            self.enabled = None
+
+        def setProperty(self, _name, value):
+            self.enabled = value
+
+    storage = StorageStub(settings={"proxy_mode": True})
+    engine = EngineStub()
+    activity = []
+    queued = []
+    dummy = SimpleNamespace(
+        storage=storage,
+        engine=engine,
+        connecting=True,
+        proxy_option=ProxyOptionStub(),
+        proxy_mode=SimpleNamespace(
+            blockSignals=lambda *_args: None,
+            setChecked=lambda *_args: None,
+        ),
+        _save_flag=lambda key, value: (
+            storage.settings.__setitem__(key, value), storage.save_settings()
+        ),
+        _set_activity=lambda *args: activity.append(args),
+        _queue_proxy_mode_apply=lambda: queued.append(True),
+        _proxy_mode_enabled=lambda: bool(storage.settings.get("proxy_mode", True)),
+        _handle_error=lambda error: (_ for _ in ()).throw(AssertionError(error)),
+    )
+    monkeypatch.setattr(ui_module, "_restyle", lambda _widget: None)
+
+    MainWindow._proxy_mode_changed(dummy, False)
+    MainWindow._apply_proxy_mode_live(dummy)
+
+    assert engine.running is True
+    assert engine.disable_calls == 1
+    assert engine.enable_calls == 0
+    assert storage.settings["proxy_mode"] is False
+    assert dummy.proxy_option.enabled is False
+    assert queued == [True]
+
+
+def test_verified_connection_skips_windows_proxy_when_proxy_mode_is_off():
+    class EngineStub:
+        def enable_system_proxy(self, *_args):
+            raise AssertionError("Windows proxy must stay off")
+
+        def disable_system_proxy(self):
+            raise AssertionError("No proxy snapshot exists to restore")
+
+    logs = []
+    dummy = SimpleNamespace(
+        storage=StorageStub(settings={"proxy_mode": False}),
+        engine=EngineStub(),
+        bridge=SimpleNamespace(
+            log=SimpleNamespace(emit=logs.append),
+            activity=SimpleNamespace(emit=lambda *_args: None),
+        ),
+        _proxy_mode_enabled=lambda: False,
+        tr=lambda _fa, en: en,
+    )
+
+    enabled = MainWindow._apply_proxy_mode_after_probe(dummy)
+
+    assert enabled is False
+    assert "remain active" in logs[-1]
+
+
+def test_verified_connection_enables_windows_proxy_by_default():
+    class EngineStub:
+        def __init__(self):
+            self.enable_calls = []
+
+        def enable_system_proxy(self, cancel):
+            self.enable_calls.append(cancel)
+
+        def disable_system_proxy(self):
+            raise AssertionError("Proxy mode stayed enabled")
+
+    engine = EngineStub()
+    activity = []
+    dummy = SimpleNamespace(
+        storage=StorageStub(settings={}),
+        engine=engine,
+        bridge=SimpleNamespace(
+            log=SimpleNamespace(emit=lambda *_args: None),
+            activity=SimpleNamespace(emit=lambda *args: activity.append(args)),
+        ),
+        _proxy_mode_enabled=lambda: True,
+        tr=lambda _fa, en: en,
+    )
+    cancel = object()
+
+    enabled = MainWindow._apply_proxy_mode_after_probe(dummy, cancel)
+
+    assert enabled is True
+    assert engine.enable_calls == [cancel]
+    assert activity[-1][0] == "Applying Windows system proxy…"

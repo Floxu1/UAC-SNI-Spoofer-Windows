@@ -6,10 +6,18 @@ import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 
+from .verified_configs import (COUNTRIES, VERIFIED_SPOOF_CONFIGS,
+                               VERIFIED_SPOOF_EDGE, VERIFIED_SPOOF_FAKE_SNI,
+                               ROTATING_SPOOF_SEQUENCES)
+
 
 DEFAULT_ADDRESS = "104.18.8.83"
 DEFAULT_FALLBACK = "104.18.9.83"
 DEFAULT_SNI = "www.speedtest.net"
+
+
+
+SPOOF_META_RE = re.compile(r"^SPOOF-(\d+)-([A-Z]{2})(?:-(\d+)ms)?$", re.I)
 
 BUILTIN_CONFIGS = """trojan://humanity@127.0.0.1:40443?path=%2Fassignment&security=tls&insecure=0&host=www.calmlunch.com&type=ws&allowInsecure=0&sni=www.calmlunch.com#uacSpoofer%201
 trojan://humanity@127.0.0.1:40443?path=%2Fassignment&security=tls&insecure=0&host=www.ignitelimit.com&type=ws&allowInsecure=0&sni=www.ignitelimit.com#uacSpoofer%202
@@ -35,11 +43,24 @@ class ProxyProfile:
     last_ping_ok: bool = False
     last_ping_ms: float = 0.0
     origin: str = "user"
+    country_code: str = ""
+    country_latency_ms: int = 0
+    verified_spoof: bool = False
+    spoof_fake_sni: str = ""
+    rotating_exit: bool = False
+    observed_exit_ip: str = ""
+    observed_country_code: str = ""
+    country_verified_at: float = 0.0
+    country_source: str = ""
 
     @property
     def target_label(self) -> str:
         ping = f"{self.last_ping_ms:.0f} ms" if self.last_ping_ok else "not tested"
         return f"{self.address}:{self.port} / {self.sni}  •  {ping}"
+
+    @property
+    def country_flag(self) -> str:
+        return COUNTRIES.get(self.country_code.upper(), ("🌐", "", ""))[0]
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -73,16 +94,16 @@ class Tuning:
     startup_boost: str = "fast"
     warm_tcp_pool_enabled: bool = True
     warm_tcp_pool_size: int = 2
-    # Xray transport/session controls.  A small mux fan-in prevents a browser
-    # tab from creating a new spoofed transport for every asset while keeping
-    # enough independent carriers to avoid head-of-line blocking.
+
+
+
     xray_mux_enabled: bool = True
     xray_mux_concurrency: int = 8
-    # Quality checks must never compete with the user's first page/video load.
+
     background_quality_probe_enabled: bool = False
     background_quality_probe_delay_s: int = 30
     log_level: str = "normal"
-    # patterniha/SNI-Spoofing wrong-sequence core quality controls.
+
     pattern_quality_preset: str = "upload"
     pattern_connect_ip: str = "104.18.32.47"
     pattern_fallback_ips: str = "172.64.155.209"
@@ -162,10 +183,10 @@ class Tuning:
         if normalized == "mci":
             tuning = cls.preset("maximum")
             tuning.carrier_mode = "mci"
-            # Live MCI measurements: .98/.99 answer quickly while the IranCell
-            # 104.19 pair times out. Mux stays off for the current WS/Trojan
-            # profiles, but parallel Pattern handshakes and kernel buffers stay
-            # high enough for browser/video bursts.
+
+
+
+
             tuning.xray_mux_enabled = False
             tuning.xray_mux_concurrency = 4
             tuning.pattern_connect_ip = "188.114.98.0"
@@ -262,10 +283,32 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
             return None
         query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         sni = next((query.get(k, "") for k in ("sni", "servername", "serverName", "host", "authority") if query.get(k)), parsed.hostname)
-        name = urllib.parse.unquote(parsed.fragment) or f"{protocol.upper()} {parsed.hostname}"
-        return ProxyProfile(name=name, source_uri=raw, protocol=protocol,
-                            config_host=parsed.hostname, config_port=parsed.port or 443,
-                            origin="builtin" if suggested else "user", sni=DEFAULT_SNI)
+        fragment = urllib.parse.unquote(parsed.fragment)
+        name = fragment or f"{protocol.upper()} {parsed.hostname}"
+        profile = ProxyProfile(name=name, source_uri=raw, protocol=protocol,
+                               config_host=parsed.hostname, config_port=parsed.port or 443,
+                               origin="builtin" if suggested else "user", sni=sni)
+        match = SPOOF_META_RE.fullmatch(fragment)
+        if match:
+            sequence, country_code, latency_ms = match.groups()
+            country_code = country_code.upper()
+            _flag, english_name, _persian_name = COUNTRIES.get(
+                country_code, ("🌐", country_code, country_code)
+            )
+            profile.id = str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+            profile.name = f"{english_name} · Spoof {int(sequence):03d}"
+            profile.address = VERIFIED_SPOOF_EDGE
+            profile.fallback_address = ""
+            profile.origin = "verified"
+            profile.country_code = country_code
+            profile.country_latency_ms = 0
+            profile.verified_spoof = True
+            profile.spoof_fake_sni = VERIFIED_SPOOF_FAKE_SNI
+            profile.rotating_exit = int(sequence) in ROTATING_SPOOF_SEQUENCES
+            if profile.rotating_exit:
+                profile.country_code = "XX"
+                profile.name = f"Dynamic exit · Spoof {int(sequence):03d}"
+        return profile
     except Exception:
         return None
 
@@ -278,10 +321,15 @@ def parse_many(text: str, suggested: bool = False) -> list[ProxyProfile]:
 
 
 def default_profiles() -> list[ProxyProfile]:
-    profiles = parse_many(BUILTIN_CONFIGS, suggested=True)
-    for index, profile in enumerate(profiles, 1):
+    legacy_profiles = parse_many(BUILTIN_CONFIGS, suggested=True)
+    for index, profile in enumerate(legacy_profiles, 1):
         profile.name = f"uacSpoofer {index}"
-    return profiles
+    return [*legacy_profiles, *verified_profiles()]
+
+
+def verified_profiles() -> list[ProxyProfile]:
+    """Return the versioned, country-labelled profiles bundled with the app."""
+    return parse_many(VERIFIED_SPOOF_CONFIGS, suggested=True)
 
 
 def parse_outbound(profile: ProxyProfile) -> dict:

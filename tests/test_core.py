@@ -23,10 +23,18 @@ from uac_desktop.ui import MainWindow
 from uac_desktop.storage import _write
 
 
-def test_all_mobile_builtins_parse():
+def test_all_mobile_and_verified_builtins_parse():
     profiles = default_profiles()
-    assert len(profiles) == 6
+    assert len(profiles) == 60
     assert {x.protocol for x in profiles} == {"vless", "trojan"}
+    verified = [profile for profile in profiles if profile.verified_spoof]
+    assert len(verified) == 54
+    assert {profile.country_code for profile in verified} == {
+        "AT", "DE", "FI", "FR", "JP", "NL", "PL", "SG", "US", "XX",
+    }
+    assert all(profile.address == "104.19.229.21" for profile in verified)
+    assert all(profile.spoof_fake_sni == "static.cloudflare.com" for profile in verified)
+    assert sum(profile.rotating_exit for profile in verified) == 8
 
 
 def test_xray_has_socks_and_http_inbounds():
@@ -64,7 +72,7 @@ def test_tls_fragment_preserves_payload():
 
 
 def test_httpupgrade_mapping():
-    profile = default_profiles()[-1]
+    profile = default_profiles()[5]
     parsed = parse_outbound(profile)
     assert parsed["network"] == "httpupgrade"
     config = build_xray_config(profile)

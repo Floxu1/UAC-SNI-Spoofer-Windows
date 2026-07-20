@@ -10,19 +10,19 @@ class ClientHelloMaker:
     static3 = tls_ch_template[76:120]
     static4 = tls_ch_template[127 + len(template_sni):262 + len(template_sni)]
     static5 = b"\x00\x15"
-    ##############
+
     tls_change_cipher = b"\x14\x03\x03\x00\x01\x01"
     tls_app_data_header = b"\x17\x03\x03"
 
     @classmethod
     def get_client_hello_with(cls, rnd: bytes, sess_id: bytes, target_sni: bytes,
-                              key_share: bytes) -> bytes:  # rnd,sess_id,key_share: 32 bytes
+                              key_share: bytes) -> bytes:
         server_name_ext = struct.pack("!H", len(target_sni) + 5) + struct.pack("!H",
                                                                                len(target_sni) + 3) + b"\x00" + struct.pack(
             "!H", len(target_sni)) + target_sni
         padding_ext = struct.pack("!H", 219 - len(target_sni)) + (b"\x00" * (219 - len(target_sni)))
         return cls.static1 + rnd + cls.static2 + sess_id + cls.static3 + server_name_ext + cls.static4 + key_share + cls.static5 + padding_ext
-        # rnd-> [11:43)  sess_id-> [44:76) key_share-> [262+len(target_sni):294+len(target_sni))
+
 
     @classmethod
     def parse_client_hello(cls, client_hello_bytes: bytes):

@@ -9,13 +9,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QScrollArea, QToolButton
 
 import uac_desktop.storage as storage_module
 from uac_desktop.models import Tuning
 from uac_desktop.network import ScanResult
 from uac_desktop.storage import Storage
-from uac_desktop.ui import MainWindow, ToggleSwitch, TuningDialog
+from uac_desktop.ui import STYLE, MainWindow, ToggleOptionFrame, ToggleSwitch, TuningDialog
+from uac_desktop.update_checker import UpdateInfo
 
 
 @pytest.fixture(scope="module")
@@ -165,6 +166,110 @@ def test_toggle_switch_center_is_clickable(qapp):
         assert toggle.isChecked() is True
     finally:
         toggle.close()
+
+
+def test_proxy_option_remains_clickable_when_visual_state_is_off(qapp):
+    toggle = ToggleSwitch()
+    option = ToggleOptionFrame(toggle)
+    option.setProperty("active", False)
+    try:
+        option.resize(160, 50)
+        option.show()
+        qapp.processEvents()
+        assert option.isEnabled() is True
+        assert toggle.isEnabled() is True
+
+        QTest.mouseClick(option, Qt.LeftButton, Qt.NoModifier, option.rect().center())
+        qapp.processEvents()
+        assert toggle.isChecked() is True
+    finally:
+        option.close()
+
+
+def test_home_dashboard_has_no_scroll_and_fits_minimum_window(qapp, tmp_path, monkeypatch):
+    _redirect_storage(monkeypatch, tmp_path)
+    monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
+    monkeypatch.setattr(MainWindow, "refresh_processes", lambda self: None)
+    monkeypatch.setattr(MainWindow, "check_for_updates", lambda self, manual=False: None)
+    previous_style = qapp.styleSheet()
+    qapp.setStyleSheet(STYLE)
+    window = MainWindow()
+    try:
+        window.show()
+        QTest.qWait(5)
+        qapp.processEvents()
+        assert window.hero_card.height() >= 300
+        for width, height in ((1080, 700), (1280, 800), (1440, 900)):
+            window.resize(width, height)
+            qapp.processEvents()
+
+            home = window.stack.widget(0)
+            sections = [
+                window.home_header,
+                window.hero_card,
+                window.country_card,
+                *window.metric_cards,
+                window.quick_controls,
+            ]
+            assert home is window.home_page
+            assert not isinstance(home, QScrollArea)
+            assert not home.findChildren(QScrollArea)
+            assert all(section.isVisible() for section in sections)
+            assert max(section.mapTo(home, section.rect().bottomLeft()).y() for section in sections) <= home.rect().bottom()
+            assert len({card.mapTo(home, card.rect().topLeft()).y() for card in window.metric_cards}) == 1
+            assert window.carrier.geometry().bottom() <= window.carrier_control.rect().bottom()
+            assert window.carrier.geometry().right() <= window.carrier_control.rect().right()
+            assert window.status.font().pixelSize() == 38
+            assert window.connection_hint.font().pixelSize() == 15
+            assert window.route_card.title.font().pixelSize() == 11
+            assert window.route_card.value.font().pixelSize() == 22
+    finally:
+        window._force_quit = True
+        window.close()
+        qapp.setStyleSheet(previous_style)
+
+
+def test_update_notification_is_top_centered_and_contained(qapp, tmp_path, monkeypatch):
+    _redirect_storage(monkeypatch, tmp_path)
+    monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)
+    monkeypatch.setattr(MainWindow, "refresh_processes", lambda self: None)
+    monkeypatch.setattr(MainWindow, "check_for_updates", lambda self, manual=False: None)
+    previous_style = qapp.styleSheet()
+    qapp.setStyleSheet(STYLE)
+    window = MainWindow()
+    try:
+        window.show()
+        qapp.processEvents()
+        info = UpdateInfo(
+            repo_url="https://github.com/example/UAC-Spoofer-Desktop",
+            current_version="1.0.2",
+            latest_version="1.1.0",
+            tag_name="v1.1.0",
+            release_name="UAC Spoofer Desktop 1.1.0",
+            release_url="https://github.com/example/UAC-Spoofer-Desktop/releases/tag/v1.1.0",
+            published_at="",
+            release_notes="",
+            prerelease=False,
+            is_update_available=True,
+        )
+        window._show_update_notification(info)
+        qapp.processEvents()
+
+        banner = window._update_notification
+        button = banner.findChild(QPushButton, "updateNotificationPrimary")
+        stack_origin = window.stack.mapTo(window.centralWidget(), window.stack.rect().topLeft())
+        assert banner.isVisible()
+        assert banner.y() == stack_origin.y() + 18
+        assert banner.width() <= window.stack.width() - 36
+        assert button is not None and button.isVisible()
+        assert banner.findChild(QLabel, "updateNotificationVersion") is None
+        assert banner.findChild(QToolButton, "updateNotificationClose") is None
+        assert button.mapTo(banner, button.rect().bottomRight()).x() <= banner.rect().right()
+        assert button.mapTo(banner, button.rect().bottomRight()).y() <= banner.rect().bottom()
+    finally:
+        window._force_quit = True
+        window.close()
+        qapp.setStyleSheet(previous_style)
 
 
 def test_app_bypass_changes_are_debounced_and_reconnect_once(qapp):
