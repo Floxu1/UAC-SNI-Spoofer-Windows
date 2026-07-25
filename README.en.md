@@ -24,7 +24,6 @@ The desktop profiles are tuned separately for **MCI / Hamrah Aval** and **IranCe
 - Separate MCI, IranCell, and Auto carrier modes
 - Xray-based local SOCKS/HTTP tunnel
 - Optional system-wide sing-box TUN mode for Windows TCP and UDP traffic
-- Real CMD latency for targets such as `4.2.2.3` through direct ICMP instead of a synthetic zero
 - Patterniha SNI and Edge scanner with live results
 - MCI TLS startup optimization
 - YouTube route warmup for faster video startup
