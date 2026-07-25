@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import ctypes
 import ipaddress
 import os
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -30,6 +32,7 @@ from ..tls_tools import fragments
 
 LogFn = Callable[[str], None]
 TrafficFn = Callable[[int, int], None]
+IP_UNICAST_IF = 31
 
 
 def default_interface_ipv4(destination: str) -> str:
@@ -39,6 +42,30 @@ def default_interface_ipv4(destination: str) -> str:
         return str(probe.getsockname()[0])
     finally:
         probe.close()
+
+
+class _SockaddrIn(ctypes.Structure):
+    _fields_ = [
+        ("sin_family", ctypes.c_ushort),
+        ("sin_port", ctypes.c_ushort),
+        ("sin_addr", ctypes.c_ubyte * 4),
+        ("sin_zero", ctypes.c_ubyte * 8),
+    ]
+
+
+def best_interface_index(destination: str) -> int:
+    address = _SockaddrIn()
+    address.sin_family = socket.AF_INET
+    for index, value in enumerate(socket.inet_aton(destination)):
+        address.sin_addr[index] = value
+    interface = ctypes.c_ulong()
+    result = ctypes.windll.iphlpapi.GetBestInterfaceEx(
+        ctypes.byref(address),
+        ctypes.byref(interface),
+    )
+    if result:
+        raise OSError(int(result), "GetBestInterfaceEx failed")
+    return int(interface.value)
 
 
 def _valid_ipv4(value: str) -> str | None:
@@ -311,6 +338,7 @@ class PatternSniCore:
         self._profile = None
         self._quality = Quality()
         self._interface_ip = ""
+        self._interface_index = 0
         self._edges: list[str] = []
         self._preferred_edge: str | None = None
         self._failed_until: dict[str, float] = {}
@@ -355,8 +383,8 @@ class PatternSniCore:
         port = int(self._profile.port)
         return (f"tcp and !impostor and tcp.PayloadLength == 0 and "
                 f"(tcp.Syn or tcp.Ack or tcp.Rst or tcp.Fin) and "
-                f"((ip.SrcAddr == {self._interface_ip} and tcp.DstPort == {port} and ({outbound_edges})) "
-                f"or (ip.DstAddr == {self._interface_ip} and tcp.SrcPort == {port} and ({inbound_edges})))")
+                f"((tcp.DstPort == {port} and ({outbound_edges})) "
+                f"or (tcp.SrcPort == {port} and ({inbound_edges})))")
 
     def start(self, profile, tuning, forced_strategy: str | None = None) -> None:
         self.stop()
@@ -369,7 +397,8 @@ class PatternSniCore:
         self._fake_sni_bytes(self._fake_sni)
         self._edges = self._build_edges(profile, tuning)
         self._interface_ip = default_interface_ipv4(self._edges[0])
-        if not self._interface_ip:
+        self._interface_index = best_interface_index(self._edges[0])
+        if not self._interface_ip or self._interface_index <= 0:
             raise RuntimeError("Pattern core could not detect the active IPv4 interface")
         self.upload = self.download = 0
         self._stop.clear()
@@ -443,10 +472,16 @@ class PatternSniCore:
         healthy.sort(key=lambda edge: (edge != self._preferred_edge, self._edges.index(edge)))
         return healthy
 
-    def _tune_socket(self, sock: socket.socket) -> None:
+    def _tune_socket(self, sock: socket.socket, pin_interface: bool = False) -> None:
         size = self._quality.socket_buffer_kb * 1024
 
 
+        if pin_interface and self._interface_index:
+            sock.setsockopt(
+                socket.IPPROTO_IP,
+                IP_UNICAST_IF,
+                struct.pack("!I", self._interface_index),
+            )
         send_size = size if self._quality.upload_optimized else min(size, 256 * 1024)
         for option, option_size in ((socket.SO_SNDBUF, send_size), (socket.SO_RCVBUF, size)):
             try:
@@ -468,6 +503,20 @@ class PatternSniCore:
                     sock.setsockopt(socket.IPPROTO_TCP, option, value)
                 except OSError:
                     pass
+
+    def _tune_outgoing_socket(self, sock: socket.socket, edge: str) -> None:
+        try:
+            self._tune_socket(sock, True)
+        except OSError:
+            interface_ip = default_interface_ipv4(edge)
+            if ipaddress.ip_address(interface_ip) in ipaddress.ip_network("172.19.0.0/30"):
+                raise
+            interface_index = best_interface_index(edge)
+            if not interface_ip or interface_index <= 0:
+                raise RuntimeError("Pattern core could not refresh the active IPv4 interface")
+            self._interface_ip = interface_ip
+            self._interface_index = interface_index
+            self._tune_socket(sock, True)
 
     def _register(self, connection: InjectiveConnection) -> None:
         with self._registry_lock:
@@ -511,8 +560,8 @@ class PatternSniCore:
             for edge in candidates:
                 outgoing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 outgoing.setblocking(False)
-                self._tune_socket(outgoing)
                 try:
+                    self._tune_outgoing_socket(outgoing, edge)
                     await asyncio.wait_for(
                         loop.sock_connect(outgoing, (edge, int(self._profile.port))),
                         self._quality.connect_timeout_ms / 1000,
@@ -524,7 +573,7 @@ class PatternSniCore:
                         self.log(f"PATTERN EDGE active {edge}:{self._profile.port} "
                                  f"mode={self._strategy_override}")
                     return outgoing
-                except (OSError, asyncio.TimeoutError) as exc:
+                except (OSError, asyncio.TimeoutError, RuntimeError) as exc:
                     self._failed_until[edge] = (
                         time.monotonic() + self._quality.edge_failure_cooldown_s
                     )
@@ -540,9 +589,9 @@ class PatternSniCore:
         for edge in candidates:
             outgoing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             outgoing.setblocking(False)
-            self._tune_socket(outgoing)
             connection = None
             try:
+                self._tune_outgoing_socket(outgoing, edge)
                 outgoing.bind((self._interface_ip, 0))
                 source_port = int(outgoing.getsockname()[1])
                 connection = InjectiveConnection(outgoing, incoming, self._interface_ip, edge, source_port,
@@ -560,7 +609,7 @@ class PatternSniCore:
                 if previous_edge != edge:
                     self.log(f"PATTERN EDGE active {edge}:{self._profile.port}")
                 return outgoing
-            except (OSError, asyncio.TimeoutError, ConnectionError) as exc:
+            except (OSError, asyncio.TimeoutError, ConnectionError, RuntimeError) as exc:
                 if connection:
                     self._unregister(connection)
                 self._failed_until[edge] = (time.monotonic()
@@ -575,44 +624,49 @@ class PatternSniCore:
         return None
 
     async def _handle(self, incoming: socket.socket) -> None:
-        assert self._session_sem is not None
-        async with self._session_sem:
-            outgoing = await self._connect_edge(incoming)
-        if not outgoing:
-            incoming.close()
-            return
-        if self._strategy_override == "tls_sni_records":
-
-
-
-            loop = asyncio.get_running_loop()
-            try:
-                first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
-                if not first:
-                    incoming.close()
-                    outgoing.close()
-                    return
-                expected = (5 + int.from_bytes(first[3:5], "big")
-                            if len(first) >= 5 and first[0] == 0x16 else len(first))
-                while len(first) < expected:
-                    chunk = await asyncio.wait_for(
-                        loop.sock_recv(incoming, expected - len(first)), 1.0
-                    )
-                    if not chunk:
-                        break
-                    first += chunk
-                pieces = fragments(first, "tls_sni_records")
-                for index, piece in enumerate(pieces):
-                    await loop.sock_sendall(outgoing, piece)
-                    self.upload += len(piece)
-                    if index + 1 < len(pieces):
-                        await asyncio.sleep(0.001)
-                self._emit_traffic()
-            except (OSError, asyncio.TimeoutError):
-                incoming.close()
-                outgoing.close()
+        outgoing = None
+        try:
+            assert self._session_sem is not None
+            async with self._session_sem:
+                outgoing = await self._connect_edge(incoming)
+            if not outgoing:
                 return
-        await self._relay_pair(incoming, outgoing)
+            if self._strategy_override == "tls_sni_records":
+                loop = asyncio.get_running_loop()
+                try:
+                    first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
+                    if not first:
+                        return
+                    expected = (5 + int.from_bytes(first[3:5], "big")
+                                if len(first) >= 5 and first[0] == 0x16 else len(first))
+                    while len(first) < expected:
+                        chunk = await asyncio.wait_for(
+                            loop.sock_recv(incoming, expected - len(first)), 1.0
+                        )
+                        if not chunk:
+                            break
+                        first += chunk
+                    pieces = fragments(first, "tls_sni_records")
+                    for index, piece in enumerate(pieces):
+                        await loop.sock_sendall(outgoing, piece)
+                        self.upload += len(piece)
+                        if index + 1 < len(pieces):
+                            await asyncio.sleep(0.001)
+                    self._emit_traffic()
+                except (OSError, asyncio.TimeoutError):
+                    return
+            await self._relay_pair(incoming, outgoing)
+        except (OSError, ConnectionError, asyncio.TimeoutError, RuntimeError):
+            return
+        finally:
+            for sock in (incoming, outgoing):
+                if sock is not None:
+                    try:
+                        close = getattr(sock, "close", None)
+                        if callable(close):
+                            close()
+                    except OSError:
+                        pass
 
     async def _pump(self, source: socket.socket, destination: socket.socket, upload: bool) -> None:
         loop = asyncio.get_running_loop()

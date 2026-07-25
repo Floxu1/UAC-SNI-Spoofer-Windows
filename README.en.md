@@ -23,6 +23,8 @@ The desktop profiles are tuned separately for **MCI / Hamrah Aval** and **IranCe
 
 - Separate MCI, IranCell, and Auto carrier modes
 - Xray-based local SOCKS/HTTP tunnel
+- Optional system-wide sing-box TUN mode for Windows TCP and UDP traffic
+- Real CMD latency for targets such as `4.2.2.3` through direct ICMP instead of a synthetic zero
 - Patterniha SNI and Edge scanner with live results
 - MCI TLS startup optimization
 - YouTube route warmup for faster video startup
@@ -34,6 +36,14 @@ The desktop profiles are tuned separately for **MCI / Hamrah Aval** and **IranCe
 - Advanced tuning for route, SNI, DNS, timeout, and fallback behavior
 - GitHub Releases update checker
 - Safe Windows proxy restore after disconnect, exit, or restart
+
+## TUN mode
+
+`Windows Proxy` remains the default mode. When `TUN Mode` is enabled, the app creates a `UAC-Spoofer` virtual interface with sing-box and sends Windows TCP and UDP traffic through the local Xray SOCKS listener, the Patterniha core, and the active config. The app verifies a real YouTube route through the TUN interface before reporting the connection as active.
+
+SOCKS, VLESS, and Trojan do not transport ICMP. Ping requests therefore use a dedicated Direct rule over the physical interface so CMD reports real network latency. Web pages and video traffic continue through the tunnel.
+
+Disabling TUN while connected removes its interface and routes immediately. If Windows Proxy is enabled, that mode is restored automatically. App Bypass process names are also translated into direct sing-box route rules.
 
 ## Carrier support
 
@@ -97,6 +107,8 @@ For the most stable and deterministic result, select your current carrier manual
 ## Credits
 
 Special thanks to the **Patterniha** group for inventing and introducing this SNI-spoofing method.
+
+**sing-box v1.13.14** is bundled for optional TUN mode, with its license included as `bin/sing-box-LICENSE`.
 
 The integrated upstream source and GPL-3.0 license are included under:
 

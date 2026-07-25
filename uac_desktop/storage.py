@@ -63,6 +63,9 @@ class Storage:
 
             self.settings["proxy_mode"] = True
             preferences_changed = True
+        if "tun_mode" not in self.settings:
+            self.settings["tun_mode"] = False
+            preferences_changed = True
 
 
         if "close_to_tray" in self.settings:

@@ -16,6 +16,13 @@ STAGE = ROOT / "github_release_stage"
 DIST = ROOT / "dist" / "UAC-Spoofer-Desktop"
 PORTABLE = OUT / "portable"
 SOURCE = OUT / "source"
+PORTABLE_RUNTIME_FILES = (
+    Path("UAC-Spoofer-Desktop.exe"),
+    Path("_internal/bin/xray.exe"),
+    Path("_internal/bin/sing-box.exe"),
+    Path("_internal/bin/libcronet.dll"),
+    Path("_internal/bin/sing-box-LICENSE"),
+)
 
 
 def copy_file(source: Path, destination: Path) -> str:
@@ -97,20 +104,26 @@ def reset_tree(path: Path) -> None:
             time.sleep(1)
 
 
+def require_file_paths(paths, message: str) -> None:
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise SystemExit(message + ": " + ", ".join(missing))
+
+
 def clear_output_files() -> None:
     OUT.mkdir(exist_ok=True)
     for path in OUT.iterdir():
-        if path.name == "portable":
-            continue
         if path.is_dir():
-            shutil.rmtree(path)
+            reset_tree(path)
         else:
             path.unlink()
 
 
 def main() -> None:
-    if not (DIST / "UAC-Spoofer-Desktop.exe").is_file():
-        raise SystemExit("Portable build is missing; run PyInstaller first.")
+    require_file_paths(
+        (DIST / path for path in PORTABLE_RUNTIME_FILES),
+        "Portable build is missing required files; run PyInstaller first",
+    )
     reset_tree(STAGE)
     stage_portable = STAGE / "portable"
     stage_source = STAGE / "source"
@@ -148,6 +161,10 @@ def main() -> None:
         licenses / "Patterniha-GPL-3.0.txt",
     )
     copy_item(ROOT / "bin" / "LICENSE", licenses / "Xray-LICENSE.txt")
+    copy_item(
+        ROOT / "bin" / "sing-box-LICENSE",
+        licenses / "sing-box-LICENSE.txt",
+    )
 
     version = {}
     exec((stage_source / "uac_desktop" / "__init__.py").read_text(encoding="utf-8"), version)
@@ -175,23 +192,21 @@ def main() -> None:
     )
 
     clear_output_files()
-    copy_item(stage_portable, PORTABLE, merge=True)
+    copy_item(stage_portable, PORTABLE)
     for path in STAGE.iterdir():
         if path.name != "portable":
             copy_item(path, OUT / path.name)
 
     required = [
-        PORTABLE / "UAC-Spoofer-Desktop.exe",
-        PORTABLE / "_internal" / "bin" / "xray.exe",
+        *(PORTABLE / path for path in PORTABLE_RUNTIME_FILES),
         SOURCE / "main.py",
         SOURCE / "uac_desktop" / "app_config.py",
         OUT / "README.md",
+        OUT / "LICENSES" / "sing-box-LICENSE.txt",
         portable_zip,
         source_zip,
     ]
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        raise SystemExit("Missing release files: " + ", ".join(missing))
+    require_file_paths(required, "Missing release files")
     print(OUT)
 
 

@@ -12,5 +12,7 @@ See the LICENSE file for details.
 Third-party notices:
 - Patterniha SNI Spoofing upstream source and related license files should remain included under:
   third_party/patterniha_sni_spoofing/
+- sing-box v1.13.14 by SagerNet is bundled for optional Windows TUN mode.
+  Its license is shipped as bin/sing-box-LICENSE.
 
 Do not remove Patterniha credits from this project or derivative distributions.

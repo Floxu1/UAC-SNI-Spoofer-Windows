@@ -14,6 +14,7 @@ ROTATING_SPOOF_SEQUENCES = {4, 5, 7, 8, 11, 18, 26, 47}
 
 COUNTRIES = {
     "AT": ("🇦🇹", "Austria", "اتریش"),
+    "CH": ("🇨🇭", "Switzerland", "سوئیس"),
     "DE": ("🇩🇪", "Germany", "آلمان"),
     "FI": ("🇫🇮", "Finland", "فنلاند"),
     "FR": ("🇫🇷", "France", "فرانسه"),

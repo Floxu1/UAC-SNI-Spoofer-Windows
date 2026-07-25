@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from uac_desktop import __version__
 import uac_desktop.ui as ui_module
+from uac_desktop.engine import EngineCancelled
 from uac_desktop.models import ProxyProfile, Tuning
 from uac_desktop.network import ScanResult
 from uac_desktop.ui import DEFAULT_UPDATE_REPO_URL, MainWindow
@@ -233,7 +237,164 @@ def test_connect_button_cancels_an_in_progress_attempt():
     assert calls.index(("visual", "disconnecting")) < calls.index(("cancel", {"notify": True}))
 
 
-def test_latency_card_shows_testing_then_live_tunnel_result():
+def test_applied_sni_is_displayed_and_used_for_verified_profile_without_changing_server_sni():
+    profile = ProxyProfile(
+        id="verified-route", sni="server.example",
+        spoof_fake_sni="static.cloudflare.com", verified_spoof=True,
+    )
+    result = ScanResult(
+        domain="community.cloudflare.com", success=True, score=900,
+        carrier="irancell", tested_at=time.time(),
+    )
+
+    class ApplyStorage:
+        def __init__(self):
+            self.profiles = [profile]
+            self.scan_results = [result.to_dict()]
+            self.bookmarks = []
+            self.settings = {}
+            self.tuning = Tuning(
+                carrier_mode="irancell",
+                pattern_fake_sni="static.cloudflare.com",
+            )
+
+        def set_tuning(self, tuning):
+            self.tuning = tuning
+
+    storage = ApplyStorage()
+    dummy = SimpleNamespace(
+        storage=storage,
+        _bind_verified_sni_route=MainWindow._bind_verified_sni_route,
+    )
+    dummy._sni_candidates = lambda profile, carrier, limit: MainWindow._sni_candidates(
+        dummy, profile, carrier, limit,
+    )
+    dummy._effective_profile_fake_sni = lambda profile, carrier=None: MainWindow._effective_profile_fake_sni(
+        dummy, profile, carrier,
+    )
+
+    MainWindow._apply_carrier_sni(
+        dummy, {profile.id: result}, result,
+    )
+
+    assert profile.sni == "server.example"
+    assert MainWindow._effective_profile_fake_sni(
+        dummy, profile, "irancell",
+    ) == "community.cloudflare.com"
+    assert MainWindow._profile_sni_candidates(
+        dummy, profile, "irancell", 3,
+    ) == ["community.cloudflare.com", "static.cloudflare.com"]
+    assert "Fake SNI community.cloudflare.com" in MainWindow._profile_route_label(
+        dummy, profile, "irancell",
+    )
+
+
+def test_forced_profile_overrides_auto_mode_country_order(monkeypatch):
+    preferred = ProxyProfile(id="clicked", origin="verified", verified_spoof=True)
+    other = ProxyProfile(id="other", origin="verified", verified_spoof=True)
+
+    class OrderedStorage:
+        def __init__(self):
+            self.profiles = [other, preferred]
+            self.settings = {}
+            self.tuning = Tuning(carrier_mode="irancell")
+
+        def save_profiles(self):
+            return None
+
+    monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 25.0))
+    dummy = SimpleNamespace(
+        storage=OrderedStorage(),
+        bridge=SimpleNamespace(latency=SimpleNamespace(emit=lambda *_args: None),
+                               log=SimpleNamespace(emit=lambda *_args: None)),
+    )
+
+    ordered = MainWindow._ordered_profiles(
+        dummy, "community.cloudflare.com", threading.Event(),
+        auto_enabled=True, forced_profile=preferred,
+    )
+
+    assert ordered == [preferred]
+
+
+def test_profile_click_reconnects_only_when_tunnel_is_active():
+    profile = ProxyProfile(id="clicked-profile", name="Clicked")
+
+    class ClickStorage:
+        def __init__(self):
+            self.profiles = [profile]
+            self.selected_id = ""
+            self.settings = {}
+
+        def selected(self):
+            return profile if self.selected_id == profile.id else None
+
+    class TextStub:
+        def setText(self, _value):
+            return None
+
+        def set_secondary(self, _value):
+            return None
+
+    item = SimpleNamespace(data=lambda _role: profile.id)
+    queued = []
+    dummy = SimpleNamespace(
+        storage=ClickStorage(),
+        active_profile=TextStub(), route_card=TextStub(), ping_label=TextStub(),
+        latency_card=SimpleNamespace(sparkline=SimpleNamespace(add_value=lambda _value: None)),
+        connecting=False, engine=SimpleNamespace(running=False),
+        _profile_switch_waiting=False,
+        _profile_route_label=lambda _profile: "route",
+        _update_config_actions=lambda: None,
+        _queue_profile_switch=queued.append,
+    )
+
+    MainWindow._profile_clicked(dummy, item)
+    assert queued == []
+
+    dummy.engine.running = True
+    MainWindow._profile_clicked(dummy, item)
+    assert queued == [profile.id]
+
+
+def test_rapid_profile_switch_uses_last_click_and_starts_once(monkeypatch):
+    first = ProxyProfile(id="first", name="First")
+    second = ProxyProfile(id="second", name="Second")
+    scheduled = []
+    cancelled = []
+    started = []
+    storage = SimpleNamespace(profiles=[first, second], selected_id=first.id)
+    dummy = SimpleNamespace(
+        storage=storage,
+        _pending_profile_switch_id="",
+        _profile_switch_waiting=False,
+        _forced_profile_id="",
+        _connect_thread=None,
+        _closing=False,
+        connecting=True,
+        connection_error="",
+        _cancel_connect_attempt=lambda **kwargs: cancelled.append(kwargs),
+        _set_state=lambda _running: None,
+        _set_connection_visual=lambda _state: None,
+        _set_activity=lambda *_args: None,
+        toggle_connection=lambda: started.append(True),
+    )
+    dummy._resume_profile_switch = lambda: MainWindow._resume_profile_switch(dummy)
+    monkeypatch.setattr(ui_module.QTimer, "singleShot",
+                        lambda _delay, callback: scheduled.append(callback))
+
+    MainWindow._queue_profile_switch(dummy, first.id)
+    MainWindow._queue_profile_switch(dummy, second.id)
+
+    assert len(scheduled) == 1
+    assert cancelled == [{"notify": False}]
+    scheduled[0]()
+    assert storage.selected_id == second.id
+    assert dummy._forced_profile_id == second.id
+    assert started == [True]
+
+
+def test_latency_card_shows_8888_tunnel_latency():
     class LabelStub:
         def __init__(self):
             self.text = ""
@@ -257,17 +418,55 @@ def test_latency_card_shows_testing_then_live_tunnel_result():
             set_secondary=secondary.append,
             sparkline=sparkline,
         ),
-        tr=lambda _fa, en: en,
+        engine=SimpleNamespace(tun_running=True),
+        _target_latency_generation=3,
+        _target_latency_busy=True,
+        _target_latency_pending=False,
     )
 
     MainWindow._set_latency(dummy, 0.0, "testing")
     assert label.text == "…"
-    assert secondary[-1] == "Testing route…"
+    assert secondary[-1] == "8.8.8.8 • Checking…"
 
-    MainWindow._set_latency(dummy, 87.6, "tunnel")
+    MainWindow._target_latency_finished(dummy, 87.6, "tun", 3)
     assert label.text == "88 ms"
-    assert secondary[-1] == "Live tunnel test"
+    assert secondary[-1] == "8.8.8.8 • TUN TLS"
     assert sparkline.values == [87.6]
+
+
+def test_latency_card_falls_back_to_direct_8888_ping():
+    label = SimpleNamespace(text="", setText=lambda value: setattr(label, "text", value))
+    secondary = []
+    sparkline = []
+    dummy = SimpleNamespace(
+        ping_label=label,
+        latency_card=SimpleNamespace(
+            set_secondary=secondary.append,
+            sparkline=SimpleNamespace(add_value=sparkline.append),
+        ),
+        engine=SimpleNamespace(tun_running=True),
+        _target_latency_generation=8,
+        _target_latency_busy=True,
+        _target_latency_pending=False,
+    )
+
+    MainWindow._target_latency_finished(dummy, 62.0, "direct-fallback", 8)
+
+    assert label.text == "62 ms"
+    assert secondary[-1] == "8.8.8.8 • Direct fallback"
+    assert sparkline == [62.0]
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Reply from 8.8.8.8: bytes=32 time=62ms TTL=117", 62.0),
+        ("Reply from 8.8.8.8: bytes=32 time<1ms TTL=117", 1.0),
+        ("Request timed out.", None),
+    ],
+)
+def test_parse_direct_8888_ping(output, expected):
+    assert ui_module._parse_ping_latency(output) == expected
 
 
 def test_close_event_hides_window_when_user_chooses_system_tray():
@@ -438,3 +637,312 @@ def test_verified_connection_enables_windows_proxy_by_default():
     assert enabled is True
     assert engine.enable_calls == [cancel]
     assert activity[-1][0] == "Applying Windows system proxy…"
+
+
+def test_verified_connection_starts_tun_and_requires_youtube_traffic():
+    calls = []
+
+    class EngineStub:
+        def suspend_system_proxy_for_tun(self):
+            calls.append("proxy-off")
+
+        def enable_tun(self, cancel):
+            calls.append(("tun-on", cancel))
+
+        def disable_tun(self):
+            calls.append("tun-off")
+
+        def probe_tun(self, **kwargs):
+            calls.append(("probe", kwargs))
+            return True, "HTTP 204"
+
+    dummy = SimpleNamespace(
+        storage=StorageStub(settings={"tun_mode": True, "proxy_mode": True}),
+        engine=EngineStub(),
+        bridge=SimpleNamespace(
+            activity=SimpleNamespace(emit=lambda *args: calls.append(("activity", args))),
+        ),
+        _tun_mode_enabled=lambda: True,
+        _proxy_mode_enabled=lambda: True,
+        _apply_proxy_mode_after_probe=lambda _cancel: (_ for _ in ()).throw(
+            AssertionError("Windows Proxy must not be enabled in TUN Mode")
+        ),
+        tr=lambda _fa, en: en,
+    )
+    cancel = object()
+
+    mode = MainWindow._apply_connection_mode_after_probe(dummy, cancel)
+
+    assert mode == "tun"
+    assert calls[1] == ("tun-on", cancel)
+    probe = calls[2][1]
+    assert probe["preferred_url"] == "https://www.youtube.com/generate_204"
+    assert probe["require_preferred"] is True
+    assert probe["cancel_event"] is cancel
+    assert calls[3] == "proxy-off"
+
+
+def test_turning_tun_off_live_restores_saved_windows_proxy_preference():
+    calls = []
+
+    class EngineStub:
+        def disable_tun(self):
+            calls.append("tun-off")
+
+        def enable_system_proxy(self):
+            calls.append("proxy-on")
+
+        def disable_system_proxy(self):
+            calls.append("proxy-off")
+
+    dummy = SimpleNamespace(
+        engine=EngineStub(),
+        _tun_mode_enabled=lambda: False,
+        _proxy_mode_enabled=lambda: True,
+    )
+
+    enabled = MainWindow._apply_tun_mode_live(dummy)
+
+    assert enabled is False
+    assert calls == ["proxy-on", "tun-off"]
+
+
+def test_live_tun_failure_restores_windows_proxy_and_stops_tun():
+    calls = []
+
+    class EngineStub:
+        def suspend_system_proxy_for_tun(self):
+            calls.append("proxy-off")
+
+        def enable_tun(self):
+            calls.append("tun-on")
+
+        def probe_tun(self, **_kwargs):
+            return False, "YouTube timeout"
+
+        def disable_tun(self):
+            calls.append("tun-off")
+
+        def enable_system_proxy(self):
+            calls.append("proxy-on")
+
+    dummy = SimpleNamespace(
+        engine=EngineStub(),
+        _tun_mode_enabled=lambda: True,
+        _proxy_mode_enabled=lambda: True,
+    )
+
+    try:
+        MainWindow._apply_tun_mode_live(dummy)
+        assert False, "failed TUN verification must be reported"
+    except RuntimeError as exc:
+        assert "YouTube timeout" in str(exc)
+
+    assert calls == ["tun-on", "tun-off", "proxy-on"]
+
+
+def test_live_tun_probe_does_not_hold_mode_mutation_lock():
+    calls = []
+
+    class RecordingLock:
+        depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args):
+            self.depth -= 1
+
+    lock = RecordingLock()
+
+    class EngineStub:
+        def enable_tun(self, _cancel, expected_run_id=None):
+            assert lock.depth == 1
+            calls.append(("tun-on", expected_run_id))
+
+        def probe_tun(self, **_kwargs):
+            assert lock.depth == 0
+            calls.append("probe")
+            return True, "HTTP 204"
+
+        def suspend_system_proxy_for_tun(self, expected_run_id=None):
+            assert lock.depth == 1
+            calls.append(("proxy-suspend", expected_run_id))
+
+    dummy = SimpleNamespace(
+        engine=EngineStub(),
+        _proxy_mode_apply_lock=lock,
+        _tun_mode_enabled=lambda: True,
+        _proxy_mode_enabled=lambda: True,
+    )
+
+    enabled = MainWindow._apply_tun_mode_live(
+        dummy, 17, threading.Event(), lambda: True
+    )
+
+    assert enabled is True
+    assert lock.depth == 0
+    assert calls == [("tun-on", 17), "probe", ("proxy-suspend", 17)]
+
+
+def test_stale_live_tun_worker_never_mutates_a_new_engine_run():
+    calls = []
+    active = {"current": True}
+
+    class EngineStub:
+        run_id = 1
+        tun_running = True
+
+        def enable_tun(self, _cancel, expected_run_id=None):
+            calls.append(("tun-on", expected_run_id))
+
+        def probe_tun(self, **_kwargs):
+            calls.append("probe")
+            self.run_id = 2
+            active["current"] = False
+            return True, "HTTP 204"
+
+        def suspend_system_proxy_for_tun(self, **_kwargs):
+            calls.append("proxy-suspend")
+
+        def disable_tun(self, **_kwargs):
+            calls.append("tun-off")
+
+        def enable_system_proxy(self, **_kwargs):
+            calls.append("proxy-on")
+
+    dummy = SimpleNamespace(
+        engine=EngineStub(),
+        _tun_mode_enabled=lambda: True,
+        _proxy_mode_enabled=lambda: True,
+    )
+
+    with pytest.raises(EngineCancelled):
+        MainWindow._apply_tun_mode_live(
+            dummy, 1, threading.Event(), lambda: active["current"]
+        )
+
+    assert calls == [("tun-on", 1), "probe"]
+
+
+def test_failed_live_tun_stop_keeps_tun_and_suspends_windows_proxy():
+    calls = []
+
+    class EngineStub:
+        tun_running = True
+
+        def enable_system_proxy(self):
+            calls.append("proxy-on")
+
+        def disable_tun(self):
+            calls.append("tun-off")
+            raise RuntimeError("sing-box did not stop")
+
+        def suspend_system_proxy_for_tun(self):
+            calls.append("proxy-suspend")
+
+    dummy = SimpleNamespace(
+        engine=EngineStub(),
+        _tun_mode_enabled=lambda: False,
+        _proxy_mode_enabled=lambda: True,
+    )
+
+    with pytest.raises(RuntimeError, match="did not stop"):
+        MainWindow._apply_tun_mode_live(dummy)
+
+    assert calls == ["proxy-on", "tun-off", "proxy-suspend"]
+
+
+def test_failed_tun_stop_ui_reflects_still_running_runtime(monkeypatch):
+    class ToggleStub:
+        def __init__(self):
+            self.checked = None
+
+        def blockSignals(self, _value):
+            pass
+
+        def setChecked(self, value):
+            self.checked = value
+
+    class OptionStub:
+        def __init__(self):
+            self.active = None
+            self.enabled = None
+
+        def setProperty(self, _name, value):
+            self.active = value
+
+        def setEnabled(self, value):
+            self.enabled = value
+
+    settings = {"tun_mode": False}
+    tun = ToggleStub()
+    tun_option = OptionStub()
+    proxy_option = OptionStub()
+    errors = []
+    dummy = SimpleNamespace(
+        engine=SimpleNamespace(tun_running=True),
+        storage=StorageStub(settings=settings),
+        tun_mode=tun,
+        tun_option=tun_option,
+        proxy_option=proxy_option,
+        _tun_mode_enabled=lambda: bool(settings["tun_mode"]),
+        _save_flag=lambda key, value: settings.__setitem__(key, value),
+        _handle_error=errors.append,
+    )
+    monkeypatch.setattr(ui_module, "_restyle", lambda _widget: None)
+
+    MainWindow._tun_mode_apply_finished(
+        dummy, False, False, "sing-box did not stop"
+    )
+
+    assert settings["tun_mode"] is True
+    assert tun.checked is True
+    assert tun_option.active is True
+    assert proxy_option.enabled is False
+    assert errors == ["sing-box did not stop"]
+
+
+def test_connect_mode_rechecks_toggle_and_hands_off_without_direct_gap():
+    calls = []
+    settings = {"tun_mode": True, "proxy_mode": True}
+
+    class EngineStub:
+        tun_running = False
+
+        def enable_tun(self, _cancel):
+            calls.append("tun-on")
+            self.tun_running = True
+            settings["tun_mode"] = False
+
+        def enable_system_proxy(self, _cancel):
+            calls.append("proxy-on")
+
+        def disable_tun(self):
+            calls.append("tun-off")
+            self.tun_running = False
+
+        def disable_system_proxy(self):
+            calls.append("proxy-off")
+
+        def probe_tun(self, **_kwargs):
+            raise AssertionError("The changed preference must be rechecked before probing")
+
+    engine = EngineStub()
+    dummy = SimpleNamespace(
+        engine=engine,
+        storage=StorageStub(settings=settings),
+        bridge=SimpleNamespace(
+            activity=SimpleNamespace(emit=lambda *_args: None),
+        ),
+        _tun_mode_enabled=lambda: bool(settings["tun_mode"]),
+        _proxy_mode_enabled=lambda: bool(settings["proxy_mode"]),
+        _apply_proxy_mode_after_probe=lambda _cancel: calls.append("proxy-verified") or True,
+        tr=lambda _fa, en: en,
+    )
+
+    mode = MainWindow._apply_connection_mode_after_probe(dummy, object())
+
+    assert mode == "proxy"
+    assert calls == ["tun-on", "proxy-on", "tun-off", "proxy-verified"]

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """Render deterministic, offscreen visual-QA screenshots of the desktop UI.
 
 The harness deliberately isolates ``APPDATA`` before importing the app. This
@@ -30,15 +30,19 @@ from typing import Iterable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = PROJECT_ROOT / "qa_artifacts"
 
-# These must be set before importing either PySide6 or uac_desktop. In
-# particular, uac_desktop.paths resolves DATA_DIR at import time.
+
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_OPENGL", "software")
 os.environ.setdefault("QSG_RHI_BACKEND", "software")
 
 
-PAGE_NAMES = ("home", "configs", "sni", "logs", "bypass", "tools", "support")
-DEFAULT_SIZES = {"desktop": (1440, 900), "compact": (1120, 760)}
+PAGE_NAMES = (
+    "home", "configs", "sni-maker", "sni", "logs", "bypass", "tools", "support"
+)
+PAGE_INDEXES = {name: index for index, name in enumerate(PAGE_NAMES)}
+PAGE_ALIASES = {"maker": "sni-maker", "config-maker": "sni-maker"}
+DEFAULT_SIZES = {"desktop": (1440, 900), "compact": (1080, 700)}
 
 
 def _csv(value: str) -> list[str]:
@@ -110,6 +114,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="Remove prior PNG/report artifacts before rendering (default: true)",
     )
+    parser.add_argument(
+        "--sample-data",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Populate SNI Maker with deterministic QA rows (default: true)",
+    )
     args = parser.parse_args(argv)
 
     languages = _csv(args.languages)
@@ -121,10 +131,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     pages = _csv(args.pages)
     if pages == ["all"]:
         pages = list(PAGE_NAMES)
+    pages = [PAGE_ALIASES.get(page, page) for page in pages]
     invalid_pages = sorted(set(pages) - set(PAGE_NAMES))
     if not pages or invalid_pages:
         parser.error(f"Unknown page(s): {', '.join(invalid_pages) or 'empty'}")
-    # Preserve the user's order while dropping duplicates.
+
     args.pages = list(dict.fromkeys(pages))
     args.settle_ms = max(0, min(args.settle_ms, 5_000))
     return args
@@ -195,14 +206,140 @@ figcaption{padding:9px 2px 1px;color:#9cb6ca;font-size:13px}
     (output / "index.html").write_text(document, encoding="utf-8")
 
 
+def _seed_sni_maker(window) -> int:
+    from uac_desktop.models import ProxyProfile
+
+    country_specs = (
+        ("DE", "Germany", 72.0, 7),
+        ("CH", "Switzerland", 88.0, 6),
+        ("FR", "France", 94.0, 6),
+        ("NL", "Netherlands", 103.0, 5),
+        ("JP", "Japan", 146.0, 5),
+        ("SG", "Singapore", 171.0, 4),
+        ("US", "United States", 213.0, 4),
+    )
+    rows = []
+    source_lines = []
+    sequence = 0
+    for code, country, base_ping, count in country_specs:
+        window._maker_country_labels[code] = country
+        for offset in range(count):
+            sequence += 1
+            key = f"qa-{code.lower()}-{offset + 1:02d}"
+            host = f"qa-{code.lower()}-{offset + 1:02d}.example.net"
+            if sequence % 2:
+                uri = (
+                    f"vless://00000000-0000-4000-8000-{sequence:012d}@127.0.0.1:40443"
+                    f"?security=tls&type=ws&sni={host}&host={host}&path=%2Fqa"
+                    f"#QA-{code}-{offset + 1:02d}"
+                )
+                protocol = "vless"
+            else:
+                uri = (
+                    f"trojan://qa-{sequence:04d}@127.0.0.1:40443"
+                    f"?security=tls&type=ws&sni={host}&host={host}&path=%2Fqa"
+                    f"#QA-{code}-{offset + 1:02d}"
+                )
+                protocol = "trojan"
+            ping = base_ping + offset * 7
+            label = f"{country} · QA Route {offset + 1:02d} · SNI"
+            rows.append(
+                {
+                    "key": key,
+                    "uri": uri,
+                    "source_uri": uri,
+                    "status": "healthy",
+                    "country_code": code,
+                    "ping_ms": ping,
+                    "checked": sequence <= 3,
+                    "label": label,
+                    "error": f"203.0.113.{sequence} · cloudflare-trace",
+                }
+            )
+            profile = ProxyProfile(
+                id=key,
+                name=label,
+                source_uri=uri,
+                protocol=protocol,
+                country_code=code,
+                observed_country_code=code,
+                observed_country_name=country,
+                observed_exit_ip=f"203.0.113.{sequence}",
+                verified_spoof=True,
+                origin="sni-maker",
+                last_ping_ok=True,
+                last_ping_ms=ping,
+            )
+            window._maker_profiles[key] = profile
+            window._maker_base_names[key] = f"QA Route {offset + 1:02d}"
+            if len(source_lines) < 6:
+                source_lines.append(uri)
+    extra_statuses = (
+        ("testing", "XX", None, "QA live route", "Waiting for live response"),
+        ("testing", "XX", None, "QA live route 2", "TLS handshake"),
+        ("failed", "XX", None, "QA failed route", "TLS timeout"),
+        ("converted", "XX", None, "QA converted route", "Ready for live test"),
+        ("ready", "XX", None, "QA SNI route", "Already SNI-compatible"),
+        ("skipped", "XX", None, "Unsupported QA route", "Unsupported protocol"),
+    )
+    for offset, (status, code, ping, label, error) in enumerate(extra_statuses, 1):
+        key = f"qa-extra-{offset:02d}"
+        uri = (
+            f"vless://00000000-0000-4000-8001-{offset:012d}"
+            f"@qa-extra.example:443#QA-extra-{offset}"
+        )
+        rows.append(
+            {
+                "key": key,
+                "uri": uri,
+                "source_uri": uri,
+                "status": status,
+                "country_code": code,
+                "ping_ms": ping,
+                "label": label,
+                "error": error,
+            }
+        )
+        if status != "skipped":
+            window._maker_profiles[key] = ProxyProfile(
+                id=key,
+                name=label,
+                source_uri=uri,
+                protocol="vless",
+                origin="sni-maker",
+            )
+            window._maker_base_names[key] = label
+    window.maker_source_editor.setPlainText("\n".join(source_lines))
+    window.maker_model.append_batch(rows, deduplicate=True)
+    window.maker_progress.setMaximum(len(rows))
+    window.maker_progress.setValue(len(rows) - 2)
+    return len(rows)
+
+
+def _set_sni_maker_sample_language(window, language: str, total: int) -> None:
+    persian = language == "fa"
+    window.maker_import_badge.setText(
+        f"{total} کانفیگ نمونه آماده تست"
+        if persian else f"{total} sample configs ready"
+    )
+    window.maker_progress.set_status(
+        "نمایش نمونه تست زنده" if persian else "Live test sample",
+        "success",
+    )
+    window.maker_progress.setFormat(
+        f"{total - 2} از {total} کانفیگ پردازش شد"
+        if persian else f"{total - 2} of {total} configs processed"
+    )
+
+
 def render(args: argparse.Namespace) -> int:
     output = args.output_dir.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     if args.clean:
         _clean_output(output)
 
-    # A separate APPDATA root prevents Storage migrations/default-profile seeds
-    # from touching the real desktop app. Re-create it for reproducible runs.
+
+
     sandbox_appdata = output / "_sandbox_appdata"
     if args.clean:
         shutil.rmtree(sandbox_appdata, ignore_errors=True)
@@ -224,9 +361,12 @@ def render(args: argparse.Namespace) -> int:
     app.setFont(QFont("Vazirmatn", 10))
     app.setStyleSheet(STYLE)
 
+    MainWindow._queue_target_latency_probe = lambda self: None
+    MainWindow.check_for_updates = lambda self, manual=False: None
     window = MainWindow()
-    # The harness does not invoke closeEvent/shutdown: no engine action was
-    # started, so hiding/deleting the widget is the cleanest frontend-only exit.
+    maker_sample_count = _seed_sni_maker(window) if args.sample_data else 0
+
+
     window.setAttribute(Qt.WA_DontShowOnScreen, False)
     window.show()
     _process_events(app, max(args.settle_ms, 100))
@@ -235,12 +375,14 @@ def render(args: argparse.Namespace) -> int:
     failures: list[str] = []
     for language in args.languages:
         window.language = language
-        window._apply_language()  # frontend-only; unlike toggle_language, does not persist
+        window._apply_language()
+        if maker_sample_count:
+            _set_sni_maker_sample_language(window, language, maker_sample_count)
         for viewport, (width, height) in args.sizes.items():
             window.resize(width, height)
             _process_events(app, args.settle_ms)
             for page in args.pages:
-                page_index = PAGE_NAMES.index(page)
+                page_index = PAGE_INDEXES[page]
                 window.show_page(page_index)
                 _process_events(app, args.settle_ms)
 
@@ -251,18 +393,29 @@ def render(args: argparse.Namespace) -> int:
                 if not saved or not path.exists() or path.stat().st_size < 1_000:
                     failures.append(f"Capture failed or is suspiciously small: {filename}")
                     continue
-                captures.append(
-                    {
-                        "file": filename,
-                        "language": language,
-                        "viewport": viewport,
-                        "page": page,
-                        "requested_size": [width, height],
-                        "image_size": [pixmap.width(), pixmap.height()],
-                        "bytes": path.stat().st_size,
-                        "sha256": _sha256(path),
+                capture = {
+                    "file": filename,
+                    "language": language,
+                    "viewport": viewport,
+                    "page": page,
+                    "requested_size": [width, height],
+                    "image_size": [pixmap.width(), pixmap.height()],
+                    "bytes": path.stat().st_size,
+                    "sha256": _sha256(path),
+                }
+                if page == "sni-maker":
+                    row_height = window.maker_table.verticalHeader().defaultSectionSize()
+                    viewport_height = window.maker_table.viewport().height()
+                    capture["maker_metrics"] = {
+                        "rows": window.maker_model.rowCount(),
+                        "countries": window.maker_country_rail.count(),
+                        "results_panel_height": window.maker_results_panel.height(),
+                        "table_height": window.maker_table.height(),
+                        "table_viewport_height": viewport_height,
+                        "row_height": row_height,
+                        "estimated_visible_rows": max(0, viewport_height // max(1, row_height)),
                     }
-                )
+                captures.append(capture)
 
     window.hide()
     window.deleteLater()
@@ -275,6 +428,8 @@ def render(args: argparse.Namespace) -> int:
         "project_root": str(PROJECT_ROOT),
         "isolated_appdata": str(sandbox_appdata),
         "capture_count": len(captures),
+        "sample_data": bool(args.sample_data),
+        "maker_sample_rows": maker_sample_count,
         "failures": failures,
         "captures": captures,
     }

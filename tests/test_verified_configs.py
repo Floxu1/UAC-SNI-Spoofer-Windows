@@ -39,6 +39,7 @@ def test_existing_install_receives_verified_snapshot_once(tmp_path, monkeypatch)
     assert len([profile for profile in storage.profiles if profile.verified_spoof]) == 54
     assert storage.settings["verified_configs_version"] == 5
     assert storage.settings["proxy_mode"] is True
+    assert storage.settings["tun_mode"] is False
     assert "close_to_tray" not in storage.settings
 
     first_profiles = paths["PROFILES_FILE"].read_bytes()
@@ -144,6 +145,11 @@ def test_country_mode_orders_only_the_selected_verified_profiles(monkeypatch):
             if profile.verified_spoof and profile.country_code == (code or "NL")
         ],
     )
+    dummy._route_source_profiles = lambda verified_only=False: [
+        profile for profile in storage.profiles
+        if profile.origin not in {"user", "sni-maker"}
+        and (not verified_only or profile.verified_spoof)
+    ]
     monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 18.0))
 
     ordered = MainWindow._ordered_profiles(
@@ -185,6 +191,11 @@ def test_rotating_exit_needs_fresh_observed_country_for_fixed_picker():
     rotating.country_code = "DE"
     storage = SimpleNamespace(profiles=[rotating, stable], settings={})
     dummy = SimpleNamespace(storage=storage)
+    dummy._route_source_profiles = lambda verified_only=False: [
+        profile for profile in storage.profiles
+        if profile.origin not in {"user", "sni-maker"}
+        and (not verified_only or profile.verified_spoof)
+    ]
 
     initial = MainWindow._country_profiles(dummy, rotating.country_code)
     assert stable in initial
@@ -203,7 +214,11 @@ def test_live_exit_country_relabels_profile_and_preserves_route_id():
     saves = []
     logs = []
     dummy = SimpleNamespace(
-        storage=SimpleNamespace(save_profiles=lambda: saves.append(True)),
+        storage=SimpleNamespace(
+            settings={},
+            save_profiles=lambda: saves.append(True),
+            save_settings=lambda: None,
+        ),
         bridge=SimpleNamespace(log=SimpleNamespace(emit=logs.append)),
     )
 
@@ -220,6 +235,32 @@ def test_live_exit_country_relabels_profile_and_preserves_route_id():
     assert profile.name.startswith("Japan · Spoof 026")
     assert saves == [True]
     assert "country=JP" in logs[0]
+
+
+def test_live_exit_country_preserves_user_config_name():
+    profile = parse_many(
+        "vless://00000000-0000-0000-0000-000000000001@example.com:443"
+        "?encryption=none&security=tls&sni=example.com#My%20User%20Config"
+    )[0]
+    profile.origin = ui_module.USER_CONFIG_ORIGIN
+    original_name = profile.name
+    dummy = SimpleNamespace(
+        storage=SimpleNamespace(
+            settings={},
+            save_profiles=lambda: None,
+            save_settings=lambda: None,
+        ),
+        bridge=SimpleNamespace(log=SimpleNamespace(emit=lambda _message: None)),
+    )
+
+    MainWindow._record_profile_location(
+        dummy, profile,
+        GeoLocation(ip="8.221.169.111", country_code="JP", country="Japan",
+                    city="Tokyo", source="ipwho.is"),
+    )
+
+    assert profile.name == original_name
+    assert profile.country_code == "JP"
 
 
 def test_auto_off_ignores_country_and_uses_selected_manual_profile(monkeypatch):
@@ -248,6 +289,11 @@ def test_auto_off_ignores_country_and_uses_selected_manual_profile(monkeypatch):
             latency=SimpleNamespace(emit=lambda *_args: None),
         ),
     )
+    dummy._route_source_profiles = lambda verified_only=False: [
+        profile for profile in dummy.storage.profiles
+        if profile.origin not in {"user", "sni-maker"}
+        and (not verified_only or profile.verified_spoof)
+    ]
     monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 12.0))
 
     ordered = MainWindow._ordered_profiles(
@@ -283,6 +329,12 @@ def test_auto_on_all_countries_uses_verified_suggested_not_manual(monkeypatch):
             latency=SimpleNamespace(emit=lambda *_args: None),
         ),
     )
+    dummy._route_source_profiles = lambda verified_only=False: [
+        profile for profile in dummy.storage.profiles
+        if profile.origin not in {"user", "sni-maker"}
+        and (not verified_only or profile.verified_spoof)
+    ]
+    dummy._selected_route_source = lambda: "suggested"
     monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 12.0))
 
     ordered = MainWindow._ordered_profiles(

@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,9 +66,9 @@ def test_proxy_round_trip_restores_exact_values_types_and_absence(proxy_registry
     registry, state_file, launched = proxy_registry
     original = {
         "ProxyEnable": (0, engine_module.winreg.REG_DWORD),
-        # Preserve a non-default registry type as well as its value.
+
         "ProxyServer": ("http://old-proxy:8080", engine_module.winreg.REG_EXPAND_SZ),
-        # ProxyOverride intentionally did not exist.
+
     }
     registry.values = dict(original)
     proxy = WindowsProxy(lambda _message: None)
@@ -128,11 +129,33 @@ def test_proxy_suspend_and_resume_toggle_immediately_without_losing_snapshot(pro
     assert not state_file.exists()
 
 
+def test_proxy_tun_suspend_captures_and_restores_preexisting_proxy(proxy_registry):
+    registry, state_file, launched = proxy_registry
+    original = {
+        "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
+        "ProxyServer": ("original-proxy", engine_module.winreg.REG_SZ),
+        "ProxyOverride": ("original-bypass", engine_module.winreg.REG_SZ),
+    }
+    registry.values = dict(original)
+    proxy = WindowsProxy(lambda _message: None)
+
+    proxy.suspend_for_tun()
+
+    assert registry.values["ProxyEnable"][0] == 0
+    assert state_file.exists()
+    assert proxy.has_pending_restore
+    assert len(launched) == 1
+
+    assert proxy.disable()
+    assert registry.values == original
+    assert not state_file.exists()
+
+
 def test_partial_enable_failure_rolls_back_immediately(proxy_registry):
     registry, state_file, _launched = proxy_registry
     original = {"ProxyEnable": (0, engine_module.winreg.REG_DWORD)}
     registry.values = dict(original)
-    # Fail after ProxyEnable was temporarily cleared and ProxyServer changed.
+
     registry.fail_once = "ProxyOverride"
     proxy = WindowsProxy(lambda _message: None)
 
@@ -289,6 +312,9 @@ class _PendingProxy:
         self.suspend_calls += 1
         return True
 
+    def suspend_for_tun(self):
+        self.suspend_calls += 1
+
 
 def test_engine_can_restore_windows_proxy_without_stopping_tunnel():
     logs = []
@@ -307,6 +333,21 @@ def test_engine_can_restore_windows_proxy_without_stopping_tunnel():
     assert engine._proxy_enabled is False
     assert engine.system_proxy.has_pending_restore is True
     assert "tunnel remains active" in logs[-1]
+
+
+def test_engine_tun_suspend_owns_proxy_restore_snapshot():
+    engine = object.__new__(Engine)
+    engine._lifecycle_lock = threading.RLock()
+    engine._proxy_enabled = False
+    engine.system_proxy = _PendingProxy()
+    engine._active = True
+    engine.process = SimpleNamespace(poll=lambda: None)
+    engine.tun_process = SimpleNamespace(poll=lambda: None)
+
+    Engine.suspend_system_proxy_for_tun(engine)
+
+    assert engine.system_proxy.suspend_calls == 1
+    assert engine._proxy_enabled is False
 
 
 class _BrokenFragment:
@@ -399,7 +440,7 @@ def test_watchdog_is_launched_detached_with_owner_identity(monkeypatch):
     assert kwargs["stdout"] is subprocess.DEVNULL
     assert kwargs["stderr"] is subprocess.DEVNULL
     if sys.platform == "win32":
-        assert int(kwargs["creationflags"]) & 0x00000008  # DETACHED_PROCESS
+        assert int(kwargs["creationflags"]) & 0x00000008
 
 
 def test_frozen_watchdog_starts_with_fresh_pyinstaller_environment(monkeypatch):

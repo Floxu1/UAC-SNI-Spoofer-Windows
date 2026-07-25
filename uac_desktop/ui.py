@@ -4,9 +4,14 @@ import os
 import ctypes
 import html
 import math
+import re
+import socket
+import ssl
 import subprocess
+import sys
 import threading
 import time
+import uuid
 import webbrowser
 from dataclasses import replace
 
@@ -18,15 +23,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QColor, QFont, QIcon, QPainter, QPen, QLinearGradient, QIntValidator,
-    QRadialGradient, QPainterPath, QPixmap,
+    QRadialGradient, QPainterPath, QPixmap, QFontMetrics,
     QTextCursor, QTextCharFormat, QAction,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem,
-    QTabWidget, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QGraphicsDropShadowEffect,
+    QPushButton, QScrollArea, QStackedWidget, QTableView,
+    QTableWidget, QTableWidgetItem,
+    QTabBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect, QBoxLayout, QStyle, QStyleOptionButton, QToolButton,
     QSystemTrayIcon, QMenu,
 )
@@ -38,6 +44,14 @@ from .models import ProxyProfile, Tuning, parse_many
 from .network import (GeoLocation, ScanResult, current_ip, current_location,
                       profile_ping, scan_domains, tcp_ping)
 from .paths import ASSETS, DATA_DIR, LOG_FILE
+from .sni_batch import LiveConfigResult, SniBatchTester
+from .sni_maker import (
+    SniConfigMaker, SniImportResult, config_signature,
+)
+from .sni_maker_widgets import (
+    ConfigDropEdit, CountryRail, MakerColumns, MakerFilterProxy,
+    MakerResultsModel, MakerRoles, normalize_country_code,
+)
 from .storage import Storage
 from .icons import icon as cyber_icon, pixmap as cyber_pixmap
 from .update_checker import SemVersion, UpdateInfo, check_latest_release, parse_github_repository
@@ -46,6 +60,60 @@ from .verified_configs import COUNTRIES, VERIFIED_SPOOF_EDGE, VERIFIED_SPOOF_FAK
 
 REMOTE_CONFIGS_URL = SUGGESTED_CONFIGS_URL
 DEFAULT_UPDATE_REPO_URL = UPDATE_REPOSITORY_URL
+DEFAULT_SNI_MAKER_URL = "https://mifa.world/vless"
+LEGACY_SNI_MAKER_URLS = frozenset({
+    "https://raw.githubusercontent.com/Delta-Kronecker/Sub/refs/heads/main/config/sni/all_configs_sni.txt",
+})
+USER_CONFIG_ORIGIN = "sni-maker"
+MANUAL_PROFILE_ORIGINS = frozenset({"user"})
+USER_CONFIG_ORIGINS = frozenset({USER_CONFIG_ORIGIN})
+DIRECT_PROFILE_ORIGINS = MANUAL_PROFILE_ORIGINS | USER_CONFIG_ORIGINS
+
+
+def _parse_ping_latency(output: str) -> float | None:
+    matches = re.findall(r"(?:time|زمان)\s*[=<]\s*(\d+(?:\.\d+)?)\s*ms", output, re.IGNORECASE)
+    if not matches:
+        matches = re.findall(r"(\d+(?:\.\d+)?)\s*ms", output, re.IGNORECASE)
+    return max(1.0, float(matches[0])) if matches else None
+
+
+def _direct_ping_8888(timeout_ms: int = 1500) -> float | None:
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    command = ["ping", "-n", "1", "-w", str(timeout_ms), "8.8.8.8"]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=max(2.0, timeout_ms / 1000 + 1.0),
+            creationflags=flags,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_ping_latency(f"{result.stdout}\n{result.stderr}")
+
+
+def _tun_tls_latency_8888(timeout: float = 8.0) -> float | None:
+    started = time.perf_counter()
+    raw_socket = None
+    try:
+        raw_socket = socket.create_connection(("8.8.8.8", 443), timeout=timeout)
+        raw_socket.settimeout(timeout)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        with context.wrap_socket(raw_socket, server_hostname="dns.google"):
+            return max(1.0, (time.perf_counter() - started) * 1000)
+    except (OSError, ssl.SSLError):
+        if raw_socket is not None:
+            try:
+                raw_socket.close()
+            except OSError:
+                pass
+        return None
 
 
 def country_flag_icon(code: str, width: int = 30, height: int = 20) -> QIcon:
@@ -79,6 +147,11 @@ def country_flag_icon(code: str, width: int = 30, height: int = 20) -> QIcon:
         fill("#ffffff"); fill("#003580", width * 0.29, 0, width * 0.16, height); fill("#003580", 0, height * 0.42, width, height * 0.2)
     elif code == "JP":
         fill("#ffffff"); painter.setBrush(QColor("#bc002d")); painter.setPen(Qt.NoPen); painter.drawEllipse(QPointF(width / 2, height / 2), height * 0.29, height * 0.29)
+    elif code == "CH":
+        fill("#d52b1e")
+        arm = min(width, height) * 0.2
+        painter.fillRect(QRectF(width * 0.5 - arm * 0.5, height * 0.2, arm, height * 0.6), QColor("#ffffff"))
+        painter.fillRect(QRectF(width * 0.3, height * 0.5 - arm * 0.5, width * 0.4, arm), QColor("#ffffff"))
     elif code == "SG":
         fill("#ffffff"); fill("#ef3340", 0, 0, width, height / 2); painter.setPen(Qt.NoPen); painter.setBrush(QColor("#ffffff")); painter.drawEllipse(QPointF(width * 0.25, height * 0.25), height * 0.19, height * 0.19); painter.setBrush(QColor("#ef3340")); painter.drawEllipse(QPointF(width * 0.29, height * 0.25), height * 0.15, height * 0.15)
     elif code == "US":
@@ -89,7 +162,10 @@ def country_flag_icon(code: str, width: int = 30, height: int = 20) -> QIcon:
         for row in range(3):
             for column in range(3): painter.drawPoint(QPointF(3 + column * 4, 3 + row * 3))
     else:
-        fill("#164e63"); painter.setPen(QPen(QColor("#67fff0"), 1.4)); painter.drawEllipse(rect.adjusted(6, 2, -6, -2))
+        fill("#164e63")
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Segoe UI", max(7, int(height * 0.42)), QFont.Weight.DemiBold))
+        painter.drawText(rect, Qt.AlignCenter, code if len(code) == 2 else "•")
     painter.setClipping(False)
     painter.setPen(QPen(QColor(255, 255, 255, 105), 1.0))
     painter.setBrush(Qt.NoBrush)
@@ -144,6 +220,11 @@ class Bridge(QObject):
     state = Signal(bool)
     traffic = Signal(int, int)
     latency = Signal(float, str)
+    target_latency = Signal(float, str, int)
+    maker_imported = Signal(object, object, int)
+    maker_batch = Signal(object, int, int, int)
+    maker_done = Signal(object, int)
+    maker_failed = Signal(str, int)
     scan_progress = Signal(int, int, object, int)
     scan_done = Signal(object, int)
     scan_failed = Signal(str, int)
@@ -155,7 +236,8 @@ class Bridge(QObject):
     processes = Signal(object)
     update_checked = Signal(object, int)
     update_failed = Signal(str, int, bool)
-    proxy_mode_applied = Signal(bool, bool, str)
+    proxy_mode_applied = Signal(bool, bool, str, int, int)
+    tun_mode_applied = Signal(bool, bool, str, int, int)
 
 
 def _system_motion_enabled() -> bool:
@@ -828,6 +910,34 @@ class MiniSparkline(QWidget):
         painter.drawPath(path)
 
 
+class ElidedLabel(QLabel):
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setTextFormat(Qt.PlainText)
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setText(text)
+
+    def setText(self, text):
+        self._full_text = str(text or "")
+        self._sync_text()
+
+    def _sync_text(self):
+        width = self.contentsRect().width()
+        shown = self._full_text
+        if width > 0:
+            shown = QFontMetrics(self.font()).elidedText(
+                self._full_text, Qt.ElideRight, width
+            )
+        super().setText(shown)
+        self.setToolTip(self._full_text if shown != self._full_text else "")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_text()
+
+
 class MetricCard(MotionFrame):
     def __init__(self, title, icon_name, value_widget=None, parent=None):
         super().__init__(parent)
@@ -875,7 +985,106 @@ class MetricCard(MotionFrame):
         self.sparkline.setVisible(enabled)
 
 
+class ProfileListRow(QFrame):
+    activated = Signal(str, object)
+    activateRequested = Signal(str)
+    editRequested = Signal(str)
+    deleteRequested = Signal(str)
+
+    def __init__(self, profile_id, text, icon, activate_text, active=False, parent=None):
+        super().__init__(parent)
+        self.profile_id = str(profile_id)
+        self.setObjectName("profileListRow")
+        self.setFocusPolicy(Qt.NoFocus)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 7, 4)
+        layout.setSpacing(8)
+        icon_label = QLabel()
+        icon_label.setObjectName("profileRowIcon")
+        icon_label.setFixedSize(30, 24)
+        icon_label.setAlignment(Qt.AlignCenter)
+        icon_label.setPixmap(icon.pixmap(24, 20))
+        raw_lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if len(raw_lines) >= 4:
+            shown_lines = [raw_lines[0], raw_lines[1], "  ·  ".join(raw_lines[2:])]
+        elif len(raw_lines) == 3:
+            shown_lines = [raw_lines[0], "  ·  ".join(raw_lines[1:])]
+        else:
+            shown_lines = raw_lines or ["—"]
+        text_box = QVBoxLayout()
+        text_box.setContentsMargins(0, 0, 0, 0)
+        text_box.setSpacing(0)
+        self.text_labels = []
+        for index, line in enumerate(shown_lines):
+            label = ElidedLabel(line)
+            label.setObjectName(
+                "profileRowRecommendation"
+                if len(shown_lines) == 3 and index == 0
+                else "profileRowTitle" if index == len(shown_lines) - 2
+                else "profileRowDetail"
+            )
+            label.setLayoutDirection(Qt.LeftToRight)
+            label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            text_box.addWidget(label, 1)
+            self.text_labels.append(label)
+        self.activate_button = QToolButton()
+        self.activate_button.setObjectName("profileRowActivate")
+        self.activate_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.activate_button.setText(str(activate_text))
+        self.activate_button.setIcon(cyber_icon("check-circle" if active else "play", "#081a26", 15))
+        self.activate_button.setIconSize(QSize(15, 15))
+        self.activate_button.setProperty("active", bool(active))
+        self.activate_button.setMinimumWidth(88)
+        self.activate_button.setMaximumWidth(112)
+        self.activate_button.setFixedHeight(30)
+        self.activate_button.setFocusPolicy(Qt.NoFocus)
+        self.activate_button.setEnabled(not active)
+        self.edit_button = QToolButton()
+        self.edit_button.setObjectName("profileRowEdit")
+        self.edit_button.setIcon(cyber_icon("edit", "#79dfff", 16))
+        self.edit_button.setIconSize(QSize(16, 16))
+        self.edit_button.setFixedSize(28, 28)
+        self.edit_button.setFocusPolicy(Qt.NoFocus)
+        self.delete_button = QToolButton()
+        self.delete_button.setObjectName("profileRowDelete")
+        self.delete_button.setIcon(cyber_icon("x-circle", "#ff8798", 16))
+        self.delete_button.setIconSize(QSize(16, 16))
+        self.delete_button.setFixedSize(28, 28)
+        self.delete_button.setFocusPolicy(Qt.NoFocus)
+        layout.addWidget(icon_label)
+        layout.addLayout(text_box, 1)
+        layout.addWidget(self.activate_button)
+        layout.addWidget(self.edit_button)
+        layout.addWidget(self.delete_button)
+        self.activate_button.clicked.connect(
+            lambda: self.activateRequested.emit(self.profile_id)
+        )
+        self.edit_button.clicked.connect(
+            lambda: self.editRequested.emit(self.profile_id)
+        )
+        self.delete_button.clicked.connect(
+            lambda: self.deleteRequested.emit(self.profile_id)
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.activated.emit(self.profile_id, event.modifiers())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.editRequested.emit(self.profile_id)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
 class EmptyListWidget(QListWidget):
+    deleteRequested = Signal()
+    resized = Signal()
+
     def __init__(self, icon_name="database", parent=None):
         super().__init__(parent)
         self.empty_icon = icon_name
@@ -901,6 +1110,17 @@ class EmptyListWidget(QListWidget):
         painter.setPen(QColor("#7993b3"))
         font.setPointSize(9); font.setWeight(QFont.Normal); painter.setFont(font)
         painter.drawText(QRectF(30, area.center().y() + 16, area.width() - 60, 44), Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, self.empty_subtitle)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete:
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
 
 
 class NumericInput(QFrame):
@@ -1244,7 +1464,8 @@ class CloseChoiceDialog(QDialog):
 
 
 class ProfileDialog(QDialog):
-    def __init__(self, parent, profile: ProxyProfile | None = None, language: str = "fa"):
+    def __init__(self, parent, profile: ProxyProfile | None = None, language: str = "fa",
+                 fake_sni: str = ""):
         super().__init__(parent); self.setObjectName("profileDialog"); self._animated = False; t = lambda fa, en: en if language == "en" else fa; self.setWindowTitle(t("ویرایش کانفیگ", "Edit Config") if profile else t("افزودن کانفیگ", "Add Config")); self.resize(700, 680); self.setMinimumSize(620, 580)
         self.setAccessibleName("Edit proxy configuration" if profile else "Add proxy configuration")
         self.setLayoutDirection(Qt.LeftToRight if language == "en" else Qt.RightToLeft)
@@ -1263,14 +1484,17 @@ class ProfileDialog(QDialog):
         self.fallback = QLineEdit(profile.fallback_address if profile else "104.18.9.83")
         self.port = NumericInput(profile.port if profile else 443, 1, 65535)
         self.sni = QLineEdit(profile.sni if profile else "www.speedtest.net")
+        self.fake_sni = QLineEdit(fake_sni or (profile.spoof_fake_sni if profile else ""))
+        self.fake_sni.setReadOnly(True)
+        self.fake_sni.setPlaceholderText(t("خودکار از SNI Lab", "Automatic from SNI Lab"))
         self.method = QComboBox(); self.method.addItems(["combined", "fragment", "half", "multi", "sni_split"])
         self.method.setCurrentText(profile.method if profile else "combined")
-        for technical in (self.uri, self.address, self.fallback, self.port, self.sni, self.method): technical.setLayoutDirection(Qt.LeftToRight)
+        for technical in (self.uri, self.address, self.fallback, self.port, self.sni, self.fake_sni, self.method): technical.setLayoutDirection(Qt.LeftToRight)
         self.validation = QLabel(t("یک لینک معتبر VLESS یا Trojan وارد کنید.", "Enter a valid VLESS or Trojan URI.")); self.validation.setObjectName("validationError"); self.validation.setVisible(False)
 
         identity = self._section(t("هویت و لینک", "Identity & URI"), t("نام نمایشی و لینک اصلی کانفیگ", "Display name and original config URI"), [(t("نام", "Name"), self.name), (t("لینک VLESS / Trojan", "VLESS / Trojan URI"), self.uri)])
         identity.layout().addWidget(self.validation)
-        route = self._section(t("مسیر اتصال", "Connection Route"), t("مقادیر فنی برای Edge، SNI و روش انتقال", "Technical edge, SNI and transport values"), [(t("IP اصلی", "Primary IP"), self.address), (t("IP جایگزین", "Fallback IP"), self.fallback), (t("پورت", "Port"), self.port), (t("SNI جعلی", "Fake SNI"), self.sni), (t("روش", "Method"), self.method)])
+        route = self._section(t("مسیر اتصال", "Connection Route"), t("مقادیر فنی برای Edge، SNI و روش انتقال", "Technical edge, SNI and transport values"), [(t("IP اصلی", "Primary IP"), self.address), (t("IP جایگزین", "Fallback IP"), self.fallback), (t("پورت", "Port"), self.port), (t("SNI سرور کانفیگ", "Config Server SNI"), self.sni), (t("SNI جعلی فعال", "Active Fake SNI"), self.fake_sni), (t("روش", "Method"), self.method)])
         body_layout.addWidget(identity); body_layout.addWidget(route); body_layout.addStretch(); scroll.setWidget(body); layout.addWidget(scroll, 1)
 
         footer = QFrame(); footer.setObjectName("modalFooter"); footer_layout = QHBoxLayout(footer); footer_layout.setContentsMargins(24, 15, 24, 18); footer_layout.addStretch()
@@ -1306,11 +1530,39 @@ class ProfileDialog(QDialog):
             return None
         out = self.profile or parsed[0]
         source = parsed[0]
+        address = self.address.text().strip()
+        fallback_address = self.fallback.text().strip()
+        port = self.port.value()
+        sni = self.sni.text().strip()
+        method = self.method.currentText()
+        previous_route = None
+        if self.profile is not None:
+            previous_route = (
+                out.source_uri, out.protocol, out.config_host, out.config_port,
+                out.address, out.fallback_address, out.port, out.sni, out.method,
+            )
+        current_route = (
+            source.source_uri, source.protocol, source.config_host, source.config_port,
+            address, fallback_address, port, sni, method,
+        )
         out.name = self.name.text().strip() or source.name
         out.source_uri = source.source_uri; out.protocol = source.protocol
         out.config_host = source.config_host; out.config_port = source.config_port
-        out.address = self.address.text().strip(); out.fallback_address = self.fallback.text().strip()
-        out.port = self.port.value(); out.sni = self.sni.text().strip(); out.method = self.method.currentText(); out.origin = "user"
+        out.address = address; out.fallback_address = fallback_address
+        out.port = port; out.sni = sni; out.method = method
+        out.origin = self.profile.origin if self.profile else "user"
+        if previous_route is not None and previous_route != current_route:
+            out.last_ping_ok = False
+            out.last_ping_ms = 0.0
+            out.country_code = ""
+            out.country_latency_ms = 0
+            out.verified_spoof = False
+            out.rotating_exit = False
+            out.observed_exit_ip = ""
+            out.observed_country_code = ""
+            out.observed_country_name = ""
+            out.country_verified_at = 0.0
+            out.country_source = ""
         return out
 
 
@@ -1575,8 +1827,13 @@ class MainWindow(QMainWindow):
         self.tray_quit_action = None
         self._connect_generation = 0
         self._proxy_mode_apply_lock = threading.Lock()
+        self._mode_apply_generation = 0
+        self._mode_apply_cancel = threading.Event()
         self._connect_cancel = threading.Event()
         self._connect_thread: threading.Thread | None = None
+        self._forced_profile_id = ""
+        self._pending_profile_switch_id = ""
+        self._profile_switch_waiting = False
         self._bypass_apply_timer = QTimer(self)
         self._bypass_apply_timer.setSingleShot(True)
         self._bypass_apply_timer.setInterval(550)
@@ -1591,9 +1848,37 @@ class MainWindow(QMainWindow):
         self._log_flush_timer = QTimer(self); self._log_flush_timer.setSingleShot(True); self._log_flush_timer.setInterval(180); self._log_flush_timer.timeout.connect(self._flush_log_buffer)
         self._metrics_compact = None
         self._controls_compact = None
+        self._target_latency_generation = 0
+        self._target_latency_busy = False
+        self._target_latency_pending = False
+        self._maker_generation = 0
+        self._maker_import_generation = 0
+        self._maker_running = False
+        self._maker_cancel_event = threading.Event()
+        self._maker_tester = None
+        self._maker_profiles = {}
+        self._maker_base_names = {}
+        self._maker_country_labels = {}
+        self._maker_last_country_summary = None
+        self._maker_import_meta = {}
+        self._maker_import_in_progress = False
+        self._maker_last_loaded_url = ""
+        self._maker_last_converted_editor_text = ""
+        self._maker_guide_button = None
+        self._maker_guide_effect = None
+        self._maker_guide_animation = None
+        self._maker = SniConfigMaker(
+            fake_sni=self.storage.tuning.pattern_fake_sni,
+        )
         self.engine = Engine(self.bridge.log.emit, self.bridge.state.emit, self.bridge.traffic.emit)
+        try:
+            self.engine.recover_stale_tun()
+        except Exception as exc:
+            self._pending_file_log_lines.append(f"sing-box recovery pending: {exc}")
         self._build(); self._setup_tray(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
         self.activity_bar.set_activity("", "idle", False)
+        self._target_latency_timer = QTimer(self); self._target_latency_timer.setInterval(3000); self._target_latency_timer.timeout.connect(self._queue_target_latency_probe); self._target_latency_timer.start()
+        QTimer.singleShot(300, self._queue_target_latency_probe)
         QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
         self._update_poll_timer = QTimer(self); self._update_poll_timer.setInterval(12 * 3600 * 1000); self._update_poll_timer.timeout.connect(lambda: self.check_for_updates(manual=False)); self._update_poll_timer.start()
 
@@ -1616,6 +1901,7 @@ class MainWindow(QMainWindow):
         header_meta = {
             "Connection Center": ("shield", "فرماندهی شبکه", "NETWORK COMMAND"),
             "Configs": ("file-cog", "مدیریت مسیرها", "ROUTE LIBRARY"),
+            "SNI Config Maker": ("sparkles", "ساخت و اعتبارسنجی", "CONFIG FACTORY"),
             "SNI Lab": ("flask", "آزمایش و رتبه‌بندی", "SIGNAL LABORATORY"),
             "Live Logs": ("activity", "رویدادهای زنده", "LIVE TELEMETRY"),
             "App Bypass": ("route", "مسیریابی برنامه‌ها", "APPLICATION ROUTING"),
@@ -1659,32 +1945,32 @@ class MainWindow(QMainWindow):
 
     def _build(self):
         root = CyberRoot(); self.setCentralWidget(root); layout = QHBoxLayout(root); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0)
-        sidebar = QFrame(); self.sidebar = sidebar; sidebar.setObjectName("sidebar"); sidebar.setAttribute(Qt.WA_StyledBackground, True); sidebar.setFixedWidth(286); side = QVBoxLayout(sidebar); side.setContentsMargins(18, 20, 18, 18); side.setSpacing(4)
-        logo = QFrame(); logo.setObjectName("logoCard"); logo.setMinimumHeight(88); logo_layout = QHBoxLayout(logo); logo_layout.setContentsMargins(14, 12, 14, 12); logo_layout.setSpacing(12)
+        sidebar = QFrame(); self.sidebar = sidebar; sidebar.setObjectName("sidebar"); sidebar.setAttribute(Qt.WA_StyledBackground, True); sidebar.setFixedWidth(286); side = QVBoxLayout(sidebar); self.sidebar_layout = side; side.setContentsMargins(18, 20, 18, 18); side.setSpacing(4)
+        logo = QFrame(); self.logo_card = logo; logo.setObjectName("logoCard"); logo.setMinimumHeight(88); logo_layout = QHBoxLayout(logo); logo_layout.setContentsMargins(14, 12, 14, 12); logo_layout.setSpacing(12)
         mark = QLabel(); mark.setObjectName("logoMark"); mark.setAlignment(Qt.AlignCenter); mark.setFixedSize(52, 52); mark.setPixmap(cyber_pixmap("shield", "#031422", 29)); logo_layout.addWidget(mark)
         logo_text = QVBoxLayout(); logo_text.setSpacing(2); brand = QLabel("UAC SPOOFER"); brand.setObjectName("brand"); logo_text.addWidget(brand); version = QLabel(f"DESKTOP  {__version__}"); version.setObjectName("version"); version.setLayoutDirection(Qt.LeftToRight); logo_text.addWidget(version); logo_layout.addLayout(logo_text, 1); side.addWidget(logo); side.addSpacing(16)
         self.nav = []
-        entries = [("home", "خانه", "Home"), ("file-cog", "کانفیگ‌ها", "Configs"), ("flask", f"آزمایشگاه {ltr_isolate('SNI')}", "SNI Lab"), ("activity", "لاگ زنده", "Live Logs"), ("shield", "عبور مستقیم برنامه‌ها", "App Bypass"), ("wrench", "ابزارها", "Tools"), ("headphones", "پشتیبانی", "Support")]
+        entries = [("home", "خانه", "Home"), ("file-cog", "کانفیگ‌ها", "Configs"), ("sparkles", "سازنده کانفیگ اس‌ان‌آی", "SNI Maker"), ("flask", "آزمایشگاه اس‌ان‌آی", "SNI Lab"), ("activity", "لاگ زنده", "Live Logs"), ("shield", "عبور مستقیم برنامه‌ها", "App Bypass"), ("wrench", "ابزارها", "Tools"), ("headphones", "پشتیبانی", "Support")]
         self.nav_meta = []
         for index, (icon_name, name, english) in enumerate(entries):
             button = NavButton(english if self.language == "en" else name); button.setIcon(cyber_icon(icon_name, "#9fb4d8", 22)); button.setIconSize(QSize(22, 22)); button.setProperty("iconName", icon_name); button.clicked.connect(lambda _, i=index: self.show_page(i)); side.addWidget(button); self.nav.append(button)
             self.nav_meta.append((icon_name, name, english))
         side.addStretch()
-        self.rating_card = QFrame(); self.rating_card.setObjectName("ratingCard"); rating_layout = QVBoxLayout(self.rating_card); rating_layout.setContentsMargins(15, 13, 15, 13); rating_layout.setSpacing(4)
-        rating_title = self._bind_text(QLabel(), "از برنامه راضی هستید؟", "Enjoying the app?"); rating_title.setObjectName("ratingTitle")
-        rating_text = self._bind_text(QLabel(), "با یک ستاره از پروژه حمایت کنید.", "Support the project with a star."); rating_text.setObjectName("ratingText"); rating_text.setWordWrap(True)
-        rating_button = self._action_button("ستاره در GitHub", "Star on GitHub", "external-link", "ratingButton"); rating_button.clicked.connect(lambda: webbrowser.open(PROJECT_URL))
-        rating_layout.addWidget(rating_title); rating_layout.addWidget(rating_text); rating_layout.addWidget(rating_button); side.addWidget(self.rating_card); side.addSpacing(10)
-        footer = QFrame(); footer.setObjectName("sidebarFooter"); footer_layout = QVBoxLayout(footer); footer_layout.setContentsMargins(7, 7, 7, 7); footer_layout.setSpacing(4)
-        self.language_button = QPushButton("English"); self.language_button.setObjectName("footerAction"); self.language_button.setIcon(cyber_icon("globe", "#9fb4d8", 19)); self.language_button.setIconSize(QSize(19, 19)); self.language_button.clicked.connect(self.toggle_language); footer_layout.addWidget(self.language_button)
-        self.data_button = QPushButton("باز کردن پوشه داده‌ها"); self.data_button.setObjectName("footerAction"); self.data_button.setIcon(cyber_icon("folder", "#9fb4d8", 19)); self.data_button.setIconSize(QSize(19, 19)); self.data_button.clicked.connect(lambda: os.startfile(DATA_DIR)); footer_layout.addWidget(self.data_button); side.addWidget(footer)
+        self.rating_card = QFrame(); self.rating_card.setObjectName("ratingCard"); self.rating_card.setMinimumHeight(136); rating_layout = QVBoxLayout(self.rating_card); rating_layout.setContentsMargins(15, 13, 15, 13); rating_layout.setSpacing(4)
+        self.rating_title = self._bind_text(QLabel(), "از برنامه راضی هستید؟", "Enjoying the app?"); self.rating_title.setObjectName("ratingTitle")
+        self.rating_text = self._bind_text(QLabel(), "با یک ستاره از پروژه حمایت کنید.", "Support the project with a star."); self.rating_text.setObjectName("ratingText"); self.rating_text.setWordWrap(True)
+        self.rating_button = self._action_button("ستاره در گیت‌هاب", "Star on GitHub", "external-link", "ratingButton"); self.rating_button.setMinimumHeight(40); self.rating_button.clicked.connect(lambda: webbrowser.open(PROJECT_URL))
+        rating_layout.addWidget(self.rating_title); rating_layout.addWidget(self.rating_text); rating_layout.addWidget(self.rating_button); side.addWidget(self.rating_card); side.addSpacing(10)
+        footer = QFrame(); self.sidebar_footer = footer; footer.setObjectName("sidebarFooter"); footer_layout = QVBoxLayout(footer); footer_layout.setContentsMargins(7, 7, 7, 7); footer_layout.setSpacing(4)
+        self.language_button = QPushButton("English"); self.language_button.setObjectName("footerAction"); self.language_button.setMinimumHeight(44); self.language_button.setIcon(cyber_icon("globe", "#9fb4d8", 19)); self.language_button.setIconSize(QSize(19, 19)); self.language_button.clicked.connect(self.toggle_language); footer_layout.addWidget(self.language_button)
+        self.data_button = QPushButton("باز کردن پوشه داده‌ها"); self.data_button.setObjectName("footerAction"); self.data_button.setMinimumHeight(44); self.data_button.setIcon(cyber_icon("folder", "#9fb4d8", 19)); self.data_button.setIconSize(QSize(19, 19)); self.data_button.clicked.connect(lambda: os.startfile(DATA_DIR)); footer_layout.addWidget(self.data_button); side.addWidget(footer)
         layout.addWidget(sidebar)
         content_shell = QFrame(); content_shell.setObjectName("contentShell"); content_layout = QVBoxLayout(content_shell); content_layout.setContentsMargins(0, 0, 0, 0); content_layout.setSpacing(0)
         self.stack = QStackedWidget(); self.stack.setObjectName("content"); content_layout.addWidget(self.stack, 1)
         activity_wrap = QFrame(); self.activity_wrap = activity_wrap; activity_wrap.setObjectName("activityWrap"); activity_layout = QVBoxLayout(activity_wrap); self.activity_layout = activity_layout; activity_layout.setContentsMargins(30, 0, 30, 18)
         self.activity_bar = ActivityBar(self.language); activity_layout.addWidget(self.activity_bar); content_layout.addWidget(activity_wrap)
         layout.addWidget(content_shell, 1)
-        pages = [self._home_page(), self._configs_page(), self._scanner_page(), self._logs_page(),
+        pages = [self._home_page(), self._configs_page(), self._sni_maker_page(), self._scanner_page(), self._logs_page(),
                  self._apps_page(), self._tools_page(), self._support_page()]
         for page in pages:
             page.setObjectName("page")
@@ -1709,7 +1995,7 @@ class MainWindow(QMainWindow):
         self.orb = ConnectionOrb(); orb_caption = QLabel("NETWORK CORE"); orb_caption.setObjectName("orbCaption"); orb_caption.setAlignment(Qt.AlignCenter); orb_layout.addWidget(self.orb, alignment=Qt.AlignCenter); orb_layout.addWidget(orb_caption)
         hero_layout.addWidget(orb_shell, 2, Qt.AlignCenter); root.addWidget(hero)
 
-        self.country_card = QFrame(); self.country_card.setObjectName("countrySelectorCard"); self.country_card.setMinimumHeight(88)
+        self.country_card = QFrame(); self.country_card.setObjectName("countrySelectorCard"); self.country_card.setMinimumHeight(104)
         country_layout = QHBoxLayout(self.country_card); self.country_layout = country_layout; country_layout.setContentsMargins(16, 10, 16, 10); country_layout.setSpacing(12)
         country_icon = QLabel(); self.country_icon = country_icon; country_icon.setObjectName("countryIcon"); country_icon.setFixedSize(46, 46); country_icon.setAlignment(Qt.AlignCenter); country_icon.setPixmap(cyber_pixmap("globe", "#78fff0", 24)); country_layout.addWidget(country_icon, 0, Qt.AlignVCenter)
         country_copy = QVBoxLayout(); country_copy.setSpacing(3)
@@ -1719,13 +2005,19 @@ class MainWindow(QMainWindow):
         country_copy.addWidget(self.country_eyebrow); country_copy.addWidget(self.country_title); country_copy.addWidget(self.country_description); country_layout.addLayout(country_copy, 1)
         country_actions = QVBoxLayout(); self.country_actions = country_actions; country_actions.setSpacing(5)
         self.country_count = QLabel(); self.country_count.setObjectName("countryCount"); self.country_count.setAlignment(Qt.AlignCenter)
+        self.route_source_tabs = QTabBar(); self.route_source_tabs.setObjectName("routeSourceTabs"); self.route_source_tabs.setExpanding(True); self.route_source_tabs.setDrawBase(False)
+        self.route_source_tabs.addTab(self.tr("پیشنهادی", "Suggested")); self.route_source_tabs.addTab("User Config")
+        route_source = str(self.storage.settings.get("route_source", "suggested") or "suggested").lower()
+        self.route_source_tabs.setCurrentIndex(1 if route_source == "user-config" else 0)
+        self.route_source_tabs.setAccessibleName("Connection config source")
+        source_row = QHBoxLayout(); source_row.setSpacing(7); source_row.addWidget(self.route_source_tabs, 1); source_row.addWidget(self.country_count)
         self.country_combo = QComboBox(); self.country_combo.setObjectName("countryCombo"); self.country_combo.setMinimumWidth(300); self.country_combo.setMinimumHeight(48); self.country_combo.setAccessibleName("Exit country"); self.country_combo.setCursor(Qt.PointingHandCursor); self.country_combo.setIconSize(QSize(30, 20))
-        country_actions.addWidget(self.country_count); country_actions.addWidget(self.country_combo); country_layout.addLayout(country_actions)
+        country_actions.addLayout(source_row); country_actions.addWidget(self.country_combo); country_layout.addLayout(country_actions)
         self._refresh_country_selector()
         root.addWidget(self.country_card)
 
         self.metrics_layout = QGridLayout(); self.metrics_layout.setSpacing(14)
-        self.active_profile = QLabel("—"); self.active_profile.setWordWrap(True); self.route_card = MetricCard(self.tr("مسیر فعال", "Active Route"), "route", self.active_profile); self.route_card.title.setProperty("i18nFa", "مسیر فعال"); self.route_card.title.setProperty("i18nEn", "Active Route"); self.route_card.setMinimumWidth(230)
+        self.active_profile = ElidedLabel("—"); self.route_card = MetricCard(self.tr("مسیر فعال", "Active Route"), "route", self.active_profile); self.route_card.title.setProperty("i18nFa", "مسیر فعال"); self.route_card.title.setProperty("i18nEn", "Active Route"); self.route_card.setMinimumWidth(230)
         self.route_detail = self.route_card.secondary; self.route_detail.setWordWrap(True)
         self.ping_label = QLabel("—"); self.latency_card = MetricCard(self.tr("پینگ", "Latency"), "gauge", self.ping_label); self.latency_card.title.setProperty("i18nFa", "پینگ"); self.latency_card.title.setProperty("i18nEn", "Latency"); self.latency_card.enable_sparkline(True)
         self.up_label = QLabel("0 B"); self.upload_card = MetricCard(self.tr("آپلود", "Upload"), "upload", self.up_label); self.upload_card.title.setProperty("i18nFa", "آپلود"); self.upload_card.title.setProperty("i18nEn", "Upload")
@@ -1737,13 +2029,20 @@ class MainWindow(QMainWindow):
 
         controls = QFrame(); self.quick_controls = controls; controls.setObjectName("quickControls"); self.controls_layout = QGridLayout(controls); self.controls_layout.setContentsMargins(13, 9, 13, 9); self.controls_layout.setHorizontalSpacing(9); self.controls_layout.setVerticalSpacing(7)
         self.auto_mode = ToggleSwitch(); self.auto_mode.setChecked(self.storage.settings.get("auto_mode", True)); self.auto_option = self._toggle_option(self.auto_mode, "حالت خودکار", "Auto Mode")
-        self.pick_best = ToggleSwitch(); self.pick_best.setChecked(self.storage.settings.get("pick_best", False)); self.manual_option = self._toggle_option(self.pick_best, "انتخاب بهترین کانفیگ دستی", "Pick Best Manual Config")
+        self.pick_best = ToggleSwitch(); self.pick_best.setChecked(self.storage.settings.get("pick_best", False)); self.manual_option = self._toggle_option(self.pick_best, "انتخاب بهترین کانفیگ از لیست", "Pick Best in List")
         self.proxy_mode = ToggleSwitch(); self.proxy_mode.setChecked(self.storage.settings.get("proxy_mode", True)); self.proxy_option = self._toggle_option(self.proxy_mode, "پروکسی ویندوز", "Windows Proxy")
         self.proxy_option.setObjectName("proxyModeOption"); self.proxy_option.setProperty("active", self.proxy_mode.isChecked())
         self.proxy_mode.setToolTip(self.tr(
             "خاموش: هسته اسپوف فعال می‌ماند و فقط پروکسی سیستم ویندوز اعمال نمی‌شود.",
             "Off: the spoof core stays active; only Windows System Proxy is skipped.",
         ))
+        self.tun_mode = ToggleSwitch(); self.tun_mode.setChecked(self.storage.settings.get("tun_mode", False)); self.tun_option = self._toggle_option(self.tun_mode, "حالت TUN", "TUN Mode")
+        self.tun_option.setObjectName("tunModeOption"); self.tun_option.setProperty("active", self.tun_mode.isChecked())
+        self.tun_mode.setToolTip(self.tr(
+            "تمام ترافیک TCP و UDP ویندوز را از sing-box و هسته اسپوف عبور می‌دهد؛ پینگ CMD مستقیم و واقعی می‌ماند.",
+            "Routes Windows TCP and UDP through sing-box and the spoof core; CMD ping remains direct and real.",
+        ))
+        self.proxy_option.setEnabled(not self.tun_mode.isChecked())
         self.carrier = QComboBox(); self.carrier.setObjectName("carrierModeCombo"); self.carrier.addItems(["auto", "mci", "irancell"]); self.carrier.setCurrentText(self.storage.tuning.carrier_mode); self.carrier.setMinimumWidth(100); self.carrier.setMaximumWidth(120); self.carrier.setAccessibleName("Carrier")
         self.carrier_control = QFrame(); self.carrier_control.setObjectName("carrierControl"); self.carrier_control.setMinimumWidth(190); self.carrier_control.setMaximumWidth(220); carrier_layout = QHBoxLayout(self.carrier_control); self.carrier_layout = carrier_layout; carrier_layout.setContentsMargins(7, 3, 7, 3); carrier_layout.setSpacing(6); self.carrier_label = self._bind_text(QLabel(), "اپراتور", "Carrier"); self.carrier_label.setObjectName("controlLabel"); carrier_layout.addWidget(self.carrier_label); carrier_layout.addWidget(self.carrier)
         self.tune_button = self._action_button("تنظیمات پیشرفته", "Advanced Settings", "settings", "advancedButton"); self.tune_button.setProperty("chevron", True); self.tune_button.setIconSize(QSize(19, 19)); self.tune_button.clicked.connect(self.open_tuning)
@@ -1787,26 +2086,30 @@ class MainWindow(QMainWindow):
         self._controls_compact = compact
         while self.controls_layout.count():
             self.controls_layout.takeAt(0)
-        for column in range(6):
+        for column in range(7):
             self.controls_layout.setColumnStretch(column, 0)
-        for option in (self.auto_option, self.manual_option, self.proxy_option):
+        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option):
             option.layout().setContentsMargins(7, 5, 7, 5)
             option.layout().setSpacing(7)
         if compact:
             self.controls_layout.addWidget(self.auto_option, 0, 0)
             self.controls_layout.addWidget(self.manual_option, 0, 1)
-            self.controls_layout.addWidget(self.proxy_option, 0, 2)
-            self.controls_layout.addWidget(self.carrier_control, 1, 0)
-            self.controls_layout.addWidget(self.tune_button, 1, 1, 1, 2)
-            for column in range(3): self.controls_layout.setColumnStretch(column, 1)
+            self.controls_layout.addWidget(self.tun_option, 0, 2)
+            self.controls_layout.addWidget(self.proxy_option, 1, 0)
+            self.controls_layout.addWidget(self.carrier_control, 1, 1)
+            self.controls_layout.addWidget(self.tune_button, 1, 2)
+            self.controls_layout.setColumnStretch(0, 1)
+            self.controls_layout.setColumnStretch(1, 2)
+            self.controls_layout.setColumnStretch(2, 1)
             self.tune_button.setMaximumWidth(16777215)
         else:
             self.controls_layout.addWidget(self.auto_option, 0, 0)
             self.controls_layout.addWidget(self.manual_option, 0, 1)
             self.controls_layout.addWidget(self.proxy_option, 0, 2)
-            self.controls_layout.addWidget(self.carrier_control, 0, 3)
-            self.controls_layout.setColumnStretch(4, 1)
-            self.controls_layout.addWidget(self.tune_button, 0, 5)
+            self.controls_layout.addWidget(self.tun_option, 0, 3)
+            self.controls_layout.addWidget(self.carrier_control, 0, 4)
+            self.controls_layout.setColumnStretch(5, 1)
+            self.controls_layout.addWidget(self.tune_button, 0, 6)
             self.tune_button.setMaximumWidth(230)
 
     def _layout_home_dashboard(self, narrow=None, dense=None):
@@ -1821,7 +2124,7 @@ class MainWindow(QMainWindow):
         self.home_root.setSpacing(spacing)
         self.home_root.setAlignment(Qt.AlignTop)
         header_height = 88 if dense else 100
-        country_height = 86 if dense else 92
+        country_height = 104
         metric_height = 116 if dense or narrow else 142
         controls_height = 106
         fixed = header_height + country_height + metric_height + controls_height + margins[1] + margins[3] + spacing * 4
@@ -1840,10 +2143,10 @@ class MainWindow(QMainWindow):
         self.country_layout.setContentsMargins(*(12, 7, 12, 7) if dense else (16, 10, 16, 10))
         self.country_layout.setSpacing(9 if dense else 12)
         self.country_icon.setFixedSize(*(40, 40) if dense else (46, 46))
-        self.country_actions.setDirection(QBoxLayout.LeftToRight if dense else QBoxLayout.TopToBottom)
+        self.country_actions.setDirection(QBoxLayout.TopToBottom)
         self.country_combo.setMinimumWidth(210 if dense else 280)
         self.country_combo.setMaximumWidth(255 if dense else 340)
-        self.country_combo.setFixedHeight(38 if dense else 44)
+        self.country_combo.setFixedHeight(38 if dense else 42)
         self.country_count.setMaximumHeight(38 if dense else 28)
         _restyle(self.country_card)
         self._layout_metric_cards(dense or narrow)
@@ -1853,7 +2156,7 @@ class MainWindow(QMainWindow):
         self._layout_control_bar(True)
         self.quick_controls.setFixedHeight(controls_height)
         self.controls_layout.setContentsMargins(10, 5, 10, 5)
-        for option in (self.auto_option, self.manual_option, self.proxy_option):
+        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option):
             option.setFixedHeight(40)
         self.carrier_layout.setContentsMargins(4, 3, 4, 3)
         self.carrier_layout.setSpacing(4)
@@ -1861,6 +2164,73 @@ class MainWindow(QMainWindow):
         self.carrier_control.setFixedHeight(42)
         self.tune_button.setFixedHeight(42)
         self.activity_layout.setContentsMargins(18 if dense else 30, 0, 18 if dense else 30, 8 if dense else 14)
+
+    def _layout_sni_maker(self):
+        if not hasattr(self, "maker_root"):
+            return
+        dense = self.height() < 790
+        narrow_actions = self.maker_page.width() < 1080
+        self.maker_root.setContentsMargins(
+            *(12, 8, 12, 8) if dense else (24, 16, 24, 14)
+        )
+        self.maker_root.setSpacing(6 if dense else 10)
+        self.maker_header.setFixedHeight(82 if dense else 94)
+        header_layout = self.maker_header.layout()
+        header_layout.setContentsMargins(
+            *(10, 5, 10, 5) if dense else (15, 8, 15, 8)
+        )
+        header_icon = self.maker_header.findChild(QLabel, "pageHeaderIcon")
+        if header_icon is not None:
+            header_icon.setFixedSize(*(40, 40) if dense else (46, 46))
+        maker_title = self.maker_header.findChild(QLabel, "pageTitle")
+        maker_subtitle = self.maker_header.findChild(QLabel, "pageSubtitle")
+        if maker_title is not None:
+            maker_title.setMinimumHeight(35)
+            maker_title.setAlignment(Qt.AlignVCenter)
+        if maker_subtitle is not None:
+            maker_subtitle.setMinimumHeight(20)
+            maker_subtitle.setWordWrap(False)
+        self.maker_source_card.setFixedHeight(128 if dense else 146)
+        self.maker_source_editor.setFixedHeight(70 if dense else 86)
+        self.maker_control.setFixedHeight(60 if dense else 62)
+        self.maker_progress.setFixedHeight(46 if dense else 48)
+        self._layout_maker_actions(narrow_actions)
+        self.maker_actions.setFixedHeight(
+            92 if narrow_actions else 60 if dense else 62
+        )
+        self.maker_table.verticalHeader().setDefaultSectionSize(42 if dense else 45)
+        self.maker_country_rail.setMinimumWidth(0)
+        self.maker_country_rail.setMaximumWidth(16777215)
+        self._position_maker_select_all()
+        _restyle(self.maker_header)
+
+    def _layout_maker_actions(self, compact):
+        compact = bool(compact)
+        if getattr(self, "_maker_actions_compact", None) == compact:
+            return
+        self._maker_actions_compact = compact
+        layout = self.maker_action_layout
+        while layout.count():
+            layout.takeAt(0)
+        for column in range(7):
+            layout.setColumnStretch(column, 0)
+        if compact:
+            layout.addWidget(self.maker_destination_label, 0, 0)
+            layout.addWidget(self.maker_add_selected_btn, 0, 1)
+            layout.addWidget(self.maker_add_country_btn, 0, 2)
+            layout.setColumnStretch(3, 1)
+            layout.addWidget(self.maker_add_all_btn, 1, 0, 1, 2)
+            layout.setColumnStretch(2, 1)
+            layout.addWidget(self.maker_copy_btn, 1, 3)
+            layout.addWidget(self.maker_export_btn, 1, 4)
+            return
+        layout.addWidget(self.maker_destination_label, 0, 0)
+        layout.addWidget(self.maker_add_selected_btn, 0, 1)
+        layout.addWidget(self.maker_add_country_btn, 0, 2)
+        layout.addWidget(self.maker_add_all_btn, 0, 3)
+        layout.setColumnStretch(4, 1)
+        layout.addWidget(self.maker_copy_btn, 0, 5)
+        layout.addWidget(self.maker_export_btn, 0, 6)
 
     def _configs_page(self):
         page = QWidget(); root = QVBoxLayout(page); root.setContentsMargins(34, 28, 34, 26); root.setSpacing(15)
@@ -1870,26 +2240,186 @@ class MainWindow(QMainWindow):
         self.add_btn = self._action_button("افزودن کانفیگ", "Add Config", "plus", "primaryAction")
         self.clip_btn = self._action_button("ورود از Clipboard", "Import Clipboard", "copy", "secondaryAction")
         self.sync_btn = self._action_button("دریافت پیشنهادی‌ها", "Sync Suggested", "refresh", "secondaryAction")
-        self.edit_btn = self._action_button("ویرایش", "Edit", "edit", "quietButton")
-        self.delete_btn = self._action_button("حذف", "Delete", "trash", "dangerButton")
+        self.clear_user_btn = self._action_button("حذف همه", "Delete All", "trash", "dangerButton")
+        self.clear_user_btn.setMaximumWidth(108)
+        self.clear_user_btn.setToolTip(self.tr("حذف همه کانفیگ‌های User Config", "Delete every User Config entry"))
         for widget in (self.add_btn, self.clip_btn, self.sync_btn): bar.addWidget(widget)
-        bar.addStretch(); bar.addWidget(self.edit_btn); bar.addWidget(self.delete_btn); root.addWidget(toolbar)
+        bar.addStretch(); bar.addWidget(self.clear_user_btn); root.addWidget(toolbar)
         panel = QFrame(); panel.setObjectName("configPanel"); panel_layout = QVBoxLayout(panel); panel_layout.setContentsMargins(0, 0, 0, 0)
-        self.profile_tabs = QTabWidget(); self.profile_tabs.setObjectName("profileTabs"); self.manual_list = EmptyListWidget("file-cog"); self.suggested_list = EmptyListWidget("server")
-        self.manual_list.setObjectName("configList"); self.suggested_list.setObjectName("configList")
-        for widget in (self.manual_list, self.suggested_list):
-            widget.setSelectionMode(QAbstractItemView.SingleSelection); widget.setSpacing(6); widget.itemDoubleClicked.connect(lambda _: self.edit_profile()); widget.itemSelectionChanged.connect(self._update_config_actions)
+        self.profile_tabs = QTabWidget(); self.profile_tabs.setObjectName("profileTabs"); self.manual_list = EmptyListWidget("file-cog"); self.user_config_list = EmptyListWidget("sparkles"); self.suggested_list = EmptyListWidget("server")
+        self.manual_list.setObjectName("manualConfigList"); self.user_config_list.setObjectName("userConfigList"); self.suggested_list.setObjectName("suggestedConfigList")
+        for widget in (self.manual_list, self.user_config_list, self.suggested_list):
+            widget.setSelectionMode(QAbstractItemView.ExtendedSelection); widget.setSpacing(4); widget.itemSelectionChanged.connect(self._update_config_actions); widget.deleteRequested.connect(self.delete_profile)
+        self.user_config_list.setSpacing(2); self.suggested_list.setSpacing(2)
         self.manual_list.set_empty_text(self.tr("هنوز کانفیگ دستی ندارید", "No manual configs yet"), self.tr("یک لینک VLESS یا Trojan اضافه یا از Clipboard وارد کنید.", "Add a VLESS or Trojan link, or import one from the clipboard."))
+        self.user_config_list.set_empty_text(self.tr("هنوز User Config ندارید", "No User Configs yet"), self.tr("کانفیگ‌های سالم را از SNI Config Maker به این بخش اضافه کنید.", "Add healthy routes from SNI Config Maker to this library."))
         self.suggested_list.set_empty_text(self.tr("هنوز پیشنهادی دریافت نشده", "No suggestions downloaded"), self.tr("برای دریافت فهرست پیشنهادی، همگام‌سازی را اجرا کنید.", "Sync the suggested repository to populate this list."))
-        self.profile_tabs.addTab(self.manual_list, self.tr("دستی", "Manual")); self.profile_tabs.addTab(self.suggested_list, self.tr("پیشنهادی", "Suggested")); self.profile_tabs.currentChanged.connect(self._update_config_actions)
+        self.profile_tabs.addTab(self.user_config_list, "User Config"); self.profile_tabs.addTab(self.manual_list, self.tr("دستی", "Manual")); self.profile_tabs.addTab(self.suggested_list, self.tr("پیشنهادی", "Suggested")); self.profile_tabs.currentChanged.connect(self._update_config_actions); self.profile_tabs.currentChanged.connect(self._profile_tab_changed)
+        self.profile_selection_bar = QFrame()
+        self.profile_selection_bar.setObjectName("profileSelectionBar")
+        selection_layout = QHBoxLayout(self.profile_selection_bar)
+        selection_layout.setContentsMargins(10, 3, 10, 3)
+        selection_layout.setSpacing(7)
+        self.profile_select_all_checkbox = QCheckBox()
+        self.profile_select_all_checkbox.setObjectName("profileSelectAll")
+        self.profile_select_all_checkbox.setLayoutDirection(Qt.LeftToRight)
+        self.profile_select_all_checkbox.setFixedSize(22, 22)
+        self.profile_select_all_label = self._bind_text(
+            QLabel(), "انتخاب همه کانفیگ‌ها", "Select all configs"
+        )
+        self.profile_select_all_label.setObjectName("profileSelectionLabel")
+        selection_layout.addWidget(self.profile_select_all_checkbox)
+        selection_layout.addWidget(self.profile_select_all_label)
+        selection_layout.addStretch()
+        self.profile_select_all_checkbox.setAccessibleName("Select all configurations in the active list")
+        self.profile_select_all_checkbox.setToolTip(self.tr(
+            "انتخاب یا لغو انتخاب همه کانفیگ‌های لیست فعال",
+            "Select or clear every configuration in the active list",
+        ))
+        self.profile_select_all_checkbox.clicked.connect(
+            self._set_current_profile_list_selection
+        )
+        for widget in (
+                self.user_config_list, self.manual_list,
+                self.suggested_list):
+            widget.setViewportMargins(0, 42, 0, 0)
+            widget.resized.connect(self._position_profile_select_all)
         panel_layout.addWidget(self.profile_tabs); root.addWidget(panel, 1)
         self._update_config_actions()
+        return page
+
+    def _sni_maker_page(self):
+        page = QWidget(); self.maker_page = page; root = QVBoxLayout(page); self.maker_root = root; root.setContentsMargins(24, 16, 24, 14); root.setSpacing(10)
+        self.maker_summary_badge = QLabel(self.tr("۰ سالم از ۰", "0 healthy of 0")); self.maker_summary_badge.setObjectName("summaryPill"); self.maker_summary_badge.setAlignment(Qt.AlignCenter)
+        self.maker_header = self._page_header(
+            "سازنده کانفیگ اس‌ان‌آی", "SNI Config Maker",
+            "تبدیل گروهی، تست زنده مسیر واقعی و مرتب‌سازی دقیق بر اساس کشور خروجی",
+            "Bulk conversion, live end-to-end testing and verified exit-country sorting",
+            self.maker_summary_badge,
+        )
+        root.addWidget(self.maker_header)
+
+        self.maker_source_card = QFrame(); self.maker_source_card.setObjectName("makerSourceCard")
+        source_layout = QVBoxLayout(self.maker_source_card); source_layout.setContentsMargins(10, 6, 10, 6); source_layout.setSpacing(5)
+        repository_row = QHBoxLayout(); repository_row.setSpacing(6)
+        self.maker_source_title = self._bind_text(QLabel(), "افزودن کانفیگ", "1 · Add configs"); self.maker_source_title.setObjectName("makerStepTitle")
+        saved_maker_url = str(self.storage.settings.get("sni_maker_url", "") or "").strip()
+        if not saved_maker_url or saved_maker_url in LEGACY_SNI_MAKER_URLS:
+            saved_maker_url = DEFAULT_SNI_MAKER_URL
+        self.maker_repo_url = QLineEdit(saved_maker_url); self.maker_repo_url.setObjectName("makerRepoUrl"); self.maker_repo_url.setLayoutDirection(Qt.LeftToRight); self.maker_repo_url.setClearButtonEnabled(True)
+        self.maker_repo_btn = self._action_button("دریافت", "Load", "download", "primaryAction")
+        self.maker_repo_reset_btn = self._action_button("پیش‌فرض", "Default", "refresh", "quietButton")
+        self.maker_repo_btn.setMaximumWidth(105); self.maker_repo_reset_btn.setMaximumWidth(100)
+        repository_row.addWidget(self.maker_source_title); repository_row.addWidget(self.maker_repo_url, 1); repository_row.addWidget(self.maker_repo_btn); repository_row.addWidget(self.maker_repo_reset_btn)
+        source_layout.addLayout(repository_row)
+
+        import_row = QHBoxLayout(); import_row.setSpacing(6)
+        self.maker_import_badge = QLabel(self.tr("آماده دریافت", "Ready")); self.maker_import_badge.setObjectName("selectionText"); self.maker_import_badge.setMinimumWidth(105); self.maker_import_badge.setMaximumWidth(155)
+        self.maker_source_editor = ConfigDropEdit()
+        self.maker_source_editor.textChanged.connect(self._sync_maker_editor_direction)
+        self.maker_source_editor.setPlaceholderText(self.tr(
+            "لینک‌ها را اینجا وارد کنید یا فایل را رها کنید",
+            "Paste links or drop files here",
+        ))
+        self.maker_file_btn = self._action_button("فایل", "File", "folder", "secondaryAction")
+        self.maker_clip_btn = self._action_button("کلیپ‌بورد", "Clipboard", "copy", "secondaryAction")
+        self.maker_text_btn = self._action_button("تبدیل", "Convert", "sparkles", "secondaryAction")
+        self.maker_clear_btn = self._action_button("پاک‌کردن", "Clear", "trash", "dangerButton")
+        for button, width in (
+                (self.maker_file_btn, 90), (self.maker_clip_btn, 105),
+                (self.maker_text_btn, 95), (self.maker_clear_btn, 90)):
+            button.setMaximumWidth(width)
+        import_row.addWidget(self.maker_import_badge); import_row.addWidget(self.maker_source_editor, 1)
+        import_row.addWidget(self.maker_file_btn); import_row.addWidget(self.maker_clip_btn)
+        import_row.addWidget(self.maker_text_btn); import_row.addWidget(self.maker_clear_btn)
+        source_layout.addLayout(import_row)
+        root.addWidget(self.maker_source_card)
+
+        control = QFrame(); self.maker_control = control; control.setObjectName("makerTestBar"); control_layout = QHBoxLayout(control); control_layout.setContentsMargins(8, 6, 8, 6); control_layout.setSpacing(6)
+        threads_label = self._bind_text(QLabel(), "همزمانی", "Workers"); threads_label.setObjectName("fieldLabel")
+        timeout_label = self._bind_text(QLabel(), "مهلت", "Timeout"); timeout_label.setObjectName("fieldLabel")
+        self.maker_threads = NumericInput(48, 4, 64)
+        self.maker_timeout = NumericInput(8, 3, 20, "s")
+        self.maker_threads.setMaximumWidth(120); self.maker_timeout.setMaximumWidth(120)
+        self.maker_start_btn = self._action_button("تست همه کانفیگ‌ها", "2 · Test All", "play", "primaryAction")
+        self.maker_stop_btn = self._action_button("توقف", "Stop", "x-circle", "dangerButton"); self.maker_stop_btn.setEnabled(False)
+        self.maker_start_btn.setMinimumWidth(180); self.maker_start_btn.setMaximumWidth(230); self.maker_stop_btn.setMaximumWidth(85)
+        self.maker_progress = ScanProgressPanel(self.language); self.maker_progress.setMaximum(100); self.maker_progress.setValue(0)
+        self.maker_progress.set_status(self.tr("آماده تست", "Tester ready"), "idle")
+        self.maker_progress.setFormat(self.tr("منتظر کانفیگ", "Waiting for configs"))
+        self.maker_progress.domain.setVisible(False); self.maker_progress.setMinimumWidth(145)
+        self.maker_progress.layout().setContentsMargins(8, 3, 8, 3); self.maker_progress.layout().setSpacing(2)
+        control_layout.addWidget(threads_label); control_layout.addWidget(self.maker_threads)
+        control_layout.addWidget(timeout_label); control_layout.addWidget(self.maker_timeout)
+        control_layout.addWidget(self.maker_progress, 1); control_layout.addWidget(self.maker_start_btn); control_layout.addWidget(self.maker_stop_btn)
+        root.addWidget(control)
+
+        results_panel = QFrame(); self.maker_results_panel = results_panel; results_panel.setObjectName("makerResultsPanel"); results_layout = QVBoxLayout(results_panel); results_layout.setContentsMargins(0, 0, 0, 0); results_layout.setSpacing(0)
+        result_toolbar = QFrame(); result_toolbar.setObjectName("makerResultToolbar"); result_bar = QHBoxLayout(result_toolbar); result_bar.setContentsMargins(10, 7, 10, 7); result_bar.setSpacing(8)
+        self.maker_results_title = self._bind_text(QLabel(), "نتایج تست", "3 · Test results"); self.maker_results_title.setObjectName("makerStepTitle")
+        self.maker_search = QLineEdit(); self.maker_search.setObjectName("makerSearch"); self.maker_search.setPlaceholderText(self.tr("جستجو در نتایج…", "Search results…")); self.maker_search.setClearButtonEnabled(True)
+        self.maker_status_filter = QComboBox(); self.maker_status_filter.setObjectName("makerStatusFilter")
+        self.maker_status_filter.addItem(self.tr("همه وضعیت‌ها", "All statuses"), "")
+        self.maker_status_filter.addItem(self.tr("سالم", "Healthy"), "healthy")
+        self.maker_status_filter.addItem(self.tr("ناموفق", "Failed"), "failed")
+        self.maker_status_filter.addItem(self.tr("در حال تست", "Testing"), "testing")
+        result_bar.addWidget(self.maker_results_title); result_bar.addWidget(self.maker_search, 1); result_bar.addWidget(self.maker_status_filter)
+        results_layout.addWidget(result_toolbar)
+
+        self.maker_country_rail = CountryRail(); self.maker_country_rail.setLayoutDirection(Qt.LeftToRight); self.maker_country_rail.set_country_counts({}, all_label=self.tr("همه کشورها", "All countries"))
+        results_layout.addWidget(self.maker_country_rail)
+        self.maker_model = MakerResultsModel(parent=self)
+        self.maker_proxy = MakerFilterProxy(self); self.maker_proxy.setSourceModel(self.maker_model)
+        self.maker_table = QTableView(); self.maker_table.setObjectName("makerResultsTable"); self.maker_table.setModel(self.maker_proxy)
+        self.maker_table.setSortingEnabled(True); self.maker_table.sortByColumn(MakerColumns.STATUS, Qt.AscendingOrder)
+        self.maker_table.setSelectionBehavior(QAbstractItemView.SelectRows); self.maker_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.maker_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.maker_table.setAlternatingRowColors(True); self.maker_table.setShowGrid(False)
+        self.maker_table.verticalHeader().hide(); self.maker_table.verticalHeader().setDefaultSectionSize(43)
+        maker_header = self.maker_table.horizontalHeader(); maker_header.setHighlightSections(False); maker_header.setStretchLastSection(True)
+        maker_header.setSectionResizeMode(MakerColumns.MARK, QHeaderView.Fixed); self.maker_table.setColumnWidth(MakerColumns.MARK, 42)
+        for column, width in ((MakerColumns.COUNTRY, 90), (MakerColumns.STATUS, 100), (MakerColumns.PING, 90)):
+            maker_header.setSectionResizeMode(column, QHeaderView.Fixed); self.maker_table.setColumnWidth(column, width)
+        maker_header.setSectionResizeMode(MakerColumns.URI, QHeaderView.Stretch)
+        self.maker_select_all_checkbox = QCheckBox(maker_header)
+        self.maker_select_all_checkbox.setObjectName("makerSelectAll")
+        self.maker_select_all_checkbox.setLayoutDirection(Qt.LeftToRight)
+        self.maker_select_all_checkbox.setFixedSize(22, 22)
+        self.maker_select_all_checkbox.setEnabled(False)
+        self.maker_select_all_checkbox.setAccessibleName("Select all configurations")
+        self.maker_select_all_checkbox.setToolTip(self.tr("انتخاب یا لغو انتخاب همه کانفیگ‌ها", "Select or clear all configurations"))
+        maker_header.geometriesChanged.connect(self._position_maker_select_all)
+        maker_header.sectionResized.connect(lambda *_args: self._position_maker_select_all())
+        QTimer.singleShot(0, self._position_maker_select_all)
+        results_layout.addWidget(self.maker_table, 1); root.addWidget(results_panel, 1)
+
+        actions = QFrame(); self.maker_actions = actions; actions.setObjectName("makerActionBar"); action_layout = QGridLayout(actions); self.maker_action_layout = action_layout; action_layout.setContentsMargins(10, 7, 10, 7); action_layout.setSpacing(8)
+        self.maker_destination_label = self._bind_text(QLabel(), "← کانفیگ کاربر", "→ User Config"); self.maker_destination_label.setObjectName("makerDestination"); self.maker_destination_label.setMaximumWidth(125)
+        self.maker_add_selected_btn = self._action_button("افزودن", "Add", "plus", "primaryAction")
+        self.maker_add_country_btn = self._action_button("افزودن کانفیگ‌های سالم کشور انتخاب‌شده", "Add Healthy Configs from Selected Country", "database", "secondaryAction")
+        self.maker_add_all_btn = self._action_button("افزودن همه کانفیگ‌های سالم", "Add All Healthy Configs", "download", "secondaryAction")
+        self.maker_copy_btn = self._action_button("کپی", "Copy", "copy", "quietButton")
+        self.maker_export_btn = self._action_button("خروجی", "Export", "upload", "quietButton")
+        for button, width in (
+                (self.maker_add_selected_btn, 95), (self.maker_add_country_btn, 255),
+                (self.maker_add_all_btn, 210), (self.maker_copy_btn, 85),
+                (self.maker_export_btn, 90)):
+            button.setMinimumWidth(width)
+            button.setMaximumWidth(16777215)
+            button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        self.maker_add_selected_btn.setToolTip(self.tr("افزودن انتخاب‌ها به کانفیگ کاربر", "Add marked configs to User Config"))
+        self.maker_add_country_btn.setToolTip(self.tr("افزودن سالم‌های کشور انتخاب‌شده", "Add healthy configs from the selected country"))
+        self.maker_add_all_btn.setToolTip(self.tr("افزودن همه کانفیگ‌های سالم", "Add every healthy config"))
+        self._maker_actions_compact = None
+        self._layout_maker_actions(False)
+        for button in (self.maker_add_selected_btn, self.maker_add_country_btn, self.maker_add_all_btn, self.maker_copy_btn, self.maker_export_btn):
+            button.setEnabled(False)
+        root.addWidget(actions)
         return page
 
     def _scanner_page(self):
         page, body = self._scroll_page(); root = QVBoxLayout(body); root.setContentsMargins(30, 25, 30, 24); root.setSpacing(14)
         self.scan_state_badge = QLabel(); self.scan_state_badge.setObjectName("summaryPill"); self._bind_text(self.scan_state_badge, "آماده اسکن", "Scanner Ready")
-        root.addWidget(self._page_header(f"آزمایشگاه {ltr_isolate('SNI')}", "SNI Lab", "اسکن همزمان، امتیازدهی پایداری و ذخیره بهترین مسیرها", "Discover, measure and rank reliable SNI routes", self.scan_state_badge))
+        root.addWidget(self._page_header("آزمایشگاه اس‌ان‌آی", "SNI Lab", "اسکن همزمان، امتیازدهی پایداری و ذخیره بهترین مسیرها", "Discover, measure and rank reliable SNI routes", self.scan_state_badge))
         controls = QFrame(); controls.setObjectName("scanControlCard"); controls.setMinimumHeight(214); c = QGridLayout(controls); c.setContentsMargins(18, 16, 18, 16); c.setHorizontalSpacing(18); c.setVerticalSpacing(12)
         domain_panel = QFrame(); domain_panel.setObjectName("domainPanel"); domain_box = QVBoxLayout(domain_panel); domain_box.setContentsMargins(0, 0, 0, 0); domain_box.setSpacing(7); domain_title = self._bind_text(QLabel(), "دامنه‌های هدف", "DOMAIN TARGETS"); domain_title.setObjectName("sectionEyebrow")
         domain_help = self._bind_text(QLabel(), "در هر خط یک دامنه؛ فهرست‌ها به‌صورت همزمان بررسی می‌شوند.", "One hostname per line • long lists are scanned concurrently"); domain_help.setObjectName("helperText"); domain_help.setWordWrap(True)
@@ -2027,10 +2557,20 @@ class MainWindow(QMainWindow):
         root.addLayout(info_grid); credits = QLabel(f"UAC Spoofer Desktop {__version__}  •  Credits to behroozuac"); credits.setObjectName("credits"); credits.setAlignment(Qt.AlignCenter); credits.setLayoutDirection(Qt.LeftToRight); root.addWidget(credits); root.addStretch(); return page
 
     def _wire(self):
-        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished)
-        self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.edit_btn.clicked.connect(self.edit_profile); self.delete_btn.clicked.connect(self.delete_profile); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.country_combo.activated.connect(self._country_activated); self.auto_mode.toggled.connect(self._auto_mode_changed); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v)); self.proxy_mode.toggled.connect(self._proxy_mode_changed)
-        self.manual_list.itemClicked.connect(self._profile_clicked); self.suggested_list.itemClicked.connect(self._profile_clicked)
+        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished)
+        self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.clear_user_btn.clicked.connect(self.delete_all_user_configs); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.country_combo.activated.connect(self._country_activated); self.auto_mode.toggled.connect(self._auto_mode_changed); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v)); self.proxy_mode.toggled.connect(self._proxy_mode_changed); self.tun_mode.toggled.connect(self._tun_mode_changed)
         self.scan_tabs.currentChanged.connect(self._update_scan_selection)
+        self.route_source_tabs.currentChanged.connect(self._route_source_changed)
+        self.maker_repo_btn.clicked.connect(self._maker_fetch_repository); self.maker_repo_reset_btn.clicked.connect(lambda: self.maker_repo_url.setText(DEFAULT_SNI_MAKER_URL)); self.maker_repo_url.textChanged.connect(self._maker_repo_url_changed)
+        self.maker_file_btn.clicked.connect(self._maker_import_files); self.maker_clip_btn.clicked.connect(self.maker_source_editor.paste_from_clipboard); self.maker_text_btn.clicked.connect(lambda: self._maker_import_text(self.maker_source_editor.toPlainText(), "editor")); self.maker_clear_btn.clicked.connect(self._maker_clear)
+        self.maker_source_editor.textChanged.connect(self._maker_editor_changed)
+        self.maker_source_editor.payloadAdded.connect(lambda *_args: self._update_maker_guide())
+        self.maker_start_btn.clicked.connect(self._maker_start_test); self.maker_stop_btn.clicked.connect(self._maker_stop_test)
+        self.maker_search.textChanged.connect(self.maker_proxy.set_search); self.maker_status_filter.currentIndexChanged.connect(lambda _index: self.maker_proxy.set_statuses(self.maker_status_filter.currentData()))
+        self.maker_country_rail.countrySelected.connect(self.maker_proxy.set_country); self.maker_model.summaryChanged.connect(self._maker_summary_changed)
+        self.maker_select_all_checkbox.clicked.connect(self.maker_model.set_all_checked)
+        self.maker_add_selected_btn.clicked.connect(lambda: self._maker_add_results("selected")); self.maker_add_country_btn.clicked.connect(lambda: self._maker_add_results("country")); self.maker_add_all_btn.clicked.connect(lambda: self._maker_add_results("all"))
+        self.maker_copy_btn.clicked.connect(self._maker_copy_marked); self.maker_export_btn.clicked.connect(self._maker_export_healthy)
 
     def _setup_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -2039,14 +2579,51 @@ class MainWindow(QMainWindow):
         if icon.isNull():
             icon = cyber_icon("shield", "#23f5e0", 24)
         self._tray = QSystemTrayIcon(icon, self)
-        self._tray_menu = QMenu()
+        self._tray_menu = QMenu(self)
+        self._tray_menu.setObjectName("trayMenu")
+        self._tray_menu.setMinimumWidth(220)
+        self._tray_menu.setFont(QFont("Vazirmatn", 10))
+        self._tray_menu.setStyleSheet("""
+            QMenu#trayMenu {
+                background-color: #07172c;
+                color: #e8f5ff;
+                border: 1px solid #245877;
+                border-radius: 11px;
+                padding: 8px;
+            }
+            QMenu#trayMenu::item {
+                min-height: 32px;
+                padding: 7px 38px 7px 16px;
+                margin: 2px 3px;
+                border-radius: 8px;
+                background: transparent;
+            }
+            QMenu#trayMenu::item:selected {
+                background-color: #0d5260;
+                color: #ffffff;
+            }
+            QMenu#trayMenu::item:disabled {
+                color: #67839d;
+            }
+            QMenu#trayMenu::icon {
+                padding-left: 9px;
+                padding-right: 9px;
+            }
+            QMenu#trayMenu::separator {
+                height: 1px;
+                background: #1d425d;
+                margin: 6px 10px;
+            }
+        """)
         self.tray_show_action = QAction(self._tray_menu)
         self.tray_show_action.setIcon(cyber_icon("home", "#23f5e0", 18))
+        self.tray_show_action.setIconVisibleInMenu(True)
         self.tray_show_action.triggered.connect(self._restore_from_tray)
         self._tray_menu.addAction(self.tray_show_action)
         self._tray_menu.addSeparator()
         self.tray_quit_action = QAction(self._tray_menu)
         self.tray_quit_action.setIcon(cyber_icon("power", "#ff7891", 18))
+        self.tray_quit_action.setIconVisibleInMenu(True)
         self.tray_quit_action.triggered.connect(self._quit_from_tray)
         self._tray_menu.addAction(self.tray_quit_action)
         self._tray.setContextMenu(self._tray_menu)
@@ -2061,6 +2638,12 @@ class MainWindow(QMainWindow):
             self.tray_show_action.setText(self.tr("نمایش برنامه", "Show App"))
         if self.tray_quit_action is not None:
             self.tray_quit_action.setText(self.tr("خروج کامل", "Quit"))
+        if self._tray_menu is not None:
+            self._tray_menu.setLayoutDirection(
+                Qt.LeftToRight if self.language == "en" else Qt.RightToLeft
+            )
+            self._tray_menu.setMinimumWidth(220)
+            self._tray_menu.ensurePolished()
         self._tray.setToolTip(self.tr("UAC Spoofer Desktop — در حال اجرا", "UAC Spoofer Desktop — Running"))
 
     def _tray_activated(self, reason):
@@ -2115,6 +2698,10 @@ class MainWindow(QMainWindow):
             self._animated_page.setGraphicsEffect(None)
             self._animated_page = None
         self.stack.setCurrentIndex(index)
+        if index == 2:
+            self._layout_sni_maker()
+            QTimer.singleShot(0, self._layout_sni_maker)
+            QTimer.singleShot(120, self._layout_sni_maker)
         for i, button in enumerate(self.nav):
             active = i == index
             button.setChecked(active)
@@ -2145,9 +2732,16 @@ class MainWindow(QMainWindow):
     def _update_config_actions(self, *_):
         if not hasattr(self, "profile_tabs"):
             return
-        selected = self.selected_profile_item() is not None
-        self.edit_btn.setEnabled(selected)
-        self.delete_btn.setEnabled(selected)
+        self._sync_profile_select_all(self.profile_tabs.currentWidget())
+        self._position_profile_select_all()
+        user_active = self.profile_tabs.currentWidget() is self.user_config_list
+        self.clear_user_btn.setVisible(user_active)
+        self.clear_user_btn.setEnabled(
+            user_active and any(
+                profile.origin == USER_CONFIG_ORIGIN
+                for profile in self.storage.profiles
+            )
+        )
 
     def _set_activity(self, persian, english, state="running", busy=True):
         self.activity_bar.set_activity(self.tr(persian, english), state, busy)
@@ -2171,7 +2765,8 @@ class MainWindow(QMainWindow):
 
     def _configure_technical_widgets(self):
         widgets = [self.route_detail, self.ping_label, self.up_label, self.down_label, self.ip_label,
-                   self.logs, self.domains, self.carrier, self.log_filter, self.process_search]
+                   self.logs, self.domains, self.carrier, self.log_filter, self.process_search,
+                   self.maker_repo_url, self.maker_search]
         for widget in widgets:
             widget.setLayoutDirection(Qt.LeftToRight)
             widget.setProperty("technical", True)
@@ -2182,6 +2777,42 @@ class MainWindow(QMainWindow):
         for table in (self.results_table, self.bookmarks_table, self.process_table):
             table.setLayoutDirection(table_direction)
             table.setProperty("technical", True)
+        self.maker_table.setLayoutDirection(Qt.LeftToRight)
+        self.maker_table.setProperty("technical", True)
+
+    def _sync_maker_editor_direction(self):
+        persian_placeholder = self.language == "fa" and not self.maker_source_editor.toPlainText().strip()
+        self.maker_source_editor.setLayoutDirection(
+            Qt.RightToLeft if persian_placeholder else Qt.LeftToRight
+        )
+
+    def _sync_sidebar_language_layout(self):
+        rtl = self.language == "fa"
+        direction = Qt.RightToLeft if rtl else Qt.LeftToRight
+        alignment = (Qt.AlignRight if rtl else Qt.AlignLeft) | Qt.AlignVCenter
+        compact = self.width() < 1240
+        nav_height = 44 if self.height() < 790 else 54 if self.height() < 930 else 56
+        self.rating_card.setVisible(self.height() >= 890 and not compact)
+        for button in self.nav:
+            button.setFixedHeight(nav_height)
+        self.rating_card.setLayoutDirection(direction)
+        for label in (self.rating_title, self.rating_text):
+            label.setLayoutDirection(direction)
+            label.setAlignment(alignment)
+        self.rating_button.setLayoutDirection(direction)
+        self.rating_button.setProperty("rtl", rtl)
+        self.language_button.setLayoutDirection(Qt.RightToLeft if self.language == "en" else Qt.LeftToRight)
+        self.language_button.setProperty("rtl", self.language == "en")
+        self.data_button.setLayoutDirection(direction)
+        self.data_button.setProperty("rtl", rtl)
+        for widget in (self.rating_button, self.language_button, self.data_button):
+            _restyle(widget)
+        for layout in (self.rating_card.layout(), self.sidebar_footer.layout(), self.sidebar_layout):
+            layout.invalidate()
+            layout.activate()
+        self.rating_card.updateGeometry()
+        self.sidebar_footer.updateGeometry()
+        self.sidebar.updateGeometry()
 
     def tr(self, persian: str, english: str | None = None) -> str:
         return (english or FA_EN.get(persian, persian)) if self.language == "en" else persian
@@ -2217,17 +2848,77 @@ class MainWindow(QMainWindow):
                 item = table.horizontalHeaderItem(column)
                 if item and item.text() in mapping:
                     item.setText(mapping[item.text()])
-        self.profile_tabs.setTabText(0, self.tr("دستی", "Manual")); self.profile_tabs.setTabText(1, self.tr("پیشنهادی", "Suggested"))
+        self.profile_tabs.setTabText(0, "User Config"); self.profile_tabs.setTabText(1, self.tr("دستی", "Manual")); self.profile_tabs.setTabText(2, self.tr("پیشنهادی", "Suggested"))
+        self.profile_select_all_checkbox.setToolTip(self.tr(
+            "انتخاب یا لغو انتخاب همه کانفیگ‌های لیست فعال",
+            "Select or clear every configuration in the active list",
+        ))
+        self._position_profile_select_all()
+        self.route_source_tabs.setTabText(0, self.tr("پیشنهادی", "Suggested")); self.route_source_tabs.setTabText(1, "User Config")
         self.scan_tabs.setTabText(0, self.tr("نتایج", "Results")); self.scan_tabs.setTabText(1, self.tr("ذخیره‌شده", "Saved"))
         result_headers = (["", "Domain", "IP", "Colo", "Ping", "Stability", "First byte", "Bytes/2s", "Score"] if self.language == "en" else ["", "دامنه", "IP", "Colo", "پینگ", "پایداری", "اولین بایت", "بایت/۲ثانیه", "امتیاز"])
         for table in (self.results_table, self.bookmarks_table): table.setHorizontalHeaderLabels(result_headers)
         self.process_table.setHorizontalHeaderLabels([self.tr(f"خارج از {ltr_isolate('VPN')}", "Bypass VPN"), self.tr("پردازه", "Process")])
+        self.maker_model.set_headers(
+            ["", "Country", "Status", "Real ping", "Configuration"]
+            if self.language == "en"
+            else ["", "کشور", "وضعیت", "پینگ واقعی", "کانفیگ"]
+        )
+        self.maker_model.set_status_labels(
+            {} if self.language == "en" else {
+                "queued": "در صف",
+                "ready": "آماده",
+                "converted": "تبدیل‌شده",
+                "converting": "در حال تبدیل",
+                "testing": "در حال تست",
+                "healthy": "سالم",
+                "failed": "ناموفق",
+                "invalid": "نامعتبر",
+                "skipped": "ناسازگار",
+                "cancelled": "متوقف‌شده",
+            }
+        )
+        self.maker_source_editor.setPlaceholderText(self.tr(
+            "لینک‌ها را اینجا وارد کنید یا فایل را رها کنید",
+            "Paste links or drop files here",
+        ))
+        self._sync_maker_editor_direction()
+        if self.maker_model.rowCount() == 0:
+            self.maker_import_badge.setText(self.tr("آماده دریافت", "Ready"))
+            self.maker_progress.set_status(self.tr("آماده تست", "Tester ready"), "idle")
+            self.maker_progress.setFormat(self.tr("منتظر کانفیگ", "Waiting for configs"))
+        self.maker_search.setPlaceholderText(self.tr("جستجو در نتایج…", "Search results…"))
+        self.maker_select_all_checkbox.setToolTip(self.tr(
+            "انتخاب یا لغو انتخاب همه کانفیگ‌ها",
+            "Select or clear all configurations",
+        ))
+        for index, (persian, english) in enumerate((
+                ("همه وضعیت‌ها", "All statuses"),
+                ("سالم", "Healthy"),
+                ("ناموفق", "Failed"),
+                ("در حال تست", "Testing"))):
+            self.maker_status_filter.setItemText(
+                index, english if self.language == "en" else persian
+            )
+        self.maker_country_rail.set_metric_labels(
+            self.tr("سالم", "healthy"),
+            self.tr("کل", "total"),
+            self.tr("زنده", "live"),
+        )
+        self._maker_last_country_summary = None
+        self._maker_summary_changed({
+            "total": self.maker_model.rowCount(),
+            "statuses": self.maker_model.status_counts(),
+            "countries": self.maker_model.country_summary(),
+        })
         for index, (button, (icon_name, persian, english)) in enumerate(zip(self.nav, self.nav_meta)):
             button.setText(english if self.language == "en" else persian)
             button.setProperty("rtl", self.language != "en"); _restyle(button)
             button.setIcon(cyber_icon(icon_name, "#23f5e0" if index == self.stack.currentIndex() else "#9fb4d8", 22))
         self.language_button.setText("فارسی" if self.language == "en" else "English")
         self.data_button.setText(self.tr("باز کردن پوشه داده‌ها", "Open Data Folder"))
+        self._sync_sidebar_language_layout()
+        QTimer.singleShot(0, self._sync_sidebar_language_layout)
         self._update_tray_text()
         self.status_pill.set_language(self.language); self.activity_bar.set_language(self.language)
         if not self.scanning: self.scan_progress.set_language(self.language)
@@ -2237,6 +2928,7 @@ class MainWindow(QMainWindow):
             self.update_status.setText(self.tr("برای بررسی نسخه آماده است", "Ready to check for updates"))
             self.update_versions.setText(self.tr(f"نصب‌شده: {ltr_isolate(__version__)}  •  آخرین نسخه: —", f"Installed: {__version__}  •  Latest: —"))
         self.manual_list.set_empty_text(self.tr("هنوز کانفیگ دستی ندارید", "No manual configs yet"), self.tr("یک لینک VLESS یا Trojan اضافه یا از Clipboard وارد کنید.", "Add a VLESS or Trojan link, or import one from the clipboard."))
+        self.user_config_list.set_empty_text(self.tr("هنوز User Config ندارید", "No User Configs yet"), self.tr("کانفیگ‌های سالم را از SNI Config Maker به این بخش اضافه کنید.", "Add healthy routes from SNI Config Maker to this library."))
         self.suggested_list.set_empty_text(self.tr("هنوز پیشنهادی دریافت نشده", "No suggestions downloaded"), self.tr("برای دریافت فهرست پیشنهادی، همگام‌سازی را اجرا کنید.", "Sync the suggested repository to populate this list."))
         self.log_filter.setPlaceholderText(self.tr("فیلتر لاگ‌ها…", "Filter logs…")); self.process_search.setPlaceholderText(self.tr("جستجوی پردازه…", "Search processes…"))
         self._update_process_count()
@@ -2260,24 +2952,35 @@ class MainWindow(QMainWindow):
             "خاموش: هسته اسپوف فعال می‌ماند و فقط پروکسی سیستم ویندوز اعمال نمی‌شود.",
             "Off: the spoof core stays active; only Windows System Proxy is skipped.",
         ))
+        self.tun_mode.setToolTip(self.tr(
+            "تمام ترافیک TCP و UDP ویندوز را از sing-box و هسته اسپوف عبور می‌دهد؛ پینگ CMD مستقیم و واقعی می‌ماند.",
+            "Routes Windows TCP and UDP through sing-box and the spoof core; CMD ping remains direct and real.",
+        ))
+        self.proxy_option.setEnabled(not self._tun_mode_enabled())
         self._configure_technical_widgets()
         self._layout_home_dashboard()
+        self._layout_sni_maker()
         if self._update_notification is not None and self._latest_update is not None:
             self._show_update_notification(self._latest_update)
         self.refresh_profiles()
         self._update_scan_selection()
+        self._maker_repo_url_changed()
 
     def _save_flag(self, key, value): self.storage.settings[key] = value; self.storage.save_settings()
 
     def _proxy_mode_enabled(self) -> bool:
         return bool(self.storage.settings.get("proxy_mode", True))
 
+    def _tun_mode_enabled(self) -> bool:
+        return bool(self.storage.settings.get("tun_mode", False))
+
     def _proxy_mode_changed(self, enabled):
         enabled = bool(enabled)
         self._save_flag("proxy_mode", enabled)
         self.proxy_option.setProperty("active", enabled)
         _restyle(self.proxy_option)
-        if self.connecting and not self.engine.running:
+        if (self.connecting and hasattr(self, "_ui_running")
+                and not self._ui_running):
             self._set_activity(
                 "تنظیم پروکسی ذخیره شد و پس از پایان تست اعمال می‌شود.",
                 "Proxy preference saved; it will apply after testing finishes.",
@@ -2294,30 +2997,153 @@ class MainWindow(QMainWindow):
             return
         self._queue_proxy_mode_apply()
 
-    def _apply_proxy_mode_live(self) -> bool:
+    def _cancel_mode_apply(self):
+        event = getattr(self, "_mode_apply_cancel", None)
+        if event is not None:
+            event.set()
+        self._mode_apply_generation = int(
+            getattr(self, "_mode_apply_generation", 0)
+        ) + 1
+
+    def _begin_mode_apply(self):
+        self._cancel_mode_apply()
+        self._mode_apply_cancel = threading.Event()
+        return (
+            self._mode_apply_generation,
+            self._connect_generation,
+            self._mode_apply_cancel,
+            int(self.engine.run_id),
+        )
+
+    def _set_current_profile_list_selection(self, checked):
+        self._set_profile_list_selection(
+            self.profile_tabs.currentWidget(), checked
+        )
+
+    def _set_profile_list_selection(self, widget, checked):
+        if widget not in (
+                self.user_config_list, self.manual_list,
+                self.suggested_list):
+            return
+        widget.blockSignals(True)
+        try:
+            widget.clearSelection()
+            if checked:
+                for row in range(widget.count()):
+                    item = widget.item(row)
+                    if item.data(Qt.UserRole):
+                        item.setSelected(True)
+        finally:
+            widget.blockSignals(False)
+        self._sync_profile_select_all(widget)
+        self._update_config_actions()
+
+    def _sync_profile_select_all(self, widget):
+        checkbox = getattr(self, "profile_select_all_checkbox", None)
+        if checkbox is None or widget is not self.profile_tabs.currentWidget():
+            return
+        selectable = [
+            widget.item(row)
+            for row in range(widget.count())
+            if widget.item(row).data(Qt.UserRole)
+        ]
+        selected = sum(item.isSelected() for item in selectable)
+        checkbox.setEnabled(bool(selectable))
+        checkbox.setChecked(bool(selectable) and selected == len(selectable))
+
+    def _position_profile_select_all(self):
+        checkbox = getattr(self, "profile_select_all_checkbox", None)
+        bar = getattr(self, "profile_selection_bar", None)
+        if checkbox is None or bar is None:
+            return
+        widget = self.profile_tabs.currentWidget()
+        if widget not in (
+                self.user_config_list, self.manual_list,
+                self.suggested_list):
+            bar.hide()
+            return
+        if bar.parent() is not widget:
+            bar.setParent(widget)
+        bar.setLayoutDirection(
+            Qt.LeftToRight if self.language == "en" else Qt.RightToLeft
+        )
+        bar.setGeometry(5, 4, max(80, widget.width() - 10), 34)
+        bar.show()
+        bar.raise_()
+
+    def _mode_apply_current(self, mode_generation, connect_generation,
+                            cancel, run_id):
+        return (
+            not self._closing
+            and not cancel.is_set()
+            and mode_generation == self._mode_apply_generation
+            and connect_generation == self._connect_generation
+            and run_id == self.engine.run_id
+            and self.engine.running
+        )
+
+    def _apply_proxy_mode_live(self, expected_run_id=None, current=None) -> bool:
+        if current is not None and not current():
+            raise EngineCancelled("Connection mode apply cancelled")
+        if bool(getattr(self, "_tun_mode_enabled", lambda: False)()):
+            if expected_run_id is None:
+                self.engine.disable_system_proxy()
+            else:
+                self.engine.disable_system_proxy(expected_run_id=expected_run_id)
+            return False
         enabled = self._proxy_mode_enabled()
+        if current is not None and not current():
+            raise EngineCancelled("Connection mode apply cancelled")
         if enabled:
-            self.engine.enable_system_proxy()
+            if expected_run_id is None:
+                self.engine.enable_system_proxy()
+            else:
+                self.engine.enable_system_proxy(expected_run_id=expected_run_id)
         else:
-            self.engine.disable_system_proxy()
+            if expected_run_id is None:
+                self.engine.disable_system_proxy()
+            else:
+                self.engine.disable_system_proxy(expected_run_id=expected_run_id)
         return enabled
 
     def _queue_proxy_mode_apply(self):
         if not self.engine.running:
             return
+        mode_generation, connect_generation, cancel, run_id = self._begin_mode_apply()
+
+        def current():
+            return self._mode_apply_current(
+                mode_generation, connect_generation, cancel, run_id
+            )
 
         def work():
             enabled = self._proxy_mode_enabled()
             try:
                 with self._proxy_mode_apply_lock:
-                    enabled = self._apply_proxy_mode_live()
-                self.bridge.proxy_mode_applied.emit(enabled, True, "")
+                    if not current():
+                        raise EngineCancelled("Connection mode apply cancelled")
+                    enabled = self._apply_proxy_mode_live(run_id, current)
+                if current():
+                    self.bridge.proxy_mode_applied.emit(
+                        enabled, True, "", mode_generation, run_id
+                    )
+            except EngineCancelled:
+                return
             except Exception as exc:
-                self.bridge.proxy_mode_applied.emit(enabled, False, str(exc))
+                if current():
+                    self.bridge.proxy_mode_applied.emit(
+                        enabled, False, str(exc), mode_generation, run_id
+                    )
 
         threading.Thread(target=work, name="proxy-mode", daemon=True).start()
 
-    def _proxy_mode_apply_finished(self, enabled, success, error):
+    def _proxy_mode_apply_finished(self, enabled, success, error,
+                                   mode_generation=None, run_id=None):
+        if (mode_generation is not None
+                and mode_generation != self._mode_apply_generation):
+            return
+        if run_id is not None and run_id != self.engine.run_id:
+            return
         if enabled != self._proxy_mode_enabled():
             return
         if not success:
@@ -2338,7 +3164,8 @@ class MainWindow(QMainWindow):
             "success", False,
         )
 
-    def _apply_proxy_mode_after_probe(self, cancel=None) -> bool:
+    def _apply_proxy_mode_after_probe(self, cancel=None,
+                                      expected_run_id=None) -> bool:
         if not self._proxy_mode_enabled():
             self.bridge.log.emit(
                 "Windows system proxy skipped by Proxy Mode; "
@@ -2349,25 +3176,384 @@ class MainWindow(QMainWindow):
             "در حال اعمال پروکسی سیستم ویندوز…",
             "Applying Windows system proxy…",
         ), "running", True)
-        self.engine.enable_system_proxy(cancel)
+        if expected_run_id is None:
+            self.engine.enable_system_proxy(cancel)
+        else:
+            self.engine.enable_system_proxy(
+                cancel, expected_run_id=expected_run_id
+            )
         if not self._proxy_mode_enabled():
-            self.engine.disable_system_proxy()
+            if expected_run_id is None:
+                self.engine.disable_system_proxy()
+            else:
+                self.engine.disable_system_proxy(
+                    expected_run_id=expected_run_id
+                )
             return False
         return True
+
+    def _tun_mode_changed(self, enabled):
+        enabled = bool(enabled)
+        availability_error = ""
+        if enabled:
+            try:
+                self.engine.ensure_tun_available()
+            except Exception as exc:
+                self.tun_mode.blockSignals(True)
+                self.tun_mode.setChecked(False)
+                self.tun_mode.blockSignals(False)
+                enabled = False
+                availability_error = str(exc)
+        self._save_flag("tun_mode", enabled)
+        self.tun_option.setProperty("active", enabled)
+        self.proxy_option.setEnabled(not enabled)
+        _restyle(self.tun_option)
+        _restyle(self.proxy_option)
+        if availability_error:
+            self._handle_error(availability_error)
+            return
+        if (self.connecting and hasattr(self, "_ui_running")
+                and not self._ui_running):
+            self._set_activity(
+                "تنظیم TUN ذخیره شد و پس از پایان تست مسیر اعمال می‌شود.",
+                "TUN preference saved; it will apply after route testing.",
+            )
+            return
+        if not self.engine.running:
+            self._set_activity(
+                "حالت TUN برای اتصال بعدی فعال است." if enabled else
+                "حالت TUN خاموش است؛ اتصال بعدی از تنظیم پروکسی ویندوز استفاده می‌کند.",
+                "TUN Mode will be enabled on the next connection." if enabled else
+                "TUN Mode is off; the next connection will use the Windows Proxy preference.",
+                "success", False,
+            )
+            return
+        self._queue_tun_mode_apply()
+
+    def _apply_tun_mode_live(self, expected_run_id=None, cancel=None,
+                             current=None) -> bool:
+        def ensure_current():
+            if current is not None and not current():
+                raise EngineCancelled("Connection mode apply cancelled")
+
+        def ensure_preference(value):
+            if self._tun_mode_enabled() != value:
+                raise EngineCancelled("TUN preference changed")
+
+        lock = getattr(self, "_proxy_mode_apply_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+        enabled = self._tun_mode_enabled()
+        ensure_current()
+        if enabled:
+            try:
+                with lock:
+                    ensure_current()
+                    ensure_preference(True)
+                    if expected_run_id is None:
+                        self.engine.enable_tun()
+                    else:
+                        self.engine.enable_tun(
+                            cancel, expected_run_id=expected_run_id
+                        )
+                ensure_current()
+                ensure_preference(True)
+                if expected_run_id is None:
+                    ok, detail = self.engine.probe_tun(timeout=10)
+                else:
+                    ok, detail = self.engine.probe_tun(
+                        timeout=10,
+                        cancel_event=cancel,
+                        expected_run_id=expected_run_id,
+                    )
+                ensure_current()
+                if not ok:
+                    raise RuntimeError(f"TUN traffic check failed: {detail}")
+                with lock:
+                    ensure_current()
+                    ensure_preference(True)
+                    if expected_run_id is None:
+                        self.engine.suspend_system_proxy_for_tun()
+                    else:
+                        self.engine.suspend_system_proxy_for_tun(
+                            expected_run_id=expected_run_id
+                        )
+            except EngineCancelled:
+                raise
+            except Exception:
+                with lock:
+                    ensure_current()
+                    ensure_preference(True)
+                    try:
+                        if expected_run_id is None:
+                            self.engine.disable_tun()
+                        else:
+                            self.engine.disable_tun(
+                                expected_run_id=expected_run_id
+                            )
+                    except Exception:
+                        if self.engine.tun_running:
+                            if expected_run_id is None:
+                                self.engine.suspend_system_proxy_for_tun()
+                            else:
+                                self.engine.suspend_system_proxy_for_tun(
+                                    expected_run_id=expected_run_id
+                                )
+                        raise
+                    if self._proxy_mode_enabled():
+                        if expected_run_id is None:
+                            self.engine.enable_system_proxy()
+                        else:
+                            self.engine.enable_system_proxy(
+                                expected_run_id=expected_run_id
+                            )
+                raise
+            return True
+        with lock:
+            ensure_current()
+            ensure_preference(False)
+            if self._proxy_mode_enabled():
+                if expected_run_id is None:
+                    self.engine.enable_system_proxy()
+                else:
+                    self.engine.enable_system_proxy(expected_run_id=expected_run_id)
+            else:
+                if expected_run_id is None:
+                    self.engine.disable_system_proxy()
+                else:
+                    self.engine.disable_system_proxy(expected_run_id=expected_run_id)
+            ensure_current()
+            ensure_preference(False)
+            try:
+                if expected_run_id is None:
+                    self.engine.disable_tun()
+                else:
+                    self.engine.disable_tun(expected_run_id=expected_run_id)
+            except Exception:
+                if self.engine.tun_running:
+                    if expected_run_id is None:
+                        self.engine.suspend_system_proxy_for_tun()
+                    else:
+                        self.engine.suspend_system_proxy_for_tun(
+                            expected_run_id=expected_run_id
+                        )
+                raise
+        return False
+
+    def _queue_tun_mode_apply(self):
+        if not self.engine.running:
+            return
+        mode_generation, connect_generation, cancel, run_id = self._begin_mode_apply()
+
+        def current():
+            return self._mode_apply_current(
+                mode_generation, connect_generation, cancel, run_id
+            )
+
+        def work():
+            enabled = self._tun_mode_enabled()
+            try:
+                if not current():
+                    raise EngineCancelled("Connection mode apply cancelled")
+                enabled = self._apply_tun_mode_live(run_id, cancel, current)
+                if current():
+                    self.bridge.tun_mode_applied.emit(
+                        enabled, True, "", mode_generation, run_id
+                    )
+            except EngineCancelled:
+                return
+            except Exception as exc:
+                if current():
+                    self.bridge.tun_mode_applied.emit(
+                        enabled, False, str(exc), mode_generation, run_id
+                    )
+
+        threading.Thread(target=work, name="tun-mode", daemon=True).start()
+
+    def _tun_mode_apply_finished(self, enabled, success, error,
+                                 mode_generation=None, run_id=None):
+        if (mode_generation is not None
+                and mode_generation != self._mode_apply_generation):
+            return
+        if run_id is not None and run_id != self.engine.run_id:
+            return
+        if enabled != self._tun_mode_enabled():
+            return
+        if not success:
+            runtime_enabled = bool(self.engine.tun_running)
+            self.tun_mode.blockSignals(True)
+            self.tun_mode.setChecked(runtime_enabled)
+            self.tun_mode.blockSignals(False)
+            self._save_flag("tun_mode", runtime_enabled)
+            self.tun_option.setProperty("active", runtime_enabled)
+            self.proxy_option.setEnabled(not runtime_enabled)
+            _restyle(self.tun_option)
+            _restyle(self.proxy_option)
+            self._handle_error(error)
+            if hasattr(self, "_queue_target_latency_probe"):
+                QTimer.singleShot(0, self._queue_target_latency_probe)
+            return
+        proxy_enabled = self._proxy_mode_enabled()
+        self._set_activity(
+            "حالت TUN فعال شد؛ وب و ویدئو از تونل عبور می‌کنند و پینگ CMD مستقیم است."
+            if enabled else
+            "حالت TUN خاموش و پروکسی ویندوز دوباره فعال شد."
+            if proxy_enabled else
+            "حالت TUN خاموش شد؛ فقط هسته اسپوف فعال مانده است.",
+            "TUN Mode enabled; web and video use the tunnel while CMD ping stays direct."
+            if enabled else
+            "TUN Mode disabled and Windows Proxy restored."
+            if proxy_enabled else
+            "TUN Mode disabled; only the spoof core remains active.",
+            "success", False,
+        )
+        if hasattr(self, "_queue_target_latency_probe"):
+            QTimer.singleShot(0, self._queue_target_latency_probe)
+
+    def _apply_connection_mode_after_probe(self, cancel=None) -> str:
+        expected_run_id = getattr(self.engine, "run_id", None)
+
+        def check_current():
+            is_set = getattr(cancel, "is_set", None)
+            if callable(is_set) and is_set():
+                raise EngineCancelled("Connection mode apply cancelled")
+            if (expected_run_id is not None
+                    and expected_run_id != self.engine.run_id):
+                raise EngineCancelled("Connection generation changed")
+
+        def enable_proxy():
+            if expected_run_id is None:
+                self.engine.enable_system_proxy(cancel)
+            else:
+                self.engine.enable_system_proxy(
+                    cancel, expected_run_id=expected_run_id
+                )
+
+        def disable_tun():
+            if expected_run_id is None:
+                self.engine.disable_tun()
+            else:
+                self.engine.disable_tun(expected_run_id=expected_run_id)
+
+        for _attempt in range(4):
+            check_current()
+            if self._tun_mode_enabled():
+                self.bridge.activity.emit(self.tr(
+                    "در حال ساخت رابط TUN و بررسی یوتیوب…",
+                    "Starting the TUN interface and checking YouTube…",
+                ), "running", True)
+                if expected_run_id is None:
+                    self.engine.enable_tun(cancel)
+                else:
+                    self.engine.enable_tun(
+                        cancel, expected_run_id=expected_run_id
+                    )
+                check_current()
+                if not self._tun_mode_enabled():
+                    if self._proxy_mode_enabled():
+                        enable_proxy()
+                    check_current()
+                    disable_tun()
+                    continue
+                probe_arguments = {
+                    "timeout": 10,
+                    "preferred_url": "https://www.youtube.com/generate_204",
+                    "require_preferred": True,
+                    "cancel_event": cancel,
+                }
+                if expected_run_id is not None:
+                    probe_arguments["expected_run_id"] = expected_run_id
+                ok, detail = self.engine.probe_tun(
+                    **probe_arguments,
+                )
+                check_current()
+                if not ok:
+                    raise RuntimeError(f"TUN YouTube traffic check failed: {detail}")
+                if not self._tun_mode_enabled():
+                    if self._proxy_mode_enabled():
+                        enable_proxy()
+                    check_current()
+                    disable_tun()
+                    continue
+                if expected_run_id is None:
+                    self.engine.suspend_system_proxy_for_tun()
+                else:
+                    self.engine.suspend_system_proxy_for_tun(
+                        expected_run_id=expected_run_id
+                    )
+                return "tun"
+            if self.engine.tun_running:
+                if self._proxy_mode_enabled():
+                    enable_proxy()
+                check_current()
+                disable_tun()
+            if expected_run_id is None:
+                proxy_active = self._apply_proxy_mode_after_probe(cancel)
+            else:
+                proxy_active = self._apply_proxy_mode_after_probe(
+                    cancel, expected_run_id
+                )
+            check_current()
+            if not self._tun_mode_enabled():
+                return "proxy" if proxy_active else "core"
+        raise RuntimeError("Connection mode changed repeatedly during activation")
 
     def _selected_country_code(self) -> str:
         combo = getattr(self, "country_combo", None)
         value = combo.currentData() if combo is not None else self.storage.settings.get("selected_country", "ALL")
         value = str(value or "ALL").strip().upper()
-        return value if value in COUNTRIES else ""
+        available = {
+            str(profile.country_code or "").upper()
+            for profile in self.storage.profiles
+            if len(str(profile.country_code or "")) == 2
+        }
+        known = {
+            str(code).upper()
+            for code in self.storage.settings.get("known_country_codes", [])
+            if len(str(code)) == 2
+        }
+        return value if value in COUNTRIES or value in available or value in known else ""
+
+    def _selected_route_source(self) -> str:
+        tabs = getattr(self, "route_source_tabs", None)
+        if tabs is not None:
+            return "user-config" if tabs.currentIndex() == 1 else "suggested"
+        value = str(self.storage.settings.get("route_source", "suggested") or "suggested").lower()
+        return "user-config" if value == "user-config" else "suggested"
+
+    def _route_source_profiles(self, verified_only=False):
+        source = self._selected_route_source()
+        profiles = [
+            profile for profile in self.storage.profiles
+            if (
+                profile.origin == USER_CONFIG_ORIGIN
+                if source == "user-config"
+                else profile.origin not in DIRECT_PROFILE_ORIGINS
+            )
+        ]
+        if verified_only:
+            profiles = [profile for profile in profiles if profile.verified_spoof]
+        return profiles
+
+    def _country_metadata(self, code):
+        code = str(code or "").upper()
+        known = COUNTRIES.get(code)
+        if known:
+            return known
+        observed = next((
+            str(profile.observed_country_name or "").strip()
+            for profile in self.storage.profiles
+            if str(profile.country_code or profile.observed_country_code).upper() == code
+            and str(profile.observed_country_name or "").strip()
+        ), code)
+        return ("", observed or code, observed or code)
 
     def _country_profiles(self, country_code=None):
         country_code = (country_code or self._selected_country_code()).upper()
         now = time.time()
         profiles = []
-        for profile in self.storage.profiles:
-            if (profile.origin == "user" or not profile.verified_spoof
-                    or profile.country_code.upper() != country_code):
+        for profile in self._route_source_profiles(verified_only=True):
+            if profile.country_code.upper() != country_code:
                 continue
             if profile.rotating_exit:
                 fresh = now - float(profile.country_verified_at or 0) < 30 * 60
@@ -2384,20 +3570,30 @@ class MainWindow(QMainWindow):
         previous = profile.country_code.upper()
         profile.observed_exit_ip = str(location.ip or "")
         profile.observed_country_code = code
+        profile.observed_country_name = str(location.country or "")
         profile.country_verified_at = time.time()
         profile.country_source = str(location.source or "")
         profile.country_code = code
-        try:
-            fragment = profile.source_uri.rsplit("#", 1)[1]
-            sequence = int(fragment.split("-", 2)[1])
-        except (IndexError, TypeError, ValueError):
-            sequence = 0
-        _flag, english, _persian = COUNTRIES.get(
-            code, ("🌐", location.country or code, location.country or code)
-        )
-        suffix = f"Spoof {sequence:03d}" if sequence else "Spoof"
-        profile.name = f"{english} · {suffix}"
+        if profile.origin not in DIRECT_PROFILE_ORIGINS:
+            try:
+                fragment = profile.source_uri.rsplit("#", 1)[1]
+                sequence = int(fragment.split("-", 2)[1])
+            except (IndexError, TypeError, ValueError):
+                sequence = 0
+            _flag, english, _persian = COUNTRIES.get(
+                code, ("🌐", location.country or code, location.country or code)
+            )
+            suffix = f"Spoof {sequence:03d}" if sequence else "Spoof"
+            profile.name = f"{english} · {suffix}"
+        known_codes = {
+            str(value).upper()
+            for value in self.storage.settings.get("known_country_codes", [])
+            if len(str(value)) == 2
+        }
+        known_codes.add(code)
+        self.storage.settings["known_country_codes"] = sorted(known_codes)
         self.storage.save_profiles()
+        self.storage.save_settings()
         self.bridge.log.emit(
             f"EXIT COUNTRY profile={profile.id} ip={location.ip} "
             f"country={code} source={location.source} previous={previous or '-'}"
@@ -2407,8 +3603,35 @@ class MainWindow(QMainWindow):
     def _refresh_country_selector(self):
         if not hasattr(self, "country_combo"):
             return
-        selected = str(self.storage.settings.get("selected_country", "ALL") or "ALL").upper()
-        if selected not in COUNTRIES:
+        source = self._selected_route_source()
+        selected = str(self.storage.settings.get(
+            f"selected_country_{source}",
+            self.storage.settings.get("selected_country", "ALL"),
+        ) or "ALL").upper()
+        observed_meta = {}
+        for profile in self.storage.profiles:
+            code = str(profile.country_code or profile.observed_country_code or "").upper()
+            if len(code) != 2:
+                continue
+            name = str(getattr(profile, "observed_country_name", "") or "").strip()
+            if name:
+                observed_meta[code] = name
+        country_codes = sorted(
+            set(COUNTRIES) | {
+                str(profile.country_code or "").upper()
+                for profile in self.storage.profiles
+                if len(str(profile.country_code or "")) == 2
+            } | {
+                str(code).upper()
+                for code in self.storage.settings.get("known_country_codes", [])
+                if len(str(code)) == 2
+            },
+            key=lambda code: (
+                COUNTRIES.get(code, ("", observed_meta.get(code, code), ""))[1].lower(),
+                code,
+            ),
+        )
+        if selected not in country_codes:
             selected = "ALL"
         self.country_combo.blockSignals(True)
         self.country_combo.clear()
@@ -2424,7 +3647,8 @@ class MainWindow(QMainWindow):
             self.country_combo.view().setSpacing(3)
         all_text = self.tr("همه کشورها", "All countries")
         self.country_combo.addItem(cyber_icon("globe", "#78fff0", 19), all_text, "ALL")
-        for code, (flag, english, persian) in COUNTRIES.items():
+        for code in country_codes:
+            _flag, english, persian = self._country_metadata(code)
             count = len(self._country_profiles(code))
             name = (f"{english}  ({count})" if self.language == "en" else
                     f"{persian} · {ltr_isolate(f'{english} ({count})')}")
@@ -2434,13 +3658,15 @@ class MainWindow(QMainWindow):
         self.country_combo.blockSignals(False)
         active_code = self._selected_country_code()
         active_count = len(self._country_profiles(active_code)) if active_code else sum(
-            1 for profile in self.storage.profiles if profile.verified_spoof
+            1 for profile in self._route_source_profiles(verified_only=True)
         )
         self.country_count.setText(self.tr(f"{active_count} کانفیگ سالم", f"{active_count} verified configs"))
 
     def _country_activated(self, _index):
         code = self._selected_country_code()
+        source = self._selected_route_source()
         self.storage.settings["selected_country"] = code or "ALL"
+        self.storage.settings[f"selected_country_{source}"] = code or "ALL"
         self.storage.save_settings()
         self._refresh_country_selector()
         self.refresh_profiles()
@@ -2454,7 +3680,7 @@ class MainWindow(QMainWindow):
         if not code:
             self._set_activity("فیلتر کشور برداشته شد.", "Country filter cleared.", "success", False)
             return
-        _flag, english, persian = COUNTRIES[code]
+        _flag, english, persian = self._country_metadata(code)
         country_name = english if self.language == "en" else persian
         self.bridge.log.emit(f"COUNTRY SELECT {code} profiles={len(self._country_profiles(code))}")
         self._set_activity(
@@ -2466,57 +3692,162 @@ class MainWindow(QMainWindow):
             self._set_state(False)
         QTimer.singleShot(120, self._start_selected_country)
 
+    def _route_source_changed(self, _index):
+        source = self._selected_route_source()
+        self.storage.settings["route_source"] = source
+        self.storage.save_settings()
+        self._refresh_country_selector()
+        self._sync_auto_mode_ui(select_profile=True)
+        title = "User Config" if source == "user-config" else self.tr("پیشنهادی", "Suggested")
+        self._set_activity(
+            f"منبع اتصال خودکار روی {title} تنظیم شد.",
+            f"Auto connection source set to {title}.",
+            "success", False,
+        )
+
     def _start_selected_country(self):
         if (not self._closing and self.auto_mode.isChecked()
                 and self._selected_country_code() and not self.connecting
                 and not self.engine.running):
             self.toggle_connection()
 
-    def _select_manual_profile(self) -> ProxyProfile | None:
+    def _direct_source_origin(self):
+        value = str(self.storage.settings.get("direct_source", "") or "").lower()
+        if value == "user-config":
+            return USER_CONFIG_ORIGIN
+        if value == "manual":
+            return "user"
         selected = self.storage.selected()
-        if selected is not None and selected.origin == "user":
-            return selected
-        item = self.manual_list.currentItem() if hasattr(self, "manual_list") else None
+        if selected is not None and selected.origin in DIRECT_PROFILE_ORIGINS:
+            return selected.origin
+        return (
+            "user" if any(profile.origin == "user" for profile in self.storage.profiles)
+            else USER_CONFIG_ORIGIN
+        )
+
+    def _remember_direct_profile(self, profile):
+        if profile is None or profile.origin not in DIRECT_PROFILE_ORIGINS:
+            return
+        source = "user-config" if profile.origin == USER_CONFIG_ORIGIN else "manual"
+        self.storage.settings["direct_source"] = source
+        self.storage.settings[
+            "last_user_config_profile_id"
+            if profile.origin == USER_CONFIG_ORIGIN else
+            "last_manual_profile_id"
+        ] = profile.id
+        save = getattr(self.storage, "save_settings", None)
+        if callable(save):
+            save()
+
+    def _profile_tab_changed(self, index):
+        widget = self.profile_tabs.widget(index)
+        if widget is not self.user_config_list and widget is not self.manual_list:
+            return
+        auto_mode = getattr(self, "auto_mode", None)
+        if auto_mode is not None and auto_mode.isChecked():
+            return
+        source = "user-config" if widget is self.user_config_list else "manual"
+        self.storage.settings["direct_source"] = source
+        item = widget.currentItem()
         if item is not None:
-            manual = next((profile for profile in self.storage.profiles
-                           if profile.id == item.data(Qt.UserRole)
-                           and profile.origin == "user"), None)
-            if manual is not None:
-                self.storage.selected_id = manual.id
-                return manual
-        manual = next((profile for profile in self.storage.profiles
-                       if profile.origin == "user"), None)
-        if manual is not None:
-            self.storage.selected_id = manual.id
-        return manual
+            profile_id = item.data(Qt.UserRole)
+            profile = next((
+                value for value in self.storage.profiles
+                if value.id == profile_id and value.origin in DIRECT_PROFILE_ORIGINS
+            ), None)
+            if profile is not None:
+                self.storage.selected_id = profile.id
+                self._remember_direct_profile(profile)
+                return
+        save = getattr(self.storage, "save_settings", None)
+        if callable(save):
+            save()
+
+    def _select_manual_profile(self) -> ProxyProfile | None:
+        origin = MainWindow._direct_source_origin(self)
+        widget = self.user_config_list if origin == USER_CONFIG_ORIGIN else self.manual_list
+        setting_key = (
+            "last_user_config_profile_id"
+            if origin == USER_CONFIG_ORIGIN else
+            "last_manual_profile_id"
+        )
+        preferred_id = str(self.storage.settings.get(setting_key, "") or "")
+        item = widget.currentItem()
+        item_id = item.data(Qt.UserRole) if item is not None else ""
+        candidate_ids = [preferred_id, item_id, self.storage.selected_id]
+        selected = next((
+            profile for profile_id in candidate_ids if profile_id
+            for profile in self.storage.profiles
+            if profile.id == profile_id and profile.origin == origin
+        ), None)
+        if selected is None:
+            selected = next((
+                profile for profile in self.storage.profiles
+                if profile.origin == origin
+            ), None)
+        if selected is None:
+            fallback_origin = "user" if origin == USER_CONFIG_ORIGIN else USER_CONFIG_ORIGIN
+            selected = next((
+                profile for profile in self.storage.profiles
+                if profile.origin == fallback_origin
+            ), None)
+        if selected is not None:
+            self.storage.selected_id = selected.id
+            MainWindow._remember_direct_profile(self, selected)
+            widget = (
+                self.user_config_list
+                if selected.origin == USER_CONFIG_ORIGIN else self.manual_list
+            )
+            if hasattr(widget, "item"):
+                for row in range(widget.count()):
+                    current = widget.item(row)
+                    if current.data(Qt.UserRole) == selected.id:
+                        widget.setCurrentItem(current)
+                        break
+        return selected
 
     def _sync_auto_mode_ui(self, select_profile=False):
         enabled = self.auto_mode.isChecked()
         self.country_combo.setEnabled(enabled)
+        self.route_source_tabs.setEnabled(enabled)
+        self.manual_option.setEnabled(not enabled)
         self.country_card.setProperty("mode", "auto" if enabled else "manual")
         _restyle(self.country_card)
         self.country_description.setText(self.tr(
-            "با انتخاب کشور، فقط کانفیگ‌های سالم همان کشور دوباره تست می‌شوند و بهترین مورد متصل می‌شود."
-            if enabled else "حالت دستی فعال است؛ کانفیگ انتخاب‌شده از فهرست Manual متصل می‌شود.",
-            "Choose a country to retest its verified configs and connect the best route."
-            if enabled else "Manual mode is active; the selected Manual config will be connected.",
+            "منبع کانفیگ و کشور را انتخاب کنید؛ سالم‌ترین مسیر همان بخش به‌صورت خودکار متصل می‌شود."
+            if enabled else "حالت دستی فعال است؛ کانفیگ انتخاب‌شده از Manual یا User Config متصل می‌شود.",
+            "Choose a config source and country; Auto Mode connects its best verified route."
+            if enabled else "Manual mode uses the selected Manual or User Config entry.",
         ))
         if select_profile:
             if enabled:
-                self.profile_tabs.setCurrentIndex(1)
+                self.profile_tabs.setCurrentIndex(
+                    self.profile_tabs.indexOf(
+                        self.user_config_list
+                        if self._selected_route_source() == "user-config"
+                        else self.suggested_list
+                    )
+                )
             else:
-                self.profile_tabs.setCurrentIndex(0)
+                direct_index = self.profile_tabs.indexOf(
+                    self.user_config_list
+                    if MainWindow._direct_source_origin(self) == USER_CONFIG_ORIGIN
+                    else self.manual_list
+                )
+                self.profile_tabs.setCurrentIndex(direct_index)
                 self._select_manual_profile()
 
     def _auto_mode_changed(self, enabled):
+        if enabled:
+            self._remember_direct_profile(self.storage.selected())
         self._save_flag("auto_mode", enabled)
         self._sync_auto_mode_ui(select_profile=True)
         self.refresh_profiles()
         self._set_activity(
-            "حالت خودکار فعال شد؛ کانفیگ‌های پیشنهادی بر اساس کشور تست می‌شوند."
-            if enabled else "حالت دستی فعال شد؛ کانفیگ انتخاب‌شده از فهرست Manual استفاده می‌شود.",
-            "Auto Mode enabled; verified country routes will be tested."
-            if enabled else "Manual mode enabled; the selected Manual config will be used.",
+            "حالت خودکار فعال شد؛ منبع و کشور انتخاب‌شده تست می‌شوند."
+            if enabled else "حالت دستی فعال شد؛ از Manual یا User Config یک کانفیگ انتخاب کنید.",
+            "Auto Mode enabled; the selected source and country will be tested."
+            if enabled else "Manual mode enabled; select an entry from Manual or User Config.",
             "success", False,
         )
 
@@ -2527,8 +3858,100 @@ class MainWindow(QMainWindow):
             f"fakeSni={tuning.pattern_fake_sni} sessions={tuning.pattern_max_sessions}")
         self.refresh_profiles()
 
+    def _effective_profile_fake_sni(self, profile, carrier=None):
+        carrier = carrier or self.storage.tuning.carrier_mode
+        settings = self.storage.settings
+        scoped_pins = settings.get("pattern_profile_sni_pins_by_carrier", {})
+        bucket = scoped_pins.get(carrier, {}) if isinstance(scoped_pins, dict) else {}
+        bucket = bucket if isinstance(bucket, dict) else {}
+        value = bucket.get(profile.id, "")
+        if not value and carrier == self.storage.tuning.carrier_mode:
+            legacy = settings.get("pattern_profile_sni_pins", {})
+            if isinstance(legacy, dict):
+                value = legacy.get(profile.id, "")
+        scoped_globals = settings.get("pattern_global_sni_pin_by_carrier", {})
+        if not value and isinstance(scoped_globals, dict):
+            value = scoped_globals.get(carrier, "")
+        if not value and carrier == self.storage.tuning.carrier_mode:
+            value = settings.get("pattern_global_sni_pin", "")
+        return str(value or profile.spoof_fake_sni
+                   or self.storage.tuning.pattern_fake_sni or profile.sni).strip()
+
+    def _profile_route_label(self, profile, carrier=None):
+        if profile is None:
+            return ""
+        fake_sni = self._effective_profile_fake_sni(profile, carrier)
+        return f"{profile.target_label}\nFake SNI {fake_sni}"
+
+    def _attach_profile_row(self, widget, item, profile, text, icon):
+        active = profile.id == self.storage.selected_id
+        row = ProfileListRow(
+            profile.id, text, icon,
+            self.tr("فعال است", "Active") if active
+            else self.tr("فعال‌سازی", "Activate"),
+            active=active,
+        )
+        row.setToolTip(item.toolTip() or text)
+        row.activate_button.setToolTip(self.tr(
+            "فعال‌کردن این کانفیگ",
+            "Activate this configuration",
+        ))
+        row.edit_button.setToolTip(self.tr("ویرایش کانفیگ", "Edit config"))
+        row.delete_button.setToolTip(self.tr("حذف کانفیگ", "Delete config"))
+        row.activated.connect(
+            lambda profile_id, modifiers, target=widget, target_item=item:
+            self._profile_row_activated(
+                target, target_item, profile_id, modifiers
+            )
+        )
+        row.activateRequested.connect(self._activate_profile_by_id)
+        row.editRequested.connect(self._edit_profile_by_id)
+        row.deleteRequested.connect(
+            lambda profile_id: self.delete_profile({profile_id})
+        )
+        widget.setItemWidget(item, row)
+        item.setText("")
+        item.setIcon(QIcon())
+
+    def _profile_row_activated(
+            self, widget, item, profile_id, modifiers):
+        widget.setFocus()
+        if modifiers & Qt.ControlModifier:
+            item.setSelected(not item.isSelected())
+            self._update_config_actions()
+            return
+        widget.clearSelection()
+        widget.setCurrentItem(item)
+        self._update_config_actions()
+
+    def _activate_profile_by_id(self, profile_id):
+        wanted = str(profile_id)
+        for widget in (
+                self.user_config_list, self.manual_list,
+                self.suggested_list):
+            for row in range(widget.count()):
+                item = widget.item(row)
+                if str(item.data(Qt.UserRole) or "") != wanted:
+                    continue
+                self.profile_tabs.setCurrentWidget(widget)
+                widget.clearSelection()
+                widget.setCurrentItem(item)
+                self._profile_clicked(item)
+                self.refresh_profiles()
+                return
+
+    def _edit_profile_by_id(self, profile_id):
+        profile = next(
+            (value for value in self.storage.profiles
+             if value.id == str(profile_id)),
+            None,
+        )
+        if profile is None:
+            return
+        self.edit_profile(profile.id)
+
     def refresh_profiles(self):
-        self.manual_list.clear(); self.suggested_list.clear()
+        self.manual_list.clear(); self.user_config_list.clear(); self.suggested_list.clear()
         self._refresh_country_selector()
         self.sync_btn.setEnabled(True)
         carrier = self.storage.tuning.carrier_mode
@@ -2547,17 +3970,56 @@ class MainWindow(QMainWindow):
                     -float(value.get("score", 0)),
                     float(value.get("startup_ms", 999999)))
         ranked_ids = [profile.id for profile in sorted(
-            (p for p in self.storage.profiles if p.origin != "user"
+            (p for p in self.storage.profiles if p.origin not in DIRECT_PROFILE_ORIGINS
              and benchmarks.get(p.id, {}).get("ok")
              and benchmarks.get(p.id, {}).get("engine") == "patterniha-wrong-seq-v1"),
             key=benchmark_rank)]
-        profiles = sorted(self.storage.profiles, key=lambda p: (
-            p.origin != "user",
-            ranked_ids.index(p.id) if p.id in ranked_ids else 999,
-            not p.last_ping_ok,
-            p.last_ping_ms if p.last_ping_ok else 999999,
-        ))
+        def profile_sort_key(profile):
+            if profile.origin == "user":
+                return (0, "", 0, 0, profile.name.casefold())
+            if profile.origin == USER_CONFIG_ORIGIN:
+                code = str(profile.country_code or "ZZ").upper()
+                _flag, english, _persian = self._country_metadata(code)
+                return (
+                    1, f"{english.casefold()}:{code}",
+                    not profile.last_ping_ok,
+                    profile.last_ping_ms if profile.last_ping_ok else 999999,
+                    profile.name.casefold(),
+                )
+            return (
+                2, "",
+                ranked_ids.index(profile.id) if profile.id in ranked_ids else 999,
+                profile.last_ping_ms if profile.last_ping_ok else 999999,
+                profile.name.casefold(),
+            )
+        profiles = sorted(self.storage.profiles, key=profile_sort_key)
+        user_country_counts = {}
         for profile in profiles:
+            if profile.origin == USER_CONFIG_ORIGIN:
+                code = str(profile.country_code or "XX").upper()
+                user_country_counts[code] = user_country_counts.get(code, 0) + 1
+        current_user_country = None
+        for profile in profiles:
+            if profile.origin == USER_CONFIG_ORIGIN:
+                code = str(profile.country_code or "XX").upper()
+                if code != current_user_country:
+                    current_user_country = code
+                    _flag, english, persian = self._country_metadata(code)
+                    title = english if self.language == "en" else persian
+                    count = user_country_counts.get(code, 0)
+                    header = QListWidgetItem(self.tr(
+                        f"{title}  ·  {count} کانفیگ",
+                        f"{title}  ·  {count} configs",
+                    ))
+                    header.setData(Qt.UserRole, None)
+                    header.setData(Qt.UserRole + 1, "country-header")
+                    header.setFlags(Qt.NoItemFlags)
+                    header.setIcon(country_flag_icon(code, 30, 20))
+                    header.setForeground(QColor("#79efe7"))
+                    header.setBackground(QColor(8, 47, 66, 185))
+                    font = header.font(); font.setBold(True); header.setFont(font)
+                    header.setSizeHint(QSize(0, 32))
+                    self.user_config_list.addItem(header)
             benchmark = benchmarks.get(profile.id, {})
             recommendation = ""
             if profile.id in ranked_ids[:3]:
@@ -2580,13 +4042,21 @@ class MainWindow(QMainWindow):
                     quality_text = self.tr("آپلود در حال ارزیابی", "upload pending")
                 startup_label = "Page" if carrier == "mci" else "YouTube"
                 recommendation = f"{tag}  ·  Score {score}  ·  {startup_label} {startup_ms / 1000:.2f}s  ·  {quality_text}\n"
-            endpoint = f"\u2066{profile.target_label}\u2069"
-            item = QListWidgetItem(f"{recommendation}{profile.name}\n{endpoint}"); item.setData(Qt.UserRole, profile.id); item.setSizeHint(item.sizeHint().expandedTo(item.sizeHint() + QSize(0, 42 if recommendation else 30)))
-            item.setIcon(
+            endpoint = f"\u2066{self._profile_route_label(profile, carrier)}\u2069"
+            item_text = f"{recommendation}{profile.name}\n{endpoint}"
+            item = QListWidgetItem(item_text); item.setData(Qt.UserRole, profile.id)
+            item.setSizeHint(QSize(
+                0,
+                70 if recommendation else (
+                    50 if profile.origin != "user" else 58
+                ),
+            ))
+            item_icon = (
                 country_flag_icon(profile.country_code, 30, 20)
                 if profile.verified_spoof else
                 cyber_icon("file-cog" if profile.origin == "user" else "server", "#23f5e0" if profile.id == self.storage.selected_id else "#6f91b5", 20)
             )
+            item.setIcon(item_icon)
             if recommendation:
                 if carrier == "mci":
                     quality_tip = (f"download {float(benchmark.get('download_mbps', 0) or 0):.2f} Mbps · "
@@ -2596,53 +4066,902 @@ class MainWindow(QMainWindow):
                     quality_tip = f"upload {benchmark.get('upload_state', 'not tested')}"
                 startup_label = "Page" if carrier == "mci" else "YouTube"
                 item.setToolTip(f"Patterniha real test · Fake SNI {benchmark.get('fake_sni', '—')} · {startup_label} {float(benchmark.get('startup_ms', 0)):.0f} ms · {quality_tip} · strategy={benchmark.get('strategy', 'wrong_seq')}")
-            target = self.manual_list if profile.origin == "user" else self.suggested_list; target.addItem(item)
+            target = (
+                self.manual_list if profile.origin == "user"
+                else self.user_config_list if profile.origin == USER_CONFIG_ORIGIN
+                else self.suggested_list
+            ); target.addItem(item)
+            attach_row = getattr(self, "_attach_profile_row", None)
+            if callable(attach_row):
+                attach_row(target, item, profile, item_text, item_icon)
             if profile.id == self.storage.selected_id: target.setCurrentItem(item)
         self.config_count_label.setText(self.tr(f"{len(self.storage.profiles)} کانفیگ", f"{len(self.storage.profiles)} configs"))
-        selected = self.storage.selected(); self.active_profile.setText(selected.name if selected else self.tr("کانفیگی انتخاب نشده", "No config selected")); self.route_card.set_secondary(selected.target_label if selected else "")
-        if selected:
-            self.ping_label.setText(f"{selected.last_ping_ms:.0f} ms" if selected.last_ping_ok else "—")
-            if selected.last_ping_ok: self.latency_card.sparkline.add_value(selected.last_ping_ms)
-        else:
-            self.ping_label.setText("—")
+        selected = self.storage.selected(); self.active_profile.setText(selected.name if selected else self.tr("کانفیگی انتخاب نشده", "No config selected")); self.route_card.set_secondary(self._profile_route_label(selected, carrier))
         self._update_config_actions()
 
+    def _maker_repo_url_changed(self, *_args):
+        current = self.maker_repo_url.text().strip()
+        self.maker_repo_btn.setEnabled(
+            bool(current)
+            and not self._maker_import_in_progress
+            and current != self._maker_last_loaded_url
+        )
+        self._update_maker_guide()
+
+    def _maker_editor_changed(self):
+        self._sync_maker_editor_direction()
+        self._update_maker_guide()
+
+    def _set_maker_guide_button(self, button):
+        if self._maker_guide_button is button:
+            return
+        if self._maker_guide_animation is not None:
+            self._maker_guide_animation.stop()
+        if self._maker_guide_button is not None:
+            self._maker_guide_button.setProperty("guided", False)
+            self._maker_guide_button.setGraphicsEffect(None)
+            _restyle(self._maker_guide_button)
+        self._maker_guide_button = button
+        self._maker_guide_effect = None
+        self._maker_guide_animation = None
+        if button is None:
+            return
+        button.setProperty("guided", True)
+        _restyle(button)
+        if not _animations_enabled():
+            return
+        effect = QGraphicsDropShadowEffect(button)
+        effect.setOffset(0, 0)
+        effect.setColor(QColor(35, 245, 224, 205))
+        effect.setBlurRadius(9)
+        button.setGraphicsEffect(effect)
+        animation = QPropertyAnimation(effect, b"blurRadius", self)
+        animation.setDuration(1450)
+        animation.setStartValue(9.0)
+        animation.setKeyValueAt(0.48, 30.0)
+        animation.setEndValue(9.0)
+        animation.setEasingCurve(QEasingCurve.InOutSine)
+        animation.setLoopCount(-1)
+        self._maker_guide_effect = effect
+        self._maker_guide_animation = animation
+        animation.start()
+
+    def _update_maker_guide(self):
+        if (
+                not hasattr(self, "maker_repo_btn")
+                or self._maker_running
+                or self._maker_import_in_progress):
+            self._set_maker_guide_button(None)
+            return
+        editor_text = self.maker_source_editor.toPlainText().strip()
+        editor_dirty = (
+            bool(editor_text)
+            and editor_text != self._maker_last_converted_editor_text
+        )
+        if editor_dirty and self.maker_text_btn.isEnabled():
+            self._set_maker_guide_button(self.maker_text_btn)
+            return
+        if (
+                self.maker_repo_btn.isEnabled()
+                and (
+                    not self._maker_profiles
+                    or bool(self._maker_last_loaded_url)
+                )):
+            self._set_maker_guide_button(self.maker_repo_btn)
+            return
+        statuses = self.maker_model.status_counts()
+        if int(statuses.get("healthy", 0)) > 0:
+            self._set_maker_guide_button(self.maker_add_all_btn)
+            return
+        if self._maker_profiles and self.maker_start_btn.isEnabled():
+            self._set_maker_guide_button(self.maker_start_btn)
+            return
+        self._set_maker_guide_button(None)
+
+    def _maker_import_worker(
+            self, loader, source, replace=False, editor_text=""):
+        self._maker_import_generation += 1
+        generation = self._maker_import_generation
+        self._maker_import_in_progress = True
+        self._maker_repo_url_changed()
+        self.maker_import_badge.setText(self.tr("در حال پردازش…", "Processing…"))
+
+        def work():
+            try:
+                maker = SniConfigMaker(
+                    fake_sni=self.storage.tuning.pattern_fake_sni,
+                )
+                imported = loader(maker)
+                converted = maker.convert_many(imported.profiles)
+                self.bridge.maker_imported.emit(
+                    {"imported": imported, "converted": converted},
+                    {
+                        "source": source,
+                        "replace": bool(replace),
+                        "editor_text": str(editor_text or ""),
+                    },
+                    generation,
+                )
+            except Exception as exc:
+                self.bridge.maker_imported.emit(
+                    {"error": str(exc)},
+                    {
+                        "source": source,
+                        "replace": bool(replace),
+                        "editor_text": str(editor_text or ""),
+                    },
+                    generation,
+                )
+
+        threading.Thread(target=work, name="sni-maker-import", daemon=True).start()
+
+    def _maker_import_text(self, text, source="text"):
+        payload = str(text or "").strip()
+        if not payload:
+            self.show_toast(self.tr("متنی برای تبدیل وجود ندارد", "No configuration text to convert"), "warning")
+            return
+        self._maker_import_worker(
+            lambda maker: maker.import_text(payload, source=source),
+            source,
+            editor_text=payload if source == "editor" else "",
+        )
+
+    def _maker_import_files(self):
+        paths, _filter = QFileDialog.getOpenFileNames(
+            self,
+            self.tr("انتخاب فایل کانفیگ", "Select configuration files"),
+            "",
+            "Config files (*.txt *.conf *.json *.yaml *.yml);;All files (*.*)",
+        )
+        if not paths:
+            return
+
+        try:
+            chunks = []
+            for value in paths:
+                path = __import__("pathlib").Path(value)
+                if path.stat().st_size > 64 * 1024 * 1024:
+                    raise ValueError(f"File is too large: {path.name}")
+                chunks.append(path.read_text(encoding="utf-8-sig", errors="replace"))
+            self.maker_source_editor.append_payload("\n".join(chunks), paths)
+            self.show_toast(
+                self.tr(
+                    "فایل آماده است؛ اکنون تبدیل را بزنید.",
+                    "File ready; press Convert next.",
+                ),
+                "success",
+            )
+            self._update_maker_guide()
+        except (OSError, ValueError) as exc:
+            self.show_toast(str(exc), "danger")
+
+    def _maker_fetch_repository(self):
+        url = self.maker_repo_url.text().strip() or DEFAULT_SNI_MAKER_URL
+        self.maker_repo_btn.setEnabled(False)
+        self._maker_import_worker(
+            lambda maker: maker.import_url(url, timeout=20.0),
+            url,
+            replace=True,
+        )
+
+    def _maker_import_finished(self, payload, meta, generation):
+        if generation != self._maker_import_generation:
+            return
+        self._maker_import_in_progress = False
+        error = str(payload.get("error", "") if isinstance(payload, dict) else "")
+        if error:
+            self.maker_import_badge.setText(self.tr("خطا در دریافت یا پردازش", "Import failed"))
+            self.show_toast(error, "danger")
+            self._maker_repo_url_changed()
+            return
+        imported = payload.get("imported")
+        converted = payload.get("converted")
+        if not isinstance(imported, SniImportResult) or converted is None:
+            self._maker_repo_url_changed()
+            return
+        loaded_source = str(meta.get("source", "") or "").strip()
+        if bool(meta.get("replace", False)):
+            self._maker_last_loaded_url = loaded_source
+        editor_text = str(meta.get("editor_text", "") or "")
+        if editor_text:
+            self._maker_last_converted_editor_text = editor_text.strip()
+        if bool(meta.get("replace", False)):
+            self._maker.clear()
+            self._maker_profiles.clear()
+            self._maker_base_names.clear()
+            self._maker_country_labels.clear()
+            self._maker_last_country_summary = None
+            self.maker_model.clear()
+            self.maker_country_rail.set_country_counts(
+                {},
+                all_label=self.tr("همه کشورها", "All countries"),
+            )
+            self.maker_progress.setMaximum(100)
+            self.maker_progress.setValue(0)
+            self.maker_progress.set_status(
+                self.tr("آماده تست", "Tester ready"), "idle"
+            )
+        if imported.input_format == "base64":
+            self.show_toast(
+                f"Base64 subscription decoded: {imported.detected_count} configs found.",
+                "success",
+            )
+        elif imported.input_format == "direct":
+            self.show_toast(
+                f"Direct configs detected: {imported.detected_count} configs found.",
+                "success",
+            )
+        rows = []
+        added_profiles = []
+        duplicate_existing = 0
+        for result in converted.results:
+            profile = result.profile
+            if profile is None:
+                raw = result.source_profile.source_uri
+                key = f"rejected:{config_signature(raw)}"
+                if self.maker_model.row_for_key(key) < 0:
+                    rows.append({
+                        "key": key,
+                        "uri": raw,
+                        "source_uri": raw,
+                        "status": "skipped",
+                        "country_code": "XX",
+                        "label": result.source_profile.name,
+                        "error": result.error or "Incompatible with SNI mode",
+                    })
+                continue
+            key = config_signature(profile)
+            if key in self._maker_profiles:
+                duplicate_existing += 1
+                continue
+            profile.address = VERIFIED_SPOOF_EDGE
+            profile.config_host = "127.0.0.1"
+            profile.config_port = 40443
+            profile.origin = USER_CONFIG_ORIGIN
+            profile.spoof_fake_sni = (
+                profile.spoof_fake_sni
+                or self.storage.tuning.pattern_fake_sni
+            )
+            profile.verified_spoof = False
+            self._maker_profiles[key] = profile
+            base_name = profile.name
+            if base_name.endswith(" · SNI"):
+                base_name = base_name[:-6].rstrip()
+            self._maker_base_names[key] = base_name
+            added_profiles.append(profile)
+            rows.append({
+                "key": key,
+                "uri": profile.source_uri,
+                "source_uri": result.source_profile.source_uri,
+                "status": "ready" if result.already_sni else "converted",
+                "country_code": "XX",
+                "label": profile.name,
+            })
+        for raw in imported.unsupported_uris:
+            key = f"unsupported:{config_signature(raw)}"
+            if self.maker_model.row_for_key(key) >= 0 or any(
+                    row.get("key") == key for row in rows):
+                continue
+            protocol = raw.split("://", 1)[0].upper()
+            rows.append({
+                "key": key,
+                "uri": raw,
+                "source_uri": raw,
+                "status": "skipped",
+                "country_code": "XX",
+                "label": protocol,
+                "error": f"Unsupported protocol: {protocol}",
+            })
+        self._maker.add_profiles(added_profiles, source=str(meta.get("source", "")))
+        self.maker_model.append_batch(rows, deduplicate=True)
+        duplicate_count = imported.duplicate_count + duplicate_existing
+        details = [
+            self.tr(f"{len(added_profiles)} آماده تست", f"{len(added_profiles)} testable"),
+            self.tr(f"{duplicate_count} تکراری", f"{duplicate_count} duplicates"),
+        ]
+        if imported.unsupported_count:
+            protocols = ", ".join(f"{name}:{count}" for name, count in imported.unsupported_by_protocol.items())
+            details.append(self.tr(
+                f"{imported.unsupported_count} ناسازگار ({ltr_isolate(protocols)})",
+                f"{imported.unsupported_count} unsupported ({protocols})",
+            ))
+        if converted.incompatible_count:
+            details.append(self.tr(
+                f"{converted.incompatible_count} ناسازگار با متد",
+                f"{converted.incompatible_count} incompatible with SNI mode",
+            ))
+        if imported.invalid_count:
+            details.append(self.tr(
+                f"{imported.invalid_count} نامعتبر",
+                f"{imported.invalid_count} invalid",
+            ))
+        issue_count = (
+            imported.unsupported_count + converted.incompatible_count
+            + imported.invalid_count
+        )
+        compact = [self.tr(
+            f"{len(added_profiles)} آماده",
+            f"{len(added_profiles)} ready",
+        )]
+        if issue_count:
+            compact.append(self.tr(f"{issue_count} مشکل", f"{issue_count} issues"))
+        elif duplicate_count:
+            compact.append(self.tr(
+                f"{duplicate_count} تکراری",
+                f"{duplicate_count} duplicates",
+            ))
+        self.maker_import_badge.setText(" · ".join(compact))
+        self.maker_import_badge.setToolTip("  •  ".join(details))
+        source = str(meta.get("source", ""))
+        if source.startswith("http"):
+            self.storage.settings["sni_maker_url"] = source
+            self.storage.save_settings()
+        self.maker_progress.setFormat(self.tr(
+            f"{len(self._maker_profiles)} کانفیگ آماده تست زنده",
+            f"{len(self._maker_profiles)} configs ready for live testing",
+        ))
+        self._set_activity(
+            "کانفیگ‌ها تبدیل و برای تست آماده شدند.",
+            "Configurations converted and queued for testing.",
+            "success", False,
+        )
+        self._maker_repo_url_changed()
+        self._update_maker_guide()
+    def _maker_start_test(self):
+        if self._maker_running:
+            return
+        if self.engine.running or self.connecting:
+            self.show_toast(self.tr(
+                "برای تست همزمان کانفیگ‌ها ابتدا اتصال فعلی را قطع کنید",
+                "Disconnect the active tunnel before batch testing",
+            ), "warning")
+            return
+        profiles = list(self._maker_profiles.values())
+        if not profiles:
+            self.show_toast(self.tr("ابتدا کانفیگ اضافه کنید", "Add configurations first"), "warning")
+            return
+        self._maker_generation += 1
+        generation = self._maker_generation
+        self._maker_running = True
+        self._update_maker_guide()
+        self._maker_cancel_event = threading.Event()
+        self._maker_tester = SniBatchTester(self.bridge.log.emit)
+        self.maker_start_btn.setEnabled(False); self.maker_stop_btn.setEnabled(True)
+        for widget in (
+                self.maker_clear_btn,
+                self.maker_repo_btn, self.maker_repo_reset_btn,
+                self.maker_file_btn, self.maker_clip_btn, self.maker_text_btn,
+                self.maker_repo_url, self.maker_source_editor):
+            widget.setEnabled(False)
+        self.maker_model.update_batch([
+            {"key": key, "status": "testing", "error": ""}
+            for key in self._maker_profiles
+        ])
+        self.maker_progress.setMaximum(len(profiles)); self.maker_progress.setValue(0)
+        self.maker_progress.set_status(self.tr("تست زنده مسیرها", "Live route testing"), "running")
+        self.maker_progress.setFormat(self.tr(
+            f"۰ از {len(profiles)} کانفیگ",
+            f"0 of {len(profiles)} configs",
+        ))
+        workers = self.maker_threads.value()
+        timeout = float(self.maker_timeout.value())
+        tuning = self.storage.tuning
+        carrier = tuning.carrier_mode
+        strategy = str(self.storage.settings.get(
+            f"working_strategy_{carrier}",
+            "tls_sni_records" if carrier == "mci" else "wrong_seq",
+        ) or "").strip().lower()
+        tester = self._maker_tester
+        cancel = self._maker_cancel_event
+
+        def progress(batch, done, total):
+            self.bridge.maker_batch.emit(batch, done, total, generation)
+
+        def work():
+            try:
+                results = tester.run(
+                    profiles, tuning, cancel,
+                    workers=workers, timeout=timeout, strategy=strategy,
+                    progress=progress,
+                )
+                self.bridge.maker_done.emit(
+                    {"count": len(results), "cancelled": cancel.is_set()},
+                    generation,
+                )
+            except Exception as exc:
+                self.bridge.maker_failed.emit(str(exc), generation)
+
+        threading.Thread(target=work, name="sni-maker-live", daemon=True).start()
+
+    def _maker_test_batch(self, batch, done, total, generation):
+        if generation != self._maker_generation:
+            return
+        updates = []
+        now = time.time()
+        for result in batch:
+            if not isinstance(result, LiveConfigResult):
+                continue
+            key = config_signature(result.profile)
+            profile = self._maker_profiles.get(key)
+            if profile is None:
+                continue
+            verified_code = normalize_country_code(result.country_code)
+            if result.ok and verified_code != "XX":
+                profile.last_ping_ok = True
+                profile.last_ping_ms = float(result.ping_ms)
+                profile.country_latency_ms = int(round(result.ping_ms))
+                profile.country_code = verified_code
+                profile.observed_country_code = verified_code
+                profile.observed_country_name = result.country
+                profile.observed_exit_ip = result.exit_ip
+                profile.country_verified_at = now
+                profile.country_source = result.source
+                profile.verified_spoof = True
+                profile.origin = USER_CONFIG_ORIGIN
+                profile.spoof_fake_sni = (
+                    profile.spoof_fake_sni
+                    or self.storage.tuning.pattern_fake_sni
+                )
+                country = result.country or verified_code
+                base_name = self._maker_base_names.get(key, profile.name)
+                profile.name = f"{country} · {base_name} · SNI"
+                self._maker_country_labels[verified_code] = country
+                updates.append({
+                    "key": key,
+                    "status": "healthy",
+                    "country_code": verified_code,
+                    "ping_ms": result.ping_ms,
+                    "label": profile.name,
+                    "error": f"{result.exit_ip} · {result.source}",
+                })
+            else:
+                profile.last_ping_ok = False
+                profile.last_ping_ms = 0.0
+                profile.verified_spoof = False
+                profile.country_code = ""
+                profile.observed_country_code = ""
+                profile.observed_country_name = ""
+                profile.observed_exit_ip = ""
+                profile.country_verified_at = 0.0
+                profile.country_source = ""
+                profile.name = f"{self._maker_base_names.get(key, profile.name)} · SNI"
+                updates.append({
+                    "key": key,
+                    "status": "failed",
+                    "country_code": "XX",
+                    "ping_ms": None,
+                    "error": result.error or "Live route test failed",
+                })
+        self.maker_model.update_batch(updates)
+        self.maker_progress.setValue(done)
+        self.maker_progress.setFormat(self.tr(
+            f"{done} از {total} کانفیگ تست شد",
+            f"{done} of {total} configs tested",
+        ))
+
+    def _maker_finish_test_ui(self):
+        self._maker_running = False
+        self.maker_start_btn.setEnabled(True); self.maker_stop_btn.setEnabled(False)
+        self.maker_source_card.setVisible(True)
+        for widget in (
+                self.maker_clear_btn,
+                self.maker_repo_btn, self.maker_repo_reset_btn,
+                self.maker_file_btn, self.maker_clip_btn, self.maker_text_btn,
+                self.maker_repo_url, self.maker_source_editor):
+            widget.setEnabled(True)
+        self._maker_tester = None
+        self._maker_repo_url_changed()
+        self._update_maker_guide()
+
+    def _maker_test_done(self, payload, generation):
+        if generation != self._maker_generation:
+            return
+        cancelled = bool(payload.get("cancelled", False)) if isinstance(payload, dict) else False
+        if cancelled:
+            updates = []
+            for key, profile in self._maker_profiles.items():
+                row = self.maker_model.row_for_key(key)
+                result = self.maker_model.result_at(row)
+                if result is None or result.status != "testing":
+                    continue
+                updates.append({
+                    "key": key,
+                    "status": "healthy" if profile.verified_spoof else "ready",
+                    "country_code": profile.observed_country_code or "XX",
+                    "ping_ms": profile.last_ping_ms if profile.last_ping_ok else None,
+                    "error": "",
+                })
+            self.maker_model.update_batch(updates)
+        self._maker_finish_test_ui()
+        healthy = len(self.maker_model.healthy_results())
+        total = self.maker_model.rowCount()
+        self.maker_progress.set_status(
+            self.tr("تست متوقف شد", "Testing stopped") if cancelled else
+            self.tr("تست زنده کامل شد", "Live testing completed"),
+            "warning" if cancelled else "success",
+        )
+        self.maker_progress.setFormat(self.tr(
+            f"{healthy} کانفیگ سالم در {len(self._maker_country_labels)} کشور",
+            f"{healthy} healthy configs across {len(self._maker_country_labels)} countries",
+        ))
+        self._set_activity(
+            f"تست کانفیگ‌ها پایان یافت؛ {healthy} کانفیگ سالم است.",
+            f"Config testing finished; {healthy} configs are healthy.",
+            "warning" if cancelled else "success", False,
+        )
+
+    def _maker_failed(self, message, generation):
+        if generation != self._maker_generation:
+            return
+        self._maker_finish_test_ui()
+        self.maker_model.update_batch([
+            {"key": key, "status": "ready", "error": str(message)}
+            for key in self._maker_profiles
+            if self.maker_model.result_at(self.maker_model.row_for_key(key))
+            and self.maker_model.result_at(self.maker_model.row_for_key(key)).status == "testing"
+        ])
+        self.maker_progress.set_status(self.tr("خطای تست زنده", "Live test error"), "warning")
+        self.maker_progress.setFormat(str(message))
+        self.show_toast(str(message), "danger")
+
+    def _maker_stop_test(self):
+        if not self._maker_running:
+            return
+        self._maker_cancel_event.set()
+        self.maker_stop_btn.setEnabled(False)
+        self.maker_progress.set_status(self.tr("در حال توقف…", "Stopping…"), "warning")
+        tester = self._maker_tester
+        if tester is not None:
+            threading.Thread(target=tester.stop, name="sni-maker-stop", daemon=True).start()
+
+    def _maker_clear(self):
+        self._maker_stop_test()
+        self._maker_generation += 1
+        self._maker_import_generation += 1
+        self._maker_finish_test_ui()
+        self._maker_import_in_progress = False
+        self._maker_last_loaded_url = ""
+        self._maker_last_converted_editor_text = ""
+        self._maker.clear()
+        self._maker_profiles.clear()
+        self._maker_base_names.clear()
+        self._maker_country_labels.clear()
+        self._maker_last_country_summary = None
+        self.maker_model.clear()
+        self.maker_source_editor.clear()
+        self.maker_country_rail.set_country_counts({}, all_label=self.tr("همه کشورها", "All countries"))
+        self.maker_import_badge.setText(self.tr("آماده دریافت", "Ready"))
+        self.maker_import_badge.setToolTip("")
+        self.maker_progress.setMaximum(100); self.maker_progress.setValue(0)
+        self.maker_progress.set_status(self.tr("آماده تست", "Tester ready"), "idle")
+        self.maker_progress.setFormat(self.tr("منتظر کانفیگ", "Waiting for configs"))
+        self._maker_repo_url_changed()
+        self._update_maker_guide()
+
+    def _maker_summary_changed(self, summary):
+        total = int(summary.get("total", 0))
+        checked = int(summary.get(
+            "checked", len(self.maker_model.checked_results())
+        ))
+        healthy = int(summary.get("statuses", {}).get("healthy", 0))
+        countries = {
+            code: values
+            for code, values in summary.get("countries", {}).items()
+            if code != "XX" and (
+                values.get("healthy", 0) or values.get("testing", 0)
+            )
+        }
+        if countries != self._maker_last_country_summary:
+            selected = self.maker_country_rail.selected_country()
+            labels = {}
+            for code in countries:
+                known = COUNTRIES.get(code)
+                if known:
+                    labels[code] = known[1] if self.language == "en" else known[2]
+                else:
+                    labels[code] = self._maker_country_labels.get(code, code)
+            self.maker_country_rail.set_country_counts(
+                countries,
+                labels=labels,
+                selected=selected,
+                all_label=self.tr("همه کشورها", "All countries"),
+            )
+            self._maker_last_country_summary = {
+                code: dict(values) for code, values in countries.items()
+            }
+        self.maker_summary_badge.setText(self.tr(
+            f"{healthy} سالم از {total}",
+            f"{healthy} healthy of {total}",
+        ))
+        self.maker_select_all_checkbox.setEnabled(total > 0)
+        self.maker_select_all_checkbox.setChecked(total > 0 and checked == total)
+        enabled = healthy > 0
+        for button in (
+                self.maker_add_selected_btn, self.maker_add_country_btn,
+                self.maker_add_all_btn, self.maker_copy_btn,
+                self.maker_export_btn):
+            button.setEnabled(enabled)
+        if not self._maker_running:
+            self.maker_start_btn.setEnabled(bool(self._maker_profiles))
+        self._update_maker_guide()
+
+    def _position_maker_select_all(self):
+        if not hasattr(self, "maker_select_all_checkbox"):
+            return
+        header = self.maker_table.horizontalHeader()
+        section_x = header.sectionViewportPosition(MakerColumns.MARK)
+        section_width = header.sectionSize(MakerColumns.MARK)
+        box = self.maker_select_all_checkbox
+        box.move(
+            section_x + max(0, (section_width - box.width()) // 2),
+            max(0, (header.height() - box.height()) // 2),
+        )
+        box.raise_()
+
+    def _maker_add_results(self, mode):
+        if mode == "selected":
+            results = [
+                result for result in self.maker_model.checked_results()
+                if result.status == "healthy"
+            ]
+        elif mode == "country":
+            code = self.maker_country_rail.selected_country()
+            results = self.maker_model.healthy_results("" if code == "*" else code)
+        else:
+            results = self.maker_model.healthy_results()
+        existing = {
+            config_signature(profile)
+            for profile in self.storage.profiles
+            if profile.source_uri and profile.origin in USER_CONFIG_ORIGINS
+        }
+        added = []
+        duplicate_count = 0
+        for result in results:
+            profile = self._maker_profiles.get(result.key)
+            if profile is None or not profile.verified_spoof:
+                continue
+            signature = config_signature(profile)
+            if signature in existing:
+                duplicate_count += 1
+                continue
+            existing.add(signature)
+            value = replace(profile)
+            value.id = str(uuid.uuid4())
+            value.origin = USER_CONFIG_ORIGIN
+            added.append(value)
+        if not added:
+            if results and duplicate_count == len(results):
+                self.show_toast(self.tr(
+                    "کانفیگ‌های سالم انتخاب‌شده از قبل در User Config هستند",
+                    "Selected healthy configs are already in User Config",
+                ), "warning")
+                return
+            self.show_toast(self.tr(
+                "کانفیگ سالم جدیدی برای افزودن وجود ندارد",
+                "No new healthy configs to add",
+            ), "warning")
+            return
+        connection_active = bool(
+            self.connecting or self.engine.running or self._profile_switch_waiting
+        )
+        self.storage.profiles.extend(added)
+        self.storage.settings["route_source"] = "user-config"
+        self.route_source_tabs.setCurrentIndex(1)
+        if not connection_active and len(added) == 1:
+            self.storage.selected_id = added[0].id
+            self._forced_profile_id = added[0].id
+            self._remember_direct_profile(added[0])
+        known_codes = {
+            str(code).upper()
+            for code in self.storage.settings.get("known_country_codes", [])
+            if len(str(code)) == 2
+        }
+        known_codes.update(
+            profile.country_code.upper()
+            for profile in added if len(profile.country_code) == 2
+        )
+        self.storage.settings["known_country_codes"] = sorted(known_codes)
+        self.storage.save_profiles()
+        self.storage.save_settings()
+        self.refresh_profiles()
+        self.profile_tabs.setCurrentIndex(
+            self.profile_tabs.indexOf(self.user_config_list)
+        )
+        for row in range(self.user_config_list.count()):
+            item = self.user_config_list.item(row)
+            if item.data(Qt.UserRole) == added[0].id:
+                self.user_config_list.setCurrentItem(item)
+                break
+        self.show_toast(self.tr(
+            f"{len(added)} کانفیگ سالم به User Config افزوده شد",
+            f"{len(added)} healthy configs added to User Config",
+        ), "success")
+        self._set_activity(
+            f"{len(added)} کانفیگ سازنده SNI در User Config ذخیره شد.",
+            f"{len(added)} SNI Maker configs saved in User Config.",
+            "success", False,
+        )
+
+    def _maker_copy_marked(self):
+        results = [
+            result for result in self.maker_model.checked_results()
+            if result.status == "healthy"
+        ]
+        if not results:
+            self.show_toast(self.tr("کانفیگی علامت نخورده است", "No healthy configs are marked"), "warning")
+            return
+        QApplication.clipboard().setText("\n".join(result.uri for result in results))
+        self.show_toast(self.tr("کانفیگ‌ها کپی شدند", "Configurations copied"), "success")
+
+    def _maker_export_healthy(self):
+        results = self.maker_model.healthy_results()
+        if not results:
+            self.show_toast(self.tr("هنوز کانفیگ سالمی وجود ندارد", "No healthy configs yet"), "warning")
+            return
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            self.tr("ذخیره کانفیگ‌های سالم", "Export healthy configurations"),
+            str(DATA_DIR / "sni-maker-healthy.txt"),
+            "Text files (*.txt)",
+        )
+        if not path:
+            return
+        __import__("pathlib").Path(path).write_text(
+            "\n".join(result.uri for result in results) + "\n",
+            encoding="utf-8",
+        )
+        self.show_toast(self.tr("فایل خروجی ذخیره شد", "Export file saved"), "success")
+
+    def selected_profile_items(self):
+        widget = self.profile_tabs.currentWidget()
+        if (
+                widget is not self.user_config_list
+                and widget is not self.manual_list
+                and widget is not self.suggested_list):
+            return []
+        return [
+            item for item in widget.selectedItems()
+            if item.data(Qt.UserRole)
+        ]
+
     def selected_profile_item(self):
-        widget = self.manual_list if self.profile_tabs.currentIndex() == 0 else self.suggested_list
-        return widget.currentItem()
+        items = self.selected_profile_items()
+        if not items:
+            return None
+        widget = self.profile_tabs.currentWidget()
+        current = widget.currentItem()
+        return current if current in items else items[0]
 
     def select_profile_from_list(self):
         item = self.selected_profile_item()
-        if item: self.storage.selected_id = item.data(Qt.UserRole); self.refresh_profiles()
+        if item:
+            self._profile_clicked(item)
+            self.refresh_profiles()
 
     def _profile_clicked(self, item):
-        self.storage.selected_id = item.data(Qt.UserRole)
+        profile_id = item.data(Qt.UserRole)
+        if not profile_id:
+            return
+        self.storage.selected_id = profile_id
         selected = self.storage.selected()
         if selected:
-            self.active_profile.setText(selected.name); self.route_card.set_secondary(selected.target_label)
-            self.ping_label.setText(f"{selected.last_ping_ms:.0f} ms" if selected.last_ping_ok else "—")
-            if selected.last_ping_ok: self.latency_card.sparkline.add_value(selected.last_ping_ms)
+            MainWindow._remember_direct_profile(self, selected)
+            if selected.origin in DIRECT_PROFILE_ORIGINS:
+                self._forced_profile_id = selected.id
+            route_tabs = getattr(self, "route_source_tabs", None)
+            if selected.origin == USER_CONFIG_ORIGIN:
+                self.storage.settings["route_source"] = "user-config"
+                if route_tabs is not None:
+                    route_tabs.setCurrentIndex(1)
+            elif selected.origin not in DIRECT_PROFILE_ORIGINS:
+                self.storage.settings["route_source"] = "suggested"
+                if route_tabs is not None:
+                    route_tabs.setCurrentIndex(0)
+            save_settings = getattr(self.storage, "save_settings", None)
+            if callable(save_settings):
+                save_settings()
+            self.active_profile.setText(selected.name); self.route_card.set_secondary(self._profile_route_label(selected))
         self._update_config_actions()
+        if selected and (self.connecting or self.engine.running or self._profile_switch_waiting):
+            self._queue_profile_switch(profile_id)
 
     def add_profile(self):
-        dialog = ProfileDialog(self, language=self.language)
+        dialog = ProfileDialog(self, language=self.language,
+                               fake_sni=self.storage.tuning.pattern_fake_sni)
         if dialog.exec():
             profile = dialog.result_profile()
             if not profile: self.show_toast(self.tr("لینک VLESS یا Trojan معتبر نیست", "The VLESS or Trojan link is invalid"), "danger"); return
-            self.storage.profiles.append(profile); self.storage.selected_id = profile.id; self.storage.save_profiles(); self.refresh_profiles(); self._set_activity("کانفیگ ذخیره شد.", "Config saved.", "success", False)
+            self.storage.profiles.append(profile); self.storage.selected_id = profile.id; self._remember_direct_profile(profile); self.storage.save_profiles(); self.refresh_profiles(); self._set_activity("کانفیگ ذخیره شد.", "Config saved.", "success", False)
 
-    def edit_profile(self):
+    def edit_profile(self, profile_id=None):
         item = self.selected_profile_item()
-        if not item: return
-        profile = next((x for x in self.storage.profiles if x.id == item.data(Qt.UserRole)), None)
+        if profile_id is None and not item:
+            return
+        wanted_id = str(profile_id) if profile_id is not None else item.data(Qt.UserRole)
+        profile = next((x for x in self.storage.profiles if x.id == wanted_id), None)
         if not profile: return
-        dialog = ProfileDialog(self, profile, self.language)
+        dialog = ProfileDialog(self, profile, self.language,
+                               self._effective_profile_fake_sni(profile))
         if dialog.exec() and dialog.result_profile(): self.storage.selected_id = profile.id; self.storage.save_profiles(); self.refresh_profiles(); self._set_activity("تغییرات کانفیگ ذخیره شد.", "Config changes saved.", "success", False)
 
-    def delete_profile(self):
-        item = self.selected_profile_item()
-        if not item or QMessageBox.question(self, self.tr("حذف کانفیگ", "Delete Config"), self.tr("این کانفیگ حذف شود؟ این عمل قابل بازگشت نیست.", "Delete this config? This action cannot be undone."), QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
-        self.storage.profiles = [x for x in self.storage.profiles if x.id != item.data(Qt.UserRole)]; self.storage.save_profiles(); self.refresh_profiles(); self._set_activity("کانفیگ حذف شد.", "Config deleted.", "success", False)
+    def delete_profile(self, profile_ids=None):
+        if profile_ids is None or isinstance(profile_ids, bool):
+            profile_ids = {
+                item.data(Qt.UserRole)
+                for item in self.selected_profile_items()
+                if item.data(Qt.UserRole)
+            }
+        else:
+            profile_ids = {str(profile_id) for profile_id in profile_ids}
+        count = len(profile_ids)
+        if not count:
+            return
+        if QMessageBox.question(
+                self,
+                self.tr("حذف کانفیگ‌ها", "Delete Configs"),
+                self.tr(
+                    f"{count} کانفیگ انتخاب‌شده حذف شوند؟",
+                    f"Delete {count} selected configs?",
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+                ) != QMessageBox.Yes:
+            return
+        self.storage.profiles = [
+            profile for profile in self.storage.profiles
+            if profile.id not in profile_ids
+        ]
+        if self.storage.selected_id in profile_ids:
+            self.storage.selected_id = ""
+        self.storage.save_profiles()
+        self.refresh_profiles()
+        self._set_activity(
+            f"{count} کانفیگ حذف شد.",
+            f"{count} configs deleted.",
+            "success", False,
+        )
+
+    def delete_all_user_configs(self):
+        count = sum(
+            profile.origin == USER_CONFIG_ORIGIN
+            for profile in self.storage.profiles
+        )
+        if not count:
+            return
+        if QMessageBox.question(
+                self,
+                self.tr("حذف User Config", "Delete User Configs"),
+                self.tr(
+                    f"هر {count} کانفیگ User Config حذف شوند؟",
+                    f"Delete all {count} User Config entries?",
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+                ) != QMessageBox.Yes:
+            return
+        removed_ids = {
+            profile.id for profile in self.storage.profiles
+            if profile.origin == USER_CONFIG_ORIGIN
+        }
+        self.storage.profiles = [
+            profile for profile in self.storage.profiles
+            if profile.origin != USER_CONFIG_ORIGIN
+        ]
+        if self.storage.selected_id in removed_ids:
+            selected = next((
+                profile for profile in self.storage.profiles
+                if profile.origin in DIRECT_PROFILE_ORIGINS
+            ), None)
+            self.storage.selected_id = selected.id if selected else ""
+        self.storage.settings.pop("last_user_config_profile_id", None)
+        self.storage.save_profiles()
+        self.storage.save_settings()
+        self.refresh_profiles()
+        self._set_activity(
+            f"{count} کانفیگ User Config حذف شد.",
+            f"{count} User Config entries deleted.",
+            "success", False,
+        )
 
     def import_clipboard(self):
         self._set_activity("در حال وارد کردن کانفیگ…", "Importing config…")
@@ -2664,6 +4983,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _begin_connect_attempt(self):
+        self._cancel_mode_apply()
         self._connect_cancel.set()
         self._connect_generation += 1
         self._connect_cancel = threading.Event()
@@ -2673,12 +4993,53 @@ class MainWindow(QMainWindow):
         return self._closing or cancel.is_set() or generation != self._connect_generation
 
     def _cancel_connect_attempt(self, wait=False, notify=False):
+        self._cancel_mode_apply()
         self._connect_generation += 1
         self._connect_cancel.set()
         self.engine.stop(notify=notify)
         worker = self._connect_thread
         if wait and worker and worker is not threading.current_thread():
             worker.join(timeout=3)
+
+    def _queue_profile_switch(self, profile_id):
+        self._pending_profile_switch_id = profile_id
+        if self._profile_switch_waiting:
+            return
+        self._profile_switch_waiting = True
+        selected = next((profile for profile in self.storage.profiles
+                         if profile.id == profile_id), None)
+        self.connecting = False
+        self.connection_error = ""
+        self._cancel_connect_attempt(notify=False)
+        self._set_state(False)
+        self._set_connection_visual("disconnecting")
+        if selected:
+            self._set_activity(
+                f"در حال فعال‌سازی کانفیگ {ltr_isolate(selected.name)}…",
+                f"Switching to config: {selected.name}…",
+            )
+        QTimer.singleShot(50, self._resume_profile_switch)
+
+    def _resume_profile_switch(self):
+        if self._closing:
+            self._pending_profile_switch_id = ""
+            self._profile_switch_waiting = False
+            return
+        worker = self._connect_thread
+        if worker and worker.is_alive():
+            QTimer.singleShot(75, self._resume_profile_switch)
+            return
+        profile_id = self._pending_profile_switch_id
+        self._pending_profile_switch_id = ""
+        self._profile_switch_waiting = False
+        profile = next((candidate for candidate in self.storage.profiles
+                        if candidate.id == profile_id), None)
+        if profile is None:
+            self._set_state(False)
+            return
+        self.storage.selected_id = profile.id
+        self._forced_profile_id = profile.id
+        self.toggle_connection()
 
     @staticmethod
     def _attempt_tuning_for_profile(profile, base_tuning, fake_sni, mux_enabled):
@@ -2792,8 +5153,9 @@ class MainWindow(QMainWindow):
         global_pin = scoped_globals.get(carrier) if isinstance(scoped_globals, dict) else None
         if not global_pin and carrier == legacy_active:
             global_pin = self.storage.settings.get("pattern_global_sni_pin")
-        if profile is not None:
-            add(pins.get(profile.id))
+        profile_pin = pins.get(profile.id) if profile is not None else None
+        if profile_pin:
+            add(profile_pin)
         else:
             add(global_pin)
         remembered = self.storage.settings.get(f"working_pattern_sni_{carrier}", "")
@@ -2817,6 +5179,14 @@ class MainWindow(QMainWindow):
                 candidates.append(configured)
         return candidates[:max(1, limit)]
 
+    def _profile_sni_candidates(self, profile, carrier=None, limit=3):
+        carrier = carrier or self.storage.tuning.carrier_mode
+        candidates = self._sni_candidates(profile, carrier, limit)
+        fallback = str(getattr(profile, "spoof_fake_sni", "") or "").strip().lower()
+        if fallback and fallback not in candidates:
+            candidates.append(fallback)
+        return candidates
+
     def _verified_route_result(self, domain, carrier):
         candidates = []
         for raw in [*self.storage.scan_results, *self.storage.bookmarks]:
@@ -2832,20 +5202,33 @@ class MainWindow(QMainWindow):
                 continue
         return max(candidates, key=lambda result: (result.score, result.stability, -result.first_byte_ms), default=None)
 
-    def _ordered_profiles(self, fake_sni, cancel_event, auto_enabled=True, manual_only=False):
-        country_code = MainWindow._selected_country_code(self) if auto_enabled else ""
-        if not auto_enabled:
-            selected = self.storage.selected()
-            candidates = ([selected] if selected is not None
-                          and selected.origin == "user" else [])
+    def _ordered_profiles(self, fake_sni, cancel_event, auto_enabled=True, manual_only=False,
+                          forced_profile=None):
+        country_code = (MainWindow._selected_country_code(self)
+                        if auto_enabled and forced_profile is None else "")
+        if forced_profile is not None:
+            candidates = [forced_profile]
+        elif not auto_enabled:
+            if manual_only:
+                origin = MainWindow._direct_source_origin(self)
+                candidates = [
+                    profile for profile in self.storage.profiles
+                    if profile.origin == origin
+                ]
+            else:
+                selected = self.storage.selected()
+                candidates = ([selected] if selected is not None
+                              and selected.origin in DIRECT_PROFILE_ORIGINS else [])
         elif country_code:
             candidates = MainWindow._country_profiles(self, country_code)
         else:
-            verified = [profile for profile in self.storage.profiles
-                        if profile.origin != "user" and profile.verified_spoof]
-            suggested = [profile for profile in self.storage.profiles
-                         if profile.origin != "user"]
-            candidates = verified or suggested or list(self.storage.profiles)
+            source_profiles = self._route_source_profiles()
+            verified = [profile for profile in source_profiles if profile.verified_spoof]
+            candidates = (
+                verified
+                if self._selected_route_source() == "user-config"
+                else verified or source_profiles
+            )
         if cancel_event.is_set():
             raise EngineCancelled("Connection attempt cancelled")
         tuning = self.storage.tuning
@@ -2860,8 +5243,11 @@ class MainWindow(QMainWindow):
             if latency_signal is not None:
                 latency_signal.emit(latency, "edge")
         for profile in candidates:
-            profile.last_ping_ok = ok
-            profile.last_ping_ms = latency
+            if not (
+                    profile.origin == USER_CONFIG_ORIGIN
+                    and profile.verified_spoof and profile.last_ping_ok):
+                profile.last_ping_ok = ok
+                profile.last_ping_ms = latency
         self.storage.save_profiles()
         if cancel_event.is_set():
             raise EngineCancelled("Connection attempt cancelled")
@@ -3166,6 +5552,12 @@ class MainWindow(QMainWindow):
         return True
 
     def toggle_connection(self):
+        if getattr(self, "_maker_running", False) and not self.engine.running and not self.connecting:
+            self.show_toast(self.tr(
+                "ابتدا تست زنده سازنده SNI را متوقف کنید",
+                "Stop the SNI Maker live test before connecting",
+            ), "warning")
+            return
         if self.connecting:
             self.connecting = False
             self.connection_error = ""
@@ -3179,29 +5571,46 @@ class MainWindow(QMainWindow):
         if self.engine.running:
             self.connecting = False; self.connection_error = ""; self._set_connection_visual("disconnecting")
             self._set_activity(
-                "در حال توقف تونل و بازگردانی پروکسی سیستم…" if self._proxy_mode_enabled()
+                "در حال توقف رابط TUN و هسته اسپوف…" if self._tun_mode_enabled()
+                else "در حال توقف تونل و بازگردانی پروکسی سیستم…" if self._proxy_mode_enabled()
                 else "در حال توقف هسته اسپوف…",
-                "Stopping the tunnel and restoring the system proxy…" if self._proxy_mode_enabled()
+                "Stopping the TUN interface and spoof core…" if self._tun_mode_enabled()
+                else "Stopping the tunnel and restoring the system proxy…" if self._proxy_mode_enabled()
                 else "Stopping the spoof core…",
             )
             self._cancel_connect_attempt(notify=True)
             self._set_state(False)
             return
+        if self._tun_mode_enabled():
+            try:
+                self.engine.ensure_tun_available()
+            except Exception as exc:
+                message = str(exc)
+                self.connection_error = message
+                self._set_connection_visual("error")
+                self._handle_error(message)
+                return
         generation, cancel = self._begin_connect_attempt()
         base_tuning = self.storage.tuning
         carrier = base_tuning.carrier_mode
         bypass = self.selected_processes()
         auto_enabled = self.auto_mode.isChecked()
         manual_only = self.pick_best.isChecked()
-        country_code = self._selected_country_code() if auto_enabled else ""
+        forced_profile_id = self._forced_profile_id
+        self._forced_profile_id = ""
+        forced_profile = next((profile for profile in self.storage.profiles
+                               if profile.id == forced_profile_id), None)
+        country_code = self._selected_country_code() if auto_enabled and forced_profile is None else ""
         country_profiles = self._country_profiles(country_code) if country_code else []
-        manual_profile = self.storage.selected() if not auto_enabled else None
-        if not auto_enabled and (manual_profile is None or manual_profile.origin != "user"):
+        manual_profile = forced_profile or (self.storage.selected() if not auto_enabled else None)
+        if not auto_enabled and forced_profile is None and (
+                manual_profile is None
+                or manual_profile.origin not in DIRECT_PROFILE_ORIGINS):
             manual_profile = self._select_manual_profile()
-        if not auto_enabled and manual_profile is None:
+        if not auto_enabled and forced_profile is None and manual_profile is None:
             message = self.tr(
-                "در حالت دستی ابتدا یک کانفیگ از فهرست Manual انتخاب کنید",
-                "Select a config from the Manual list before connecting in Manual mode",
+                "در حالت دستی ابتدا یک کانفیگ از Manual یا User Config انتخاب کنید",
+                "Select a Manual or User Config entry before connecting",
             )
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
             return
@@ -3209,26 +5618,42 @@ class MainWindow(QMainWindow):
             message = self.tr("برای کشور انتخاب‌شده کانفیگ سالمی وجود ندارد", "No verified config is available for the selected country")
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
             return
-        seed_snis = ([next((profile.spoof_fake_sni for profile in country_profiles
-                            if profile.spoof_fake_sni), VERIFIED_SPOOF_FAKE_SNI)]
-                     if country_code else self._sni_candidates(
-                         manual_profile if not auto_enabled else None, carrier=carrier
-                     ))
+        if (auto_enabled and forced_profile is None and not country_code
+                and self._selected_route_source() == "user-config"
+                and not self._route_source_profiles(verified_only=True)):
+            message = self.tr(
+                "در User Config هنوز کانفیگ سالمی برای اتصال خودکار وجود ندارد",
+                "User Config has no verified route for Auto Mode yet",
+            )
+            self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
+            return
+        seed_profile = forced_profile or (manual_profile if not auto_enabled else None)
+        seed_snis = (self._profile_sni_candidates(seed_profile, carrier)
+                     if seed_profile is not None else
+                     self._sni_candidates(None, carrier=carrier))
+        if not seed_snis and country_profiles:
+            seed_snis = [next((profile.spoof_fake_sni for profile in country_profiles
+                               if profile.spoof_fake_sni), VERIFIED_SPOOF_FAKE_SNI)]
         if not seed_snis:
             message = self.tr("هیچ SNI معتبر در مخزن اسکن پیدا نشد", "No valid SNI was found in the scan repository")
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
             return
         self.connecting = True; self.connection_error = ""; self._set_connection_visual("connecting"); self._set_latency(0.0, "testing")
-        if country_code:
-            _flag, english, persian = COUNTRIES[country_code]
+        if forced_profile is not None:
+            self._set_activity(
+                f"در حال فعال‌سازی کانفیگ {ltr_isolate(forced_profile.name)}…",
+                f"Activating selected config: {forced_profile.name}…",
+            )
+        elif country_code:
+            _flag, english, persian = self._country_metadata(country_code)
             self._set_activity(
                 f"در حال تست {len(country_profiles)} کانفیگ {persian}…",
                 f"Testing {len(country_profiles)} {english} configs…",
             )
         elif not auto_enabled:
             self._set_activity(
-                f"در حال اتصال کانفیگ دستی {ltr_isolate(manual_profile.name)}…",
-                f"Connecting selected Manual config: {manual_profile.name}…",
+                f"در حال اتصال کانفیگ انتخاب‌شده {ltr_isolate(manual_profile.name)}…",
+                f"Connecting selected config: {manual_profile.name}…",
             )
         else:
             self._set_activity("در حال آماده‌سازی مسیر امن…", "Preparing secure route…")
@@ -3239,18 +5664,20 @@ class MainWindow(QMainWindow):
             last_error = ""
 
 
-            strategy = "wrong_seq" if country_code else ("tls_sni_records" if carrier == "mci" else "wrong_seq")
+            strategy = ("wrong_seq" if country_code or (
+                forced_profile is not None and forced_profile.verified_spoof
+            ) else ("tls_sni_records" if carrier == "mci" else "wrong_seq"))
             try:
                 self.bridge.activity.emit(self.tr(f"در حال آزمایش دسترسی {ltr_isolate('SNI')}…", "Testing SNI reachability…"), "running", True)
-                profiles = self._ordered_profiles(seed_snis[0], cancel, auto_enabled, manual_only)
+                profiles = self._ordered_profiles(
+                    seed_snis[0], cancel, auto_enabled, manual_only, forced_profile
+                )
                 if self._attempt_cancelled(generation, cancel):
                     raise EngineCancelled("Connection attempt cancelled")
                 if not profiles:
                     raise ValueError(self.tr("کانفیگی موجود نیست", "No config available"))
                 for index, profile in enumerate(profiles, 1):
-                    profile_snis = ([profile.spoof_fake_sni or VERIFIED_SPOOF_FAKE_SNI]
-                                    if profile.verified_spoof
-                                    else self._sni_candidates(profile, carrier, limit=3))
+                    profile_snis = self._profile_sni_candidates(profile, carrier, limit=3)
                     profile_passed = False
                     profile_mux_enabled = self._profile_mux_enabled(profile, base_tuning, carrier)
                     for sni_index, fake_sni in enumerate(profile_snis, 1):
@@ -3357,7 +5784,8 @@ class MainWindow(QMainWindow):
                                     self._remember_profile_mux(profile, True, attempt_tuning, carrier)
                                 download_state = "not_tested"
                                 download_detail = ""
-                                proxy_active = self._apply_proxy_mode_after_probe(cancel)
+                                with self._proxy_mode_apply_lock:
+                                    connection_mode = self._apply_connection_mode_after_probe(cancel)
                                 if self._attempt_cancelled(generation, cancel):
                                     raise EngineCancelled("Connection attempt cancelled")
                                 self.storage.settings[f"working_strategy_{carrier}"] = attempt_strategy
@@ -3401,6 +5829,12 @@ class MainWindow(QMainWindow):
                                 )
                                 if self._attempt_cancelled(generation, cancel):
                                     raise EngineCancelled("Connection attempt cancelled")
+                                if (not self.engine.running
+                                        or (connection_mode == "tun"
+                                            and not self.engine.tun_running)):
+                                    raise RuntimeError(
+                                        "Connection engine stopped before activation completed"
+                                    )
                                 connected = profile_passed = True
                                 self.bridge.profiles_changed.emit()
                                 quality = (f"; download={download_detail}"
@@ -3409,11 +5843,15 @@ class MainWindow(QMainWindow):
                                 self.bridge.state.emit(True)
                                 self.bridge.hint.emit(self.tr(f"متصل با بهترین {ltr_isolate('SNI')}: {ltr_isolate(fake_sni)}", f"Connected with best SNI: {fake_sni}"))
                                 self.bridge.activity.emit(self.tr(
+                                    "حالت TUN فعال است؛ وب و یوتیوب از تونل عبور می‌کنند."
+                                    if connection_mode == "tun" else
                                     "اتصال برقرار شد و پروکسی ویندوز فعال است."
-                                    if proxy_active else
+                                    if connection_mode == "proxy" else
                                     "هسته اسپوف فعال است؛ پروکسی ویندوز خاموش است.",
+                                    "TUN Mode is active; web and YouTube use the tunnel."
+                                    if connection_mode == "tun" else
                                     "Connected with Windows Proxy enabled."
-                                    if proxy_active else
+                                    if connection_mode == "proxy" else
                                     "Spoof core is active; Windows Proxy is off.",
                                 ), "success", False)
                                 self._schedule_mci_warmup(carrier, cancel)
@@ -3468,40 +5906,81 @@ class MainWindow(QMainWindow):
         _restyle(self.status)
 
     def _set_state(self, running):
+        if running and not self.engine.running:
+            running = False
+        if (running and self._tun_mode_enabled()
+                and not bool(getattr(self.engine, "tun_running", False))):
+            running = False
         was_running = getattr(self, "_ui_running", False)
         self._ui_running = bool(running)
         self.connecting = False
         self.proxy_mode.setEnabled(True)
-        self.proxy_option.setEnabled(True)
+        self.tun_mode.setEnabled(True)
+        self.tun_option.setEnabled(True)
+        self.proxy_option.setEnabled(not self._tun_mode_enabled())
         if running:
             self.connection_error = ""; self._set_connection_visual("connected")
             self._set_activity("اتصال امن برقرار شد.", "Connection established.", "success", False)
-            QTimer.singleShot(0, self._queue_proxy_mode_apply)
+            if self._tun_mode_enabled() and not self.engine.tun_running:
+                QTimer.singleShot(0, self._queue_tun_mode_apply)
+            elif not self._tun_mode_enabled():
+                QTimer.singleShot(0, self._queue_proxy_mode_apply)
         elif self.connection_error:
             self._set_connection_visual("error")
         else:
             self._set_connection_visual("disconnected")
             if was_running: self._set_activity("تونل متوقف و پروکسی سیستم بازگردانی شد.", "Tunnel stopped and system proxy restored.", "success", False)
+        QTimer.singleShot(0, self._queue_target_latency_probe)
 
     def _set_traffic(self, up, down): self.up_label.setText(format_bytes(up)); self.down_label.setText(format_bytes(down))
 
     def _set_latency(self, milliseconds, source="tunnel"):
         if source == "testing":
             self.ping_label.setText("…")
-            self.latency_card.set_secondary(self.tr("در حال تست مسیر…", "Testing route…"))
+            self.latency_card.set_secondary("8.8.8.8 • Checking…")
             return
-        try:
-            value = float(milliseconds)
-        except (TypeError, ValueError):
+
+    def _queue_target_latency_probe(self):
+        if self._closing:
             return
-        if value <= 0:
+        if self._target_latency_busy:
+            self._target_latency_pending = True
             return
-        self.ping_label.setText(f"{value:.0f} ms")
-        self.latency_card.set_secondary(self.tr(
-            "تست مسیر واقعی تونل" if source == "tunnel" else "تست سریع لبه",
-            "Live tunnel test" if source == "tunnel" else "Quick edge test",
-        ))
-        self.latency_card.sparkline.add_value(value)
+        self._target_latency_busy = True
+        self._target_latency_pending = False
+        self._target_latency_generation += 1
+        generation = self._target_latency_generation
+        use_tun = bool(getattr(self.engine, "tun_running", False))
+
+        def work():
+            mode = "tun" if use_tun else "direct"
+            value = _tun_tls_latency_8888() if use_tun else _direct_ping_8888()
+            if value is None and use_tun:
+                value = _direct_ping_8888()
+                mode = "direct-fallback"
+            self.bridge.target_latency.emit(float(value or 0.0), mode, generation)
+
+        threading.Thread(target=work, name="latency-8.8.8.8", daemon=True).start()
+
+    def _target_latency_finished(self, milliseconds, mode, generation):
+        if generation != self._target_latency_generation:
+            return
+        self._target_latency_busy = False
+        current_tun = bool(getattr(self.engine, "tun_running", False))
+        stale_mode = (mode == "tun" and not current_tun) or (mode == "direct" and current_tun)
+        if not stale_mode:
+            value = max(0.0, float(milliseconds))
+            self.ping_label.setText(f"{value:.0f} ms" if value > 0 else "Timeout")
+            secondary = {
+                "tun": "8.8.8.8 • TUN TLS",
+                "direct": "8.8.8.8 • Direct ICMP",
+                "direct-fallback": "8.8.8.8 • Direct fallback",
+            }.get(mode, "8.8.8.8")
+            self.latency_card.set_secondary(secondary)
+            if value > 0:
+                self.latency_card.sparkline.add_value(value)
+        if stale_mode or self._target_latency_pending:
+            QTimer.singleShot(0, self._queue_target_latency_probe)
 
     def _append_log(self, message):
         stamp = __import__('datetime').datetime.now().strftime("%H:%M:%S"); line = f"[{stamp}] {message}"; self._all_log_lines.append(line); self._all_log_lines = self._all_log_lines[-5000:]
@@ -4061,7 +6540,10 @@ class MainWindow(QMainWindow):
         confirmation.exec()
         if confirmation.clickedButton() is not apply_button: return
 
-        suggested = [profile for profile in self.storage.profiles if profile.origin != "user"]
+        suggested = [
+            profile for profile in self.storage.profiles
+            if profile.origin not in DIRECT_PROFILE_ORIGINS
+        ]
         if not suggested:
             self.show_toast(self.tr("کانفیگ پیشنهادی پیدا نشد", "No suggested configs were found"), "warning")
             return
@@ -4131,9 +6613,19 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         compact = self.width() < 1240
+        dense_sidebar = self.height() < 790
         self.sidebar.setFixedWidth(238 if compact else 286)
-        self.rating_card.setVisible(self.height() >= 810 and not compact)
+        self.rating_card.setVisible(self.height() >= 890 and not compact)
+        self.sidebar_layout.setContentsMargins(
+            *(14, 10, 14, 10) if dense_sidebar else (18, 20, 18, 18)
+        )
+        self.logo_card.setFixedHeight(76 if dense_sidebar else 88)
+        nav_height = 44 if dense_sidebar else 54 if self.height() < 930 else 56
+        for button in self.nav:
+            button.setFixedHeight(nav_height)
         self._layout_home_dashboard()
+        self._layout_sni_maker()
+        self._position_profile_select_all()
         self._layout_tool_cards(self.width() < 1180)
         self._position_toast()
         self._position_update_notification()
@@ -4141,7 +6633,9 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._layout_home_dashboard()
+        self._layout_sni_maker()
         QTimer.singleShot(0, self._layout_home_dashboard)
+        QTimer.singleShot(0, self._layout_sni_maker)
         if self._pending_update_notification is not None:
             info = self._pending_update_notification; self._pending_update_notification = None
             QTimer.singleShot(0, lambda value=info: self._show_update_notification(value))
@@ -4163,6 +6657,12 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, name="process-list", daemon=True).start()
 
     def _populate_processes(self, names):
+        protected = {
+            os.path.basename(sys.executable).lower(),
+            "xray.exe",
+            "sing-box.exe",
+        }
+        names = [name for name in names if str(name).lower() not in protected]
         selected = set(self.storage.settings.get("bypass_processes", [])); self.process_table.setRowCount(len(names))
         for row, name in enumerate(names):
             toggle = ToggleSwitch(); toggle.setAccessibleName(f"Bypass VPN for {name}"); toggle.setChecked(name in selected); toggle.stateChanged.connect(self._save_process_selection); self.process_table.setCellWidget(row, 0, toggle); item = QTableWidgetItem(name); item.setIcon(cyber_icon("network", "#6689ad", 17)); item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter); self.process_table.setItem(row, 1, item)
@@ -4237,8 +6737,19 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self._tray is not None:
             self._tray.hide()
+        self._target_latency_generation += 1
+        self._target_latency_timer.stop()
         self._bypass_apply_timer.stop()
         self.scan_cancelled = True; self._scan_cancel_event.set(); self._scan_generation += 1; self._update_generation += 1
+        self._maker_cancel_event.set()
+        self._maker_generation += 1
+        self._maker_import_generation += 1
+        maker_tester, self._maker_tester = self._maker_tester, None
+        if maker_tester is not None:
+            try:
+                maker_tester.stop()
+            except Exception as exc:
+                self._pending_file_log_lines.append(f"SNI Maker cleanup pending: {exc}")
         try:
             self._cancel_connect_attempt(wait=True, notify=False)
         except Exception as exc:
@@ -4302,6 +6813,8 @@ QPushButton#navButton:checked { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
 QPushButton#navButton[rtl="true"]:checked { border-left: 1px solid rgba(35,245,224,0.45); border-right: 3px solid $accent; }
 QFrame#sidebarFooter { background: rgba(7,24,45,0.82); border: 1px solid rgba(54,211,255,0.18); border-radius: 15px; }
 QPushButton#footerAction { background: transparent; border: 1px solid transparent; border-radius: 10px; padding: 9px 11px; color: #b3c7dc; text-align: left; font-weight: 600; }
+QPushButton#footerAction[rtl="true"] { text-align: right; }
+QPushButton#footerAction[rtl="false"] { text-align: left; }
 QPushButton#footerAction:hover { background: rgba(19,53,79,0.8); border-color: rgba(54,211,255,0.18); color: #78f4eb; }
 QFrame#ratingCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(17,26,71,0.9),stop:1 rgba(43,17,91,0.74)); border: 1px solid rgba(124,60,255,0.48); border-radius: 17px; }
 QLabel#ratingTitle { font-size: 14px; font-weight: 850; color: #f7f4ff; }
@@ -4353,10 +6866,12 @@ QLabel#metricLabel, QLabel#fieldLabel { color: #a9bdd7; font-size: 11px; font-we
 QLabel#metricValue { color: #f7fbff; font-size: 22px; font-weight: 850; }
 QLabel#metricSecondary { color: #55e7df; font-family: "Cascadia Mono", "Segoe UI", "Consolas"; font-size: 11px; font-weight: 650; }
 QFrame#quickControls, QFrame#sniActionBar { background: rgba(9,25,54,0.86); border: 1px solid rgba(54,211,255,0.24); border-radius: 18px; }
-QFrame#toggleOption, QFrame#proxyModeOption, QFrame#carrierControl { background: rgba(8,24,47,0.74); border: 1px solid rgba(54,211,255,0.13); border-radius: 12px; }
-QFrame#toggleOption:hover, QFrame#proxyModeOption:hover, QFrame#carrierControl:hover { border-color: rgba(54,211,255,0.35); background: rgba(12,36,61,0.82); }
+QFrame#toggleOption, QFrame#proxyModeOption, QFrame#tunModeOption, QFrame#carrierControl { background: rgba(8,24,47,0.74); border: 1px solid rgba(54,211,255,0.13); border-radius: 12px; }
+QFrame#toggleOption:hover, QFrame#proxyModeOption:hover, QFrame#tunModeOption:hover, QFrame#carrierControl:hover { border-color: rgba(54,211,255,0.35); background: rgba(12,36,61,0.82); }
 QFrame#proxyModeOption[active="true"] { border-color: rgba(35,245,224,0.38); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,55,64,0.84),stop:1 rgba(10,35,63,0.82)); }
 QFrame#proxyModeOption[active="false"] { border-color: rgba(111,145,181,0.24); background: rgba(8,21,40,0.72); }
+QFrame#tunModeOption[active="true"] { border-color: rgba(97,220,255,0.62); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,60,78,0.92),stop:1 rgba(28,39,91,0.88)); }
+QFrame#tunModeOption[active="false"] { border-color: rgba(111,145,181,0.24); background: rgba(8,21,40,0.72); }
 QLabel#controlLabel { color: #d3e0ee; font-size: 12px; font-weight: 650; }
 QCheckBox#toggleSwitch { background: transparent; border: 0; padding: 0; }
 
@@ -4388,9 +6903,9 @@ QPushButton#quietButton:hover, QPushButton#metricAction:hover, QPushButton#toolA
 QPushButton#dangerButton { background: rgba(78,20,43,0.56); border-color: rgba(255,92,124,0.42); color: #ffb7c5; }
 QPushButton#dangerButton:hover { background: rgba(116,29,56,0.76); border-color: #ff718c; color: #fff1f4; }
 
-QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QListWidget, QTableWidget { background: rgba(4,15,31,0.92); border: 1px solid rgba(66,118,161,0.55); border-radius: 11px; padding: 8px 10px; selection-background-color: #0b7c82; selection-color: #ffffff; }
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QListWidget, QTableWidget, QTableView { background: rgba(4,15,31,0.92); border: 1px solid rgba(66,118,161,0.55); border-radius: 11px; padding: 8px 10px; selection-background-color: #0b7c82; selection-color: #ffffff; }
 QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QComboBox:hover { border-color: rgba(80,164,201,0.72); }
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus { border: 1px solid $accent; background: rgba(6,22,42,0.98); }
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTableView:focus { border: 1px solid $accent; background: rgba(6,22,42,0.98); }
 QLineEdit[invalid="true"], QTextEdit[invalid="true"] { border: 1px solid $danger; background: rgba(65,15,35,0.55); }
 QComboBox { min-height: 28px; padding-left: 11px; padding-right: 34px; }
 QComboBox#countryCombo { min-height: 20px; }
@@ -4412,18 +6927,50 @@ QPushButton#numericStep { min-height: 30px; background: rgba(17,54,82,0.9); bord
 QPushButton#numericStep:hover { background: #176079; color: white; }
 QLabel#numericSuffix { color: #7f98b4; font-size: 10px; }
 
-QFrame#pageToolbar { background: rgba(9,25,51,0.88); border: 1px solid rgba(54,211,255,0.2); border-radius: 15px; }
+QFrame#pageToolbar, QFrame#makerTestBar { background: rgba(9,25,51,0.88); border: 1px solid rgba(54,211,255,0.2); border-radius: 15px; }
 QFrame#configPanel, QFrame#tableFrame { background: rgba(7,21,43,0.86); border: 1px solid rgba(54,211,255,0.21); border-radius: 17px; }
+QFrame#makerSourceCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(8,32,57,0.96),stop:1 rgba(8,23,48,0.94)); border: 1px solid rgba(54,211,255,0.27); border-radius: 17px; }
+QFrame#makerResultsPanel { background: rgba(5,18,37,0.94); border: 1px solid rgba(54,211,255,0.24); border-radius: 17px; }
+QFrame#makerResultToolbar { background: rgba(10,29,54,0.96); border: 0; border-bottom: 1px solid rgba(54,211,255,0.19); border-top-left-radius: 16px; border-top-right-radius: 16px; }
+QFrame#makerActionBar { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,38,58,0.93),stop:1 rgba(18,25,65,0.92)); border: 1px solid rgba(54,211,255,0.27); border-radius: 15px; }
+QLabel#makerStepTitle { color: #b9fff8; font-size: 12px; font-weight: 850; }
+QLabel#makerDestination { color: #78f5e8; background: rgba(7,62,67,0.65); border: 1px solid rgba(35,245,224,0.28); border-radius: 9px; padding: 7px 10px; font-size: 11px; font-weight: 800; }
+QTabBar#routeSourceTabs::tab { min-height: 20px; padding: 4px 12px; margin: 0 2px; border-radius: 8px; font-size: 10px; }
+QFrame#makerSourceCard QPushButton, QFrame#makerTestBar QPushButton, QFrame#makerResultToolbar QPushButton, QFrame#makerActionBar QPushButton { min-height: 26px; padding: 4px 9px; border-radius: 9px; }
+QFrame#makerSourceCard QPushButton[guided="true"], QFrame#makerTestBar QPushButton[guided="true"], QFrame#makerActionBar QPushButton[guided="true"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(20,190,181,0.96),stop:0.52 rgba(35,245,224,0.98),stop:1 rgba(44,199,255,0.96)); border: 2px solid #c5fff9; color: #031823; font-weight: 900; }
+QLineEdit#makerRepoUrl { min-height: 22px; padding: 4px 8px; }
+QLineEdit#makerSearch { min-height: 30px; }
+QComboBox#makerStatusFilter { min-width: 132px; }
+QTableView#makerResultsTable { background: rgba(3,14,29,0.9); border: 0; border-radius: 0; padding: 0; alternate-background-color: rgba(8,25,46,0.82); gridline-color: transparent; }
+QTableView#makerResultsTable::item { padding: 9px 10px; border-bottom: 1px solid rgba(54,211,255,0.09); color: #d3e5f2; }
+QTableView#makerResultsTable::item:hover { background: rgba(15,53,76,0.78); }
+QTableView#makerResultsTable::item:selected { background: rgba(9,83,88,0.82); color: #f8ffff; }
 QTabWidget#profileTabs::pane, QTabWidget#scannerTabs::pane { background: rgba(5,17,34,0.84); border: 0; border-top: 1px solid rgba(54,211,255,0.17); border-radius: 12px; top: -1px; }
 QTabBar::tab { background: rgba(9,27,51,0.82); padding: 10px 23px; border: 1px solid transparent; border-radius: 10px; margin: 4px; color: $muted; font-weight: 650; }
 QTabBar::tab:hover { background: rgba(18,53,80,0.82); color: $text; }
 QTabBar::tab:selected { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(9,90,94,0.8),stop:1 rgba(13,52,76,0.82)); border-color: rgba(35,245,224,0.42); color: #bcfff8; font-weight: 850; }
 QTabBar::tab:focus { border-color: $accent; }
 QTabBar::tab:disabled { color: #425a73; background: #081525; }
-QListWidget#configList { background: transparent; border: 0; border-radius: 0; padding: 9px; }
-QListWidget#configList::item { min-height: 62px; background: rgba(9,28,53,0.86); border: 1px solid rgba(62,113,154,0.34); border-radius: 13px; padding: 13px 15px; margin: 3px 5px; color: #d8e6f3; }
-QListWidget#configList::item:hover { background: rgba(13,45,70,0.92); border-color: rgba(54,211,255,0.38); }
-QListWidget#configList::item:selected { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,81,89,0.88),stop:1 rgba(12,47,75,0.9)); border: 1px solid rgba(35,245,224,0.7); color: #ffffff; }
+QListWidget#manualConfigList, QListWidget#userConfigList, QListWidget#suggestedConfigList { background: transparent; border: 0; border-radius: 0; padding: 4px; }
+QListWidget#manualConfigList::item { min-height: 54px; background: rgba(9,28,53,0.86); border: 1px solid rgba(62,113,154,0.34); border-radius: 11px; padding: 9px 12px; margin: 2px 4px; color: #d8e6f3; }
+QListWidget#userConfigList::item, QListWidget#suggestedConfigList::item { min-height: 44px; background: rgba(9,28,53,0.86); border: 1px solid rgba(62,113,154,0.34); border-radius: 9px; padding: 6px 10px; margin: 1px 3px; color: #d8e6f3; }
+QListWidget#manualConfigList::item:hover, QListWidget#userConfigList::item:hover, QListWidget#suggestedConfigList::item:hover { background: rgba(13,45,70,0.92); border-color: rgba(54,211,255,0.38); }
+QListWidget#manualConfigList::item:selected, QListWidget#userConfigList::item:selected, QListWidget#suggestedConfigList::item:selected { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,81,89,0.88),stop:1 rgba(12,47,75,0.9)); border: 1px solid rgba(35,245,224,0.7); color: #ffffff; }
+QListWidget#userConfigList::item:disabled { min-height: 24px; background: rgba(8,47,66,0.88); border: 1px solid rgba(35,245,224,0.24); border-radius: 8px; padding: 4px 10px; margin: 5px 3px 1px 3px; color: #79efe7; }
+QFrame#profileListRow { background: transparent; border: 0; }
+QLabel#profileRowIcon { background: transparent; border: 0; }
+QLabel#profileRowTitle { background: transparent; border: 0; color: #eef8ff; font-size: 12px; font-weight: 750; }
+QLabel#profileRowDetail { background: transparent; border: 0; color: #9fdcf0; font-size: 11px; }
+QLabel#profileRowRecommendation { background: transparent; border: 0; color: #8ff9eb; font-size: 10px; font-weight: 750; }
+QToolButton#profileRowActivate { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #21e5cf,stop:1 #34bdf5); border: 1px solid rgba(168,255,247,0.72); border-radius: 8px; padding: 0 9px; color: #061923; font-size: 11px; font-weight: 850; }
+QToolButton#profileRowActivate:hover { background: #7bfff1; border-color: #ffffff; }
+QToolButton#profileRowActivate[active="true"] { background: rgba(25,111,111,0.72); border-color: rgba(87,235,218,0.5); color: #c8fff9; }
+QToolButton#profileRowEdit, QToolButton#profileRowDelete { background: rgba(9,31,55,0.88); border: 1px solid rgba(74,130,168,0.42); border-radius: 8px; padding: 0; }
+QToolButton#profileRowEdit:hover { background: rgba(21,73,98,0.94); border-color: rgba(98,220,255,0.78); }
+QToolButton#profileRowDelete:hover { background: rgba(91,25,45,0.94); border-color: rgba(255,98,125,0.86); }
+QFrame#profileSelectionBar { background: rgba(7,27,49,0.98); border: 1px solid rgba(54,211,255,0.22); border-radius: 9px; }
+QLabel#profileSelectionLabel { background: transparent; border: 0; color: #a9c7dc; font-size: 11px; font-weight: 700; }
+QCheckBox#profileSelectAll { background: transparent; border: 0; padding: 0; }
 
 QFrame#scanControlCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(10,31,62,0.94),stop:1 rgba(7,22,45,0.92)); border: 1px solid rgba(54,211,255,0.26); border-radius: 19px; }
 QFrame#scanOptions { background: rgba(7,24,48,0.82); border: 1px solid rgba(54,211,255,0.18); border-radius: 14px; }

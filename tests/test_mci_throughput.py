@@ -311,11 +311,11 @@ def test_irancell_keeps_original_score_and_ignores_download_fields():
 
 def test_mci_profile_order_uses_global_fast_unknown_untested_slow_failed_tiers(monkeypatch):
     now = time.time()
-    fast = ProxyProfile(id="fast")
-    unknown = ProxyProfile(id="unknown")
-    untested = ProxyProfile(id="untested")
-    slow = ProxyProfile(id="slow")
-    failed = ProxyProfile(id="failed")
+    fast = ProxyProfile(id="fast", origin="github")
+    unknown = ProxyProfile(id="unknown", origin="github")
+    untested = ProxyProfile(id="untested", origin="github")
+    slow = ProxyProfile(id="slow", origin="github")
+    failed = ProxyProfile(id="failed", origin="github")
     profiles = [slow, failed, untested, unknown, fast]
     base = {"engine": "patterniha-wrong-seq-v1", "tested_at": now,
             "startup_ms": 500.0, "consecutive_failures": 0}
@@ -340,6 +340,11 @@ def test_mci_profile_order_uses_global_fast_unknown_untested_slow_failed_tiers(m
         storage=storage,
         bridge=SimpleNamespace(log=SimpleNamespace(emit=lambda _line: None)),
     )
+    dummy._selected_route_source = lambda: "suggested"
+    dummy._route_source_profiles = lambda verified_only=False: [
+        profile for profile in profiles
+        if not verified_only or profile.verified_spoof
+    ]
     monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 20.0))
 
     ordered = MainWindow._ordered_profiles(

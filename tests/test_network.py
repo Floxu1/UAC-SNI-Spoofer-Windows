@@ -38,8 +38,8 @@ def test_trace_explicit_edge_keeps_candidate_sni_and_records_peer(monkeypatch):
             pass
 
         def getpeername(self):
-            # The actual peer is authoritative, even if it differs from the
-            # requested anycast address.
+
+
             return ("104.18.8.84", 443)
 
         def close(self):
@@ -171,8 +171,8 @@ def test_cancelled_scan_waits_until_running_workers_exit(monkeypatch):
         try:
             all_workers_started.wait(timeout=1)
             if domain != "fast.example":
-                # A cancelled controller must wait for every in-flight probe,
-                # not merely the first worker that happens to finish afterward.
+
+
                 assert cancel.wait(timeout=1)
                 delay = {"one.example": 0.02, "two.example": 0.06, "three.example": 0.10}[domain]
                 time.sleep(delay)

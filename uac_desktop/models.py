@@ -50,6 +50,7 @@ class ProxyProfile:
     rotating_exit: bool = False
     observed_exit_ip: str = ""
     observed_country_code: str = ""
+    observed_country_name: str = ""
     country_verified_at: float = 0.0
     country_source: str = ""
 
@@ -279,7 +280,7 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
         raw = uri.strip().rstrip("\"'.,;)")
         parsed = urllib.parse.urlsplit(raw)
         protocol = parsed.scheme.lower()
-        if protocol not in {"vless", "trojan"} or not parsed.hostname:
+        if protocol not in {"vless", "trojan", "vmess"} or not parsed.hostname:
             return None
         query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         sni = next((query.get(k, "") for k in ("sni", "servername", "serverName", "host", "authority") if query.get(k)), parsed.hostname)
@@ -313,7 +314,7 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
         return None
 
 
-URI_RE = re.compile(r"(?:vless|trojan)://[^\s]+", re.I)
+URI_RE = re.compile(r"(?:vless|trojan|vmess)://[^\s]+", re.I)
 
 
 def parse_many(text: str, suggested: bool = False) -> list[ProxyProfile]:
@@ -344,10 +345,16 @@ def parse_outbound(profile: ProxyProfile) -> dict:
     network = (query.get("type") or "ws").lower()
     if network not in {"ws", "httpupgrade"}:
         network = "ws"
+    try:
+        alter_id = max(0, int(query.get("aid") or query.get("alterId") or 0))
+    except (TypeError, ValueError):
+        alter_id = 0
     return {
         "protocol": parsed.scheme.lower(), "user": urllib.parse.unquote(parsed.username or ""),
         "host": host, "port": parsed.port or 443, "sni": sni, "host_header": host_header,
         "path": path, "network": network, "fingerprint": query.get("fp") or query.get("fingerprint") or "",
         "pinned": query.get("pinnedPeerCertSha256") or query.get("pcs") or "",
         "verify_name": query.get("verifyPeerCertByName") or query.get("vcn") or "",
+        "alter_id": alter_id,
+        "user_security": query.get("scy") or query.get("cipher") or "auto",
     }

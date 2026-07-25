@@ -104,7 +104,7 @@ def test_carrier_v2_upgrades_only_slow_mci_and_preserves_route_sni_irancell(tmp_
     assert migrated["tuning"] == active_auto
     assert migrated["migration_sentinel"] == {"keep": [1, 2, 3]}
 
-    # A second startup is a no-op, including byte-for-byte stable JSON output.
+
     first_pass = paths["SETTINGS_FILE"].read_bytes()
     Storage()
     assert paths["SETTINGS_FILE"].read_bytes() == first_pass
@@ -147,8 +147,8 @@ def test_carrier_v2_leaves_near_match_custom_mci_and_irancell_exactly_unchanged(
         tmp_path, monkeypatch):
     paths = _redirect_storage(monkeypatch, tmp_path)
     custom_mci = _legacy_mci_compatibility()
-    # sessions=4/socket=512 alone is insufficient: one changed compatibility
-    # parameter makes this an intentional custom profile.
+
+
     custom_mci.pattern_ack_timeout_ms = 7999
     custom_mci.pattern_connect_ip = "203.0.113.44"
     custom_mci.pattern_fallback_ips = "203.0.113.44,203.0.113.45"

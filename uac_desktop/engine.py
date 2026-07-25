@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import ipaddress
 import json
 import os
 import platform
+import socket
 import subprocess
 import sys
 import threading
@@ -12,6 +14,7 @@ import uuid
 import winreg
 from collections.abc import Callable
 from contextlib import contextmanager
+from ctypes import wintypes
 
 import psutil
 import requests
@@ -19,7 +22,8 @@ import requests
 from . import __version__
 from .models import ProxyProfile, Tuning, parse_outbound
 from .pattern_core import PatternSniCore
-from .paths import BIN, DATA_DIR, XRAY_CONFIG, XRAY_OWNER_FILE
+from .paths import (BIN, DATA_DIR, SING_BOX_CONFIG, SING_BOX_OWNER_FILE,
+                    XRAY_CONFIG, XRAY_OWNER_FILE)
 
 
 
@@ -32,9 +36,172 @@ USER_AGENT = f"UAC-Spoofer-Desktop/{__version__}"
 DOWNLOAD_PROBE_BYTES = 256 * 1024
 DOWNLOAD_PROBE_MIN_BYTES = 32 * 1024
 DOWNLOAD_PROBE_URL = "https://speed.cloudflare.com/__down"
+SING_BOX_VERSION = "1.13.14"
 
 _PROXY_GUARD = threading.RLock()
 _PROXY_GUARD_LOCAL = threading.local()
+
+
+class _JobBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong),
+        ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", wintypes.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wintypes.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wintypes.DWORD),
+        ("SchedulingClass", wintypes.DWORD),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong),
+        ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong),
+        ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong),
+        ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _JobExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
+
+
+class _StartupInfo(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("lpReserved", wintypes.LPWSTR),
+        ("lpDesktop", wintypes.LPWSTR),
+        ("lpTitle", wintypes.LPWSTR),
+        ("dwX", wintypes.DWORD),
+        ("dwY", wintypes.DWORD),
+        ("dwXSize", wintypes.DWORD),
+        ("dwYSize", wintypes.DWORD),
+        ("dwXCountChars", wintypes.DWORD),
+        ("dwYCountChars", wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("wShowWindow", wintypes.WORD),
+        ("cbReserved2", wintypes.WORD),
+        ("lpReserved2", ctypes.POINTER(wintypes.BYTE)),
+        ("hStdInput", wintypes.HANDLE),
+        ("hStdOutput", wintypes.HANDLE),
+        ("hStdError", wintypes.HANDLE),
+    ]
+
+
+class _StartupInfoEx(ctypes.Structure):
+    _fields_ = [
+        ("StartupInfo", _StartupInfo),
+        ("lpAttributeList", ctypes.c_void_p),
+    ]
+
+
+class _ProcessInformation(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", wintypes.HANDLE),
+        ("hThread", wintypes.HANDLE),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+    ]
+
+
+class _AtomicJobProcess:
+    def __init__(self, args, process_handle, thread_handle, pid, stdout):
+        self.args = args
+        self._handle = int(process_handle)
+        self._thread_handle = int(thread_handle)
+        self.pid = int(pid)
+        self.stdout = stdout
+        self.returncode = None
+        self._handle_lock = threading.RLock()
+
+    def poll(self):
+        with self._handle_lock:
+            if self.returncode is not None:
+                return self.returncode
+            code = wintypes.DWORD()
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetExitCodeProcess.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            if not kernel32.GetExitCodeProcess(
+                    ctypes.c_void_p(self._handle), ctypes.byref(code)):
+                raise ctypes.WinError()
+            if code.value == 259:
+                return None
+            self.returncode = int(code.value)
+            return self.returncode
+
+    def wait(self, timeout=None):
+        with self._handle_lock:
+            if self.returncode is not None:
+                return self.returncode
+            milliseconds = 0xFFFFFFFF
+            if timeout is not None:
+                milliseconds = max(0, min(0xFFFFFFFE, int(float(timeout) * 1000)))
+            kernel32 = ctypes.windll.kernel32
+            kernel32.WaitForSingleObject.argtypes = [
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            result = int(kernel32.WaitForSingleObject(
+                ctypes.c_void_p(self._handle), milliseconds
+            ))
+            if result == 0x00000102:
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            if result == 0xFFFFFFFF:
+                raise ctypes.WinError()
+            return self.poll()
+
+    def terminate(self):
+        with self._handle_lock:
+            if self.poll() is not None:
+                return
+            kernel32 = ctypes.windll.kernel32
+            kernel32.TerminateProcess.argtypes = [
+                ctypes.c_void_p,
+                wintypes.UINT,
+            ]
+            kernel32.TerminateProcess.restype = wintypes.BOOL
+            if not kernel32.TerminateProcess(
+                    ctypes.c_void_p(self._handle), 1):
+                raise ctypes.WinError()
+
+    kill = terminate
+
+    def __del__(self):
+        for name in ("_thread_handle", "_handle"):
+            handle = int(getattr(self, name, 0) or 0)
+            if not handle:
+                continue
+            try:
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
+            except Exception:
+                pass
+            setattr(self, name, 0)
 
 
 @contextmanager
@@ -407,7 +574,17 @@ class WindowsProxy:
             self.log("Windows system proxy suspended")
             return True
 
-    def _enable_locked(self, bypass: str) -> None:
+    def suspend_for_tun(self, bypass: str = "<local>;localhost;127.*") -> None:
+        with _proxy_state_guard():
+            state = self._owned_pending_state()
+            if state is None:
+                self._enable_locked(bypass, False)
+                return
+            self._write_app_proxy_values(bypass, False)
+            self._refresh()
+            self.log("Windows system proxy suspended for TUN")
+
+    def _enable_locked(self, bypass: str, enabled: bool = True) -> None:
         existing = self._load_state()
         if existing is not None:
             owner = existing.get("owner", {})
@@ -430,7 +607,7 @@ class WindowsProxy:
 
 
             self._launch_watchdog(owner)
-            self._write_app_proxy_values(bypass, True)
+            self._write_app_proxy_values(bypass, enabled)
             self._refresh()
         except BaseException:
             try:
@@ -438,7 +615,10 @@ class WindowsProxy:
             except Exception as rollback_error:
                 self.log(f"Windows proxy rollback pending: {rollback_error}")
             raise
-        self.log(f"Windows system proxy enabled HTTP={HTTP_PORT} SOCKS={SOCKS_PORT}")
+        if enabled:
+            self.log(f"Windows system proxy enabled HTTP={HTTP_PORT} SOCKS={SOCKS_PORT}")
+        else:
+            self.log("Windows system proxy suspended for TUN")
 
     @property
     def has_pending_restore(self) -> bool:
@@ -592,8 +772,33 @@ class WindowsProxy:
             pass
 
 
+def resolve_xray_upstream(profile: ProxyProfile) -> str:
+    parsed = parse_outbound(profile)
+    host = str(parsed["host"]).strip()
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    addresses = []
+    for family, _kind, _protocol, _canonical, sockaddr in socket.getaddrinfo(
+            host, int(parsed["port"]), socket.AF_UNSPEC, socket.SOCK_STREAM):
+        address = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            normalized = str(ipaddress.ip_address(address))
+        except ValueError:
+            continue
+        if normalized not in addresses:
+            addresses.append(normalized)
+        if family == socket.AF_INET:
+            return normalized
+    if addresses:
+        return addresses[0]
+    raise RuntimeError(f"Could not resolve Xray upstream host: {host}")
+
+
 def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None = None,
-                      tuning: Tuning | None = None) -> dict:
+                      tuning: Tuning | None = None,
+                      upstream_address: str | None = None) -> dict:
     tuning = tuning or Tuning()
     parsed = parse_outbound(profile)
     inbounds = [
@@ -603,10 +808,18 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
          "settings": {"allowTransparent": False}},
     ]
     if parsed["protocol"] == "trojan":
-        settings = {"servers": [{"address": parsed["host"], "port": parsed["port"], "password": parsed["user"]}]}
+        settings = {"servers": [{"address": upstream_address or parsed["host"],
+                                  "port": parsed["port"], "password": parsed["user"]}]}
     elif parsed["protocol"] == "vless":
-        settings = {"vnext": [{"address": parsed["host"], "port": parsed["port"],
+        settings = {"vnext": [{"address": upstream_address or parsed["host"],
+                               "port": parsed["port"],
                                "users": [{"id": parsed["user"], "encryption": "none"}]}]}
+    elif parsed["protocol"] == "vmess":
+        settings = {"vnext": [{"address": upstream_address or parsed["host"],
+                               "port": parsed["port"],
+                               "users": [{"id": parsed["user"],
+                                          "alterId": parsed["alter_id"],
+                                          "security": parsed["user_security"]}]}]}
     else:
         raise ValueError(f"Unsupported protocol: {parsed['protocol']}")
     tls = {"serverName": parsed["sni"]}
@@ -661,6 +874,70 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
     }
 
 
+def build_singbox_tun_config(
+        bypass_processes: list[str] | None = None) -> dict:
+    direct_rules = [
+        {"process_name": ["xray.exe"], "action": "route", "outbound": "direct"},
+        {"port": 53, "action": "hijack-dns"},
+        {"network": "icmp", "action": "route", "outbound": "direct"},
+    ]
+    processes = []
+    protected = {"sing-box.exe", os.path.basename(sys.executable).lower()}
+    for value in bypass_processes or []:
+        name = os.path.basename(str(value).strip())
+        if (name and name.lower() not in protected
+                and name.lower() not in {item.lower() for item in processes}):
+            processes.append(name)
+    if processes:
+        direct_rules.append({
+            "process_name": processes,
+            "action": "route",
+            "outbound": "direct",
+        })
+    direct_rules.extend([
+        {"ip_is_private": True, "action": "route", "outbound": "direct"},
+    ])
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [{
+                "type": "tcp",
+                "tag": "remote-dns",
+                "server": "1.1.1.1",
+                "server_port": 53,
+                "detour": "proxy",
+            }],
+            "final": "remote-dns",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": [{
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": "UAC-Spoofer",
+            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            "mtu": 1400,
+            "auto_route": True,
+            "strict_route": True,
+            "stack": "mixed",
+        }],
+        "outbounds": [
+            {
+                "type": "socks",
+                "tag": "proxy",
+                "server": "127.0.0.1",
+                "server_port": SOCKS_PORT,
+                "version": "5",
+            },
+            {"type": "direct", "tag": "direct"},
+        ],
+        "route": {
+            "auto_detect_interface": True,
+            "rules": direct_rules,
+            "final": "proxy",
+        },
+    }
+
+
 class Engine:
     def __init__(self, log: Callable[[str], None], state: Callable[[bool], None],
                  traffic: Callable[[int, int], None]) -> None:
@@ -668,11 +945,16 @@ class Engine:
         self.fragment = PatternSniCore(log, traffic)
         self.system_proxy = WindowsProxy(log)
         self.process: subprocess.Popen | None = None
+        self.tun_process: subprocess.Popen | None = None
+        self._tun_job_handle = None
         self._reader: threading.Thread | None = None
+        self._tun_reader: threading.Thread | None = None
         self._lifecycle_lock = threading.RLock()
         self._run_id = 0
+        self._tun_run_id = 0
         self._active = False
         self._proxy_enabled = False
+        self._bypass_processes: list[str] = []
         self._log_level = "normal"
         self.last_probe_ms: float | None = None
         self.last_probe_url: str = ""
@@ -695,12 +977,293 @@ class Engine:
     def running(self) -> bool:
         return self._active and self.process is not None and self.process.poll() is None
 
+    @property
+    def tun_running(self) -> bool:
+        return self.tun_process is not None and self.tun_process.poll() is None
+
+    @property
+    def run_id(self) -> int:
+        return self._run_id
+
+    def _check_run_id(self, expected_run_id: int | None) -> None:
+        if expected_run_id is not None and int(expected_run_id) != self._run_id:
+            raise EngineCancelled("Connection generation changed")
+
     def _binary(self):
         name = "xray.exe" if platform.system() == "Windows" else "xray"
         path = BIN / name
         if not path.exists():
             raise FileNotFoundError(f"Xray binary not found: {path}. Run install-engine.ps1 once.")
         return path
+
+    def _singbox_binary(self):
+        name = "sing-box.exe" if platform.system() == "Windows" else "sing-box"
+        path = BIN / name
+        if not path.exists():
+            raise FileNotFoundError(
+                f"sing-box {SING_BOX_VERSION} binary not found: {path}. "
+                "Run install-engine.ps1 once."
+            )
+        return path
+
+    def ensure_tun_available(self):
+        if platform.system() != "Windows":
+            raise RuntimeError("sing-box TUN mode currently requires Windows")
+        if not bool(ctypes.windll.shell32.IsUserAnAdmin()):
+            raise RuntimeError("sing-box TUN mode requires administrator access")
+        return self._singbox_binary()
+
+    @staticmethod
+    def _create_tun_job():
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError()
+        information = _JobExtendedLimitInformation()
+        information.BasicLimitInformation.LimitFlags = 0x00002000
+        if not kernel32.SetInformationJobObject(
+                handle, 9, ctypes.byref(information), ctypes.sizeof(information)):
+            error = ctypes.WinError()
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise error
+        return handle
+
+    @staticmethod
+    def _tun_process_in_job(handle, process_handle) -> bool:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.IsProcessInJob.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        kernel32.IsProcessInJob.restype = wintypes.BOOL
+        result = wintypes.BOOL()
+        if not kernel32.IsProcessInJob(
+                ctypes.c_void_p(int(process_handle)),
+                ctypes.c_void_p(int(handle)),
+                ctypes.byref(result)):
+            raise ctypes.WinError()
+        return bool(result.value)
+
+    @staticmethod
+    def _spawn_tun_in_job(handle, command, cwd) -> _AtomicJobProcess:
+        import msvcrt
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreatePipe.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE),
+            ctypes.POINTER(wintypes.HANDLE),
+            ctypes.POINTER(_SecurityAttributes),
+            wintypes.DWORD,
+        ]
+        kernel32.CreatePipe.restype = wintypes.BOOL
+        kernel32.SetHandleInformation.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        kernel32.SetHandleInformation.restype = wintypes.BOOL
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(_SecurityAttributes),
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.InitializeProcThreadAttributeList.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+        kernel32.UpdateProcThreadAttribute.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+        kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+        kernel32.CreateProcessW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.LPWSTR,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+            ctypes.POINTER(_StartupInfo),
+            ctypes.POINTER(_ProcessInformation),
+        ]
+        kernel32.CreateProcessW.restype = wintypes.BOOL
+        kernel32.TerminateProcess.argtypes = [
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        security = _SecurityAttributes(
+            ctypes.sizeof(_SecurityAttributes), None, True
+        )
+        output_read = wintypes.HANDLE()
+        output_write = wintypes.HANDLE()
+        null_input = 0
+        attribute_list = None
+        process_information = _ProcessInformation()
+        stdout = None
+        descriptor = None
+        try:
+            if not kernel32.CreatePipe(
+                    ctypes.byref(output_read), ctypes.byref(output_write),
+                    ctypes.byref(security), 0):
+                raise ctypes.WinError()
+            if not kernel32.SetHandleInformation(output_read, 1, 0):
+                raise ctypes.WinError()
+            null_input = int(kernel32.CreateFileW(
+                "NUL", 0x80000000, 3, ctypes.byref(security), 3, 0x80, None
+            ) or 0)
+            if not null_input or null_input == int(ctypes.c_void_p(-1).value):
+                raise ctypes.WinError()
+
+            attribute_size = ctypes.c_size_t()
+            kernel32.InitializeProcThreadAttributeList(
+                None, 2, 0, ctypes.byref(attribute_size)
+            )
+            if not attribute_size.value:
+                raise ctypes.WinError()
+            attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
+            attribute_list = ctypes.cast(attribute_buffer, ctypes.c_void_p)
+            if not kernel32.InitializeProcThreadAttributeList(
+                    attribute_list, 2, 0, ctypes.byref(attribute_size)):
+                raise ctypes.WinError()
+
+            jobs = (wintypes.HANDLE * 1)(int(handle))
+            inherited = (wintypes.HANDLE * 2)(
+                null_input, int(output_write.value)
+            )
+            if not kernel32.UpdateProcThreadAttribute(
+                    attribute_list, 0, 0x0002000D,
+                    ctypes.cast(jobs, ctypes.c_void_p), ctypes.sizeof(jobs),
+                    None, None):
+                raise ctypes.WinError()
+            if not kernel32.UpdateProcThreadAttribute(
+                    attribute_list, 0, 0x00020002,
+                    ctypes.cast(inherited, ctypes.c_void_p),
+                    ctypes.sizeof(inherited), None, None):
+                raise ctypes.WinError()
+
+            startup = _StartupInfoEx()
+            startup.StartupInfo.cb = ctypes.sizeof(_StartupInfoEx)
+            startup.StartupInfo.dwFlags = 0x00000100
+            startup.StartupInfo.hStdInput = null_input
+            startup.StartupInfo.hStdOutput = output_write
+            startup.StartupInfo.hStdError = output_write
+            startup.lpAttributeList = attribute_list
+            arguments = [str(value) for value in command]
+            command_line = ctypes.create_unicode_buffer(
+                subprocess.list2cmdline(arguments)
+            )
+            if not kernel32.CreateProcessW(
+                    arguments[0], command_line, None, None, True,
+                    0x08080004, None, str(cwd),
+                    ctypes.byref(startup.StartupInfo),
+                    ctypes.byref(process_information)):
+                raise ctypes.WinError()
+            if not Engine._tun_process_in_job(
+                    handle, process_information.hProcess):
+                raise RuntimeError("sing-box process was not created inside its Job")
+
+            kernel32.CloseHandle(output_write)
+            output_write.value = None
+            kernel32.CloseHandle(ctypes.c_void_p(null_input))
+            null_input = 0
+            descriptor = msvcrt.open_osfhandle(
+                int(output_read.value), os.O_RDONLY | os.O_BINARY
+            )
+            output_read.value = None
+            stdout = os.fdopen(
+                descriptor, "r", encoding="utf-8", errors="replace"
+            )
+            descriptor = None
+            process = _AtomicJobProcess(
+                arguments,
+                process_information.hProcess,
+                process_information.hThread,
+                process_information.dwProcessId,
+                stdout,
+            )
+            process_information.hProcess = None
+            process_information.hThread = None
+            stdout = None
+            return process
+        except Exception:
+            if process_information.hProcess:
+                kernel32.TerminateProcess(process_information.hProcess, 1)
+            raise
+        finally:
+            if attribute_list:
+                kernel32.DeleteProcThreadAttributeList(attribute_list)
+            if stdout is not None:
+                stdout.close()
+            if descriptor is not None:
+                os.close(descriptor)
+            for raw_handle in (
+                    output_read.value, output_write.value, null_input,
+                    process_information.hThread,
+                    process_information.hProcess):
+                if raw_handle:
+                    kernel32.CloseHandle(ctypes.c_void_p(int(raw_handle)))
+
+    @staticmethod
+    def _resume_tun_process(process: subprocess.Popen) -> None:
+        thread_handle = int(getattr(process, "_thread_handle", 0) or 0)
+        if thread_handle:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.ResumeThread.argtypes = [ctypes.c_void_p]
+            kernel32.ResumeThread.restype = wintypes.DWORD
+            result = int(kernel32.ResumeThread(ctypes.c_void_p(thread_handle)))
+            if result == 0xFFFFFFFF:
+                raise ctypes.WinError()
+            kernel32.CloseHandle(ctypes.c_void_p(thread_handle))
+            process._thread_handle = 0
+            return
+        ntdll = ctypes.windll.ntdll
+        ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
+        status = int(ntdll.NtResumeProcess(ctypes.c_void_p(int(process._handle))))
+        if status:
+            raise OSError(f"NtResumeProcess failed with status 0x{status & 0xffffffff:08x}")
+
+    @staticmethod
+    def _close_tun_job(handle) -> None:
+        if not handle:
+            return
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        if not kernel32.CloseHandle(ctypes.c_void_p(handle)):
+            raise ctypes.WinError()
 
     @staticmethod
     def _check_cancel(cancel_event: threading.Event | None) -> None:
@@ -744,6 +1307,89 @@ class Engine:
             XRAY_OWNER_FILE.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def _write_singbox_owner_record(self, process: subprocess.Popen) -> None:
+        try:
+            created = psutil.Process(process.pid).create_time()
+            parent_created = psutil.Process(os.getpid()).create_time()
+            value = {
+                "pid": process.pid,
+                "create_time": created,
+                "parent_pid": os.getpid(),
+                "parent_create_time": parent_created,
+                "exe": str(self._singbox_binary()),
+                "config": str(SING_BOX_CONFIG),
+            }
+            temp = SING_BOX_OWNER_FILE.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+            temp.replace(SING_BOX_OWNER_FILE)
+        except (OSError, psutil.Error):
+            pass
+
+    @staticmethod
+    def _read_singbox_owner_record() -> dict:
+        try:
+            value = json.loads(SING_BOX_OWNER_FILE.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _remove_singbox_owner_record(pid: int | None = None) -> None:
+        if pid is not None:
+            value = Engine._read_singbox_owner_record()
+            if value and int(value.get("pid", -1)) != int(pid):
+                return
+        try:
+            SING_BOX_OWNER_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def recover_stale_tun(self) -> bool:
+        owner = self._read_singbox_owner_record()
+        if not owner:
+            return False
+        try:
+            pid = int(owner.get("pid", -1))
+            created = float(owner.get("create_time", -1))
+            parent_pid = int(owner.get("parent_pid", -1))
+            parent_created = float(owner.get("parent_create_time", -1))
+        except (TypeError, ValueError):
+            self._remove_singbox_owner_record()
+            return False
+        if parent_pid == os.getpid():
+            try:
+                if abs(psutil.Process(parent_pid).create_time() - parent_created) < 0.01:
+                    return False
+            except (psutil.Error, OSError):
+                pass
+        try:
+            process = psutil.Process(pid)
+            command = process.cmdline()
+            config_marker = self._normalize_path(str(SING_BOX_CONFIG))
+            config_matches = any(
+                self._normalize_path(argument) == config_marker
+                for argument in command[1:]
+            )
+            if (process.name().lower() != "sing-box.exe"
+                    or abs(process.create_time() - created) >= 0.01
+                    or not config_matches):
+                self._remove_singbox_owner_record(pid)
+                return False
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=1)
+            self._remove_singbox_owner_record(pid)
+            self.log(f"RECOVERY stopped stale sing-box TUN pid={pid}")
+            return True
+        except psutil.NoSuchProcess:
+            self._remove_singbox_owner_record(pid)
+            return False
+        except (psutil.AccessDenied, psutil.Error, OSError):
+            return False
 
     @staticmethod
     def _listener_owners(ports: set[int]) -> dict[int, int]:
@@ -859,6 +1505,8 @@ class Engine:
             self._check_cancel(cancel_event)
             self.reclaim_stale_listeners()
             self._check_cancel(cancel_event)
+            self.recover_stale_tun()
+            self._check_cancel(cancel_event)
             self.last_probe_ms = None
             self.last_probe_url = ""
             self.last_download_ok = None
@@ -878,10 +1526,16 @@ class Engine:
             if not profile.source_uri:
                 raise ValueError("Selected config has no VLESS/Trojan URI")
             self._log_level = tuning.log_level
+            self._bypass_processes = list(bypass_processes or [])
+            upstream_address = resolve_xray_upstream(profile)
+            self._check_cancel(cancel_event)
             self.fragment.start(profile, tuning, strategy_override)
             try:
                 self._check_cancel(cancel_event)
-                config = build_xray_config(profile, bypass_processes, tuning)
+                config = build_xray_config(
+                    profile, bypass_processes, tuning,
+                    upstream_address=upstream_address,
+                )
                 XRAY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
                 creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 process = subprocess.Popen([str(self._binary()), "run", "-config", str(XRAY_CONFIG)],
@@ -916,9 +1570,11 @@ class Engine:
                 self._stop_locked(notify=False)
                 raise
 
-    def enable_system_proxy(self, cancel_event: threading.Event | None = None) -> None:
+    def enable_system_proxy(self, cancel_event: threading.Event | None = None,
+                            expected_run_id: int | None = None) -> None:
         """Expose the verified local proxy only after the real page probe passes."""
         with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
             self._check_cancel(cancel_event)
             if not self.running:
                 raise RuntimeError("Cannot enable Windows proxy before the engine is running")
@@ -927,15 +1583,204 @@ class Engine:
                 self._proxy_enabled = True
             self._check_cancel(cancel_event)
 
-    def disable_system_proxy(self) -> None:
+    def disable_system_proxy(self, expected_run_id: int | None = None) -> None:
         """Restore Windows proxy state without stopping Xray or Patterniha."""
         with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
             if self._proxy_enabled or self.system_proxy.has_pending_restore:
                 try:
                     self.system_proxy.suspend()
                 finally:
                     self._proxy_enabled = False
             self.log("Windows system proxy mode disabled; tunnel remains active")
+
+    def suspend_system_proxy_for_tun(self, expected_run_id: int | None = None) -> None:
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+            if not self.running:
+                raise RuntimeError("Cannot suspend Windows proxy before the engine is running")
+            if not self.tun_running:
+                raise RuntimeError("Cannot suspend Windows proxy before TUN is running")
+            try:
+                self.system_proxy.suspend_for_tun()
+            finally:
+                self._proxy_enabled = False
+
+    def enable_tun(self, cancel_event: threading.Event | None = None,
+                   expected_run_id: int | None = None) -> None:
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+            self._check_cancel(cancel_event)
+            if not self.running:
+                raise RuntimeError("Cannot enable TUN before the engine is running")
+            if self.tun_running:
+                return
+            binary = self.ensure_tun_available()
+            config = build_singbox_tun_config(self._bypass_processes)
+            SING_BOX_CONFIG.write_text(
+                json.dumps(config, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            checked = subprocess.run(
+                [str(binary), "check", "-c", str(SING_BOX_CONFIG)],
+                cwd=str(SING_BOX_CONFIG.parent),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creation,
+                timeout=8,
+            )
+            if checked.returncode:
+                detail = (checked.stderr or checked.stdout or "invalid configuration").strip()
+                raise RuntimeError(f"sing-box config check failed: {detail[:1200]}")
+            self._check_cancel(cancel_event)
+            self._tun_job_handle = self._create_tun_job()
+            try:
+                process = self._spawn_tun_in_job(
+                    self._tun_job_handle,
+                    [str(binary), "run", "-c", str(SING_BOX_CONFIG)],
+                    str(SING_BOX_CONFIG.parent),
+                )
+                self.tun_process = process
+                self._tun_run_id += 1
+                run_id = self._tun_run_id
+                self._write_singbox_owner_record(process)
+                self._resume_tun_process(process)
+                deadline = time.monotonic() + 1.2
+                while time.monotonic() < deadline:
+                    self._check_cancel(cancel_event)
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                if process.poll() is not None:
+                    returncode = process.returncode
+                    output = process.stdout.read() if process.stdout else ""
+                    raise RuntimeError(
+                        f"sing-box TUN exited immediately ({returncode}): {output[:1200]}"
+                    )
+                self._check_cancel(cancel_event)
+                self._tun_reader = threading.Thread(
+                    target=self._read_tun_logs,
+                    args=(process, run_id),
+                    name=f"sing-box-log-{run_id}",
+                    daemon=True,
+                )
+                self._tun_reader.start()
+                self.log(
+                    f"SING-BOX TUN started interface=UAC-Spoofer "
+                    f"socks=127.0.0.1:{SOCKS_PORT}"
+                )
+            except Exception:
+                self._stop_tun_locked()
+                raise
+
+    def disable_tun(self, expected_run_id: int | None = None) -> None:
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+            self._stop_tun_locked()
+
+    def _stop_tun_locked(self) -> None:
+        process = getattr(self, "tun_process", None)
+        job_handle = getattr(self, "_tun_job_handle", None)
+        if process is None:
+            if job_handle:
+                self._close_tun_job(job_handle)
+                self._tun_job_handle = None
+            self._tun_run_id = int(getattr(self, "_tun_run_id", 0)) + 1
+            return
+        was_running = process.poll() is None
+        failure = None
+        try:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+        except (OSError, PermissionError) as exc:
+            failure = exc
+        if process.poll() is None and job_handle:
+            try:
+                self._close_tun_job(job_handle)
+                self._tun_job_handle = None
+                process.wait(timeout=2)
+            except (OSError, PermissionError, subprocess.TimeoutExpired) as exc:
+                failure = exc
+        if process.poll() is None:
+            self.tun_process = process
+            detail = f"sing-box TUN process {process.pid} did not stop"
+            self.log(detail)
+            if failure is not None:
+                raise RuntimeError(detail) from failure
+            raise RuntimeError(detail)
+        if job_handle and self._tun_job_handle is not None:
+            try:
+                self._close_tun_job(job_handle)
+            except OSError as exc:
+                self.log(f"sing-box TUN job cleanup pending: {exc}")
+            self._tun_job_handle = None
+        self.tun_process = None
+        self._tun_run_id = int(getattr(self, "_tun_run_id", 0)) + 1
+        self._remove_singbox_owner_record(process.pid)
+        if was_running:
+            self.log("SING-BOX TUN stopped")
+
+    def probe_tun(self, timeout: float = 10,
+                  preferred_url: str = "https://www.youtube.com/generate_204",
+                  require_preferred: bool = True,
+                  cancel_event: threading.Event | None = None,
+                  expected_run_id: int | None = None) -> tuple[bool, str]:
+        self._check_run_id(expected_run_id)
+        self._check_cancel(cancel_event)
+        if not self.tun_running:
+            return False, "sing-box TUN is not running"
+        urls = list(dict.fromkeys((
+            preferred_url,
+            "https://www.gstatic.com/generate_204",
+            "https://www.cloudflare.com/cdn-cgi/trace",
+        )))
+        errors = []
+        for url in urls:
+            self._check_cancel(cancel_event)
+            session = requests.Session()
+            session.trust_env = False
+            started = time.perf_counter()
+            try:
+                response = session.get(
+                    url,
+                    timeout=timeout,
+                    headers={"User-Agent": USER_AGENT, "Connection": "close"},
+                )
+                self._check_run_id(expected_run_id)
+                self._check_cancel(cancel_event)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                if 200 <= response.status_code < 500:
+                    detail = response.text.strip()[:160] or f"HTTP {response.status_code}"
+                    self.last_probe_url = url
+                    self.last_probe_ms = elapsed_ms
+                    self.log(
+                        f"TUN CONNECTIVITY CHECK OK {url} => "
+                        f"{response.status_code} {elapsed_ms:.0f}ms"
+                    )
+                    return True, detail
+                errors.append(f"{url}: HTTP {response.status_code}")
+            except Exception as exc:
+                errors.append(f"{url}: {type(exc).__name__}")
+            finally:
+                session.close()
+            if url == preferred_url and require_preferred:
+                detail = errors[-1]
+                self.log("TUN PREFERRED CHECK FAILED " + detail)
+                return False, detail
+        detail = " | ".join(errors)
+        self.log("TUN CONNECTIVITY CHECK FAILED " + detail)
+        return False, detail
 
     def probe(self, timeout: float = 10, preferred_url: str | None = None,
               require_preferred: bool = False,
@@ -1142,6 +1987,19 @@ class Engine:
                 self.log("XRAY process stopped unexpectedly")
                 self._stop_locked(notify=True)
 
+    def _read_tun_logs(self, process: subprocess.Popen, run_id: int) -> None:
+        if not process or not process.stdout:
+            return
+        for line in process.stdout:
+            clean = line.strip()
+            if clean:
+                self.log("SING-BOX " + clean)
+        with self._lifecycle_lock:
+            if self.tun_process is not process or self._tun_run_id != run_id:
+                return
+            self.log("SING-BOX TUN process stopped unexpectedly")
+            self._stop_locked(notify=True)
+
     @staticmethod
     def _is_client_abort_noise(line: str) -> bool:
         """Match routine local HTTP cancellations without hiding dial/core errors."""
@@ -1275,6 +2133,7 @@ class Engine:
 
     def _stop_locked(self, notify: bool = True) -> None:
         was_active = self._active
+        self._stop_tun_locked()
         self._active = False
         self._run_id += 1
         process = self.process
@@ -1302,6 +2161,7 @@ class Engine:
             try:
                 self.fragment.stop()
             finally:
+                self._bypass_processes = []
                 if self._proxy_enabled or self.system_proxy.has_pending_restore:
                     try:
                         self.system_proxy.disable()

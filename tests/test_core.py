@@ -3,6 +3,8 @@ import concurrent.futures
 import json
 import os
 import socket
+import struct
+import sys
 import threading
 from types import SimpleNamespace
 
@@ -12,8 +14,10 @@ from pydivert import WinDivert
 
 from uac_desktop import __version__
 from uac_desktop.engine import (Engine, EngineCancelled, HTTP_PORT, SOCKS_PORT,
-                                USER_AGENT, XRAY_CONFIG, build_xray_config)
-from uac_desktop.models import Tuning, default_profiles, parse_many, parse_outbound
+                                USER_AGENT, XRAY_CONFIG, build_singbox_tun_config,
+                                build_xray_config, resolve_xray_upstream)
+from uac_desktop.models import (ProxyProfile, Tuning, default_profiles,
+                                parse_many, parse_outbound)
 from uac_desktop.fragment_proxy import FragmentProxy
 from uac_desktop.pattern_core import PatternSniCore
 from uac_desktop.pattern_core.core import Quality
@@ -42,6 +46,79 @@ def test_xray_has_socks_and_http_inbounds():
     ports = {x["port"] for x in config["inbounds"]}
     assert ports == {SOCKS_PORT, HTTP_PORT}
     assert config["outbounds"][0]["protocol"] == "trojan"
+
+
+def test_xray_hostname_is_resolved_before_tun_without_changing_tls_name(monkeypatch):
+    profile = ProxyProfile(
+        source_uri=(
+            "trojan://password@edge.example:443"
+            "?security=tls&type=ws&host=origin.example&sni=tls.example"
+        ),
+        protocol="trojan",
+        config_host="edge.example",
+    )
+    monkeypatch.setattr(
+        "uac_desktop.engine.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::7", 443, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.7", 443)),
+        ],
+    )
+
+    address = resolve_xray_upstream(profile)
+    config = build_xray_config(profile, upstream_address=address)
+    outbound = config["outbounds"][0]
+
+    assert address == "203.0.113.7"
+    assert outbound["settings"]["servers"][0]["address"] == "203.0.113.7"
+    assert outbound["streamSettings"]["tlsSettings"]["serverName"] == "tls.example"
+    assert outbound["streamSettings"]["wsSettings"]["headers"]["Host"] == "origin.example"
+
+
+def test_singbox_tun_config_routes_web_to_socks_and_icmp_direct():
+    config = build_singbox_tun_config([
+        r"C:\Program Files\Example\example.exe", "example.exe", "game.exe",
+    ])
+    inbound = config["inbounds"][0]
+    assert inbound["type"] == "tun"
+    assert inbound["auto_route"] is True
+    assert inbound["strict_route"] is True
+    assert inbound["stack"] == "mixed"
+    assert inbound["address"] == [
+        "172.19.0.1/30", "fdfe:dcba:9876::1/126",
+    ]
+    assert "route_exclude_address" not in inbound
+    assert config["route"]["final"] == "proxy"
+    assert config["route"]["auto_detect_interface"] is True
+    assert config["route"]["rules"][0] == {
+        "process_name": ["xray.exe"], "action": "route", "outbound": "direct",
+    }
+    assert config["route"]["rules"][1] == {"port": 53, "action": "hijack-dns"}
+    assert {
+        "network": "icmp", "action": "route", "outbound": "direct",
+    } in config["route"]["rules"]
+    assert {
+        "process_name": ["example.exe", "game.exe"],
+        "action": "route",
+        "outbound": "direct",
+    } in config["route"]["rules"]
+    assert config["outbounds"][0]["server_port"] == SOCKS_PORT
+    assert config["dns"]["servers"][0]["detour"] == "proxy"
+
+
+def test_singbox_bypass_never_excludes_the_probe_process():
+    current = os.path.basename(sys.executable)
+    config = build_singbox_tun_config([current, "sing-box.exe", "game.exe"])
+    process_rules = [
+        rule["process_name"]
+        for rule in config["route"]["rules"]
+        if "process_name" in rule
+    ]
+    assert ["game.exe"] in process_rules
+    assert all(current.lower() not in {name.lower() for name in names}
+               for names in process_rules)
+    assert all("sing-box.exe" not in {name.lower() for name in names}
+               for names in process_rules)
 
 
 def test_xray_mux_defaults_are_bounded_and_can_be_disabled():
@@ -351,15 +428,68 @@ def test_upload_optimization_changes_nodelay_and_send_buffer():
     core = PatternSniCore(lambda _: None)
     optimized = RecordingSocket()
     core._quality = Quality(socket_buffer_kb=4096, upload_optimized=True)
+    core._interface_index = 23
     core._tune_socket(optimized)
+    assert (socket.IPPROTO_IP, 31, struct.pack("!I", 23)) not in optimized.options
     assert (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) in optimized.options
     assert (socket.SOL_SOCKET, socket.SO_SNDBUF, 4096 * 1024) in optimized.options
 
     compatible = RecordingSocket()
     core._quality = Quality(socket_buffer_kb=4096, upload_optimized=False)
-    core._tune_socket(compatible)
+    core._tune_socket(compatible, True)
+    assert (socket.IPPROTO_IP, 31, struct.pack("!I", 23)) in compatible.options
     assert (socket.IPPROTO_TCP, socket.TCP_NODELAY, 0) in compatible.options
     assert (socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024) in compatible.options
+
+
+def test_pattern_pin_refreshes_stale_physical_interface(monkeypatch):
+    core = PatternSniCore(lambda _: None)
+    core._interface_ip = "192.168.1.10"
+    core._interface_index = 3
+    calls = []
+
+    def tune(_sock, pin):
+        calls.append((core._interface_ip, core._interface_index, pin))
+        if len(calls) == 1:
+            raise OSError("stale interface")
+
+    monkeypatch.setattr(core, "_tune_socket", tune)
+    monkeypatch.setattr(
+        "uac_desktop.pattern_core.core.default_interface_ipv4",
+        lambda _edge: "192.168.70.151",
+    )
+    monkeypatch.setattr(
+        "uac_desktop.pattern_core.core.best_interface_index",
+        lambda _edge: 23,
+    )
+
+    core._tune_outgoing_socket(object(), "104.19.229.21")
+
+    assert calls == [
+        ("192.168.1.10", 3, True),
+        ("192.168.70.151", 23, True),
+    ]
+
+
+def test_pattern_handler_closes_incoming_when_edge_setup_fails():
+    class CloseSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    core = PatternSniCore(lambda _: None)
+    core._session_sem = asyncio.Semaphore(1)
+    incoming = CloseSocket()
+
+    async def fail(_incoming):
+        raise OSError("pin failed")
+
+    core._connect_edge = fail
+    asyncio.run(core._handle(incoming))
+
+    assert incoming.closed
 
 
 def test_pattern_upload_pump_relays_multiple_large_chunks():
@@ -512,6 +642,153 @@ def test_engine_cancel_token_aborts_lifecycle_boundary():
         assert False, "cancelled generations must abort before spawning Xray"
     except EngineCancelled:
         pass
+
+
+def test_engine_starts_validated_singbox_after_xray(monkeypatch, tmp_path):
+    engine = Engine(lambda _line: None, lambda _running: None,
+                    lambda _up, _down: None)
+    engine._active = True
+    engine.process = RunningProcess()
+    engine._bypass_processes = ["game.exe"]
+    binary = tmp_path / "sing-box.exe"
+    binary.write_bytes(b"test")
+    config_path = tmp_path / "sing-box-tun.json"
+    calls = []
+
+    class TunProcess:
+        pid = 8123
+        stdout = []
+
+        def __init__(self):
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            calls.append("terminate")
+            self.alive = False
+
+        def wait(self, timeout=None):
+            calls.append(("wait", timeout))
+            return 0
+
+        def kill(self):
+            calls.append("kill")
+            self.alive = False
+
+    class ThreadStub:
+        def __init__(self, **kwargs):
+            calls.append(("thread", kwargs["name"]))
+
+        def start(self):
+            calls.append("thread-start")
+
+    tun_process = TunProcess()
+    monkeypatch.setattr("uac_desktop.engine.SING_BOX_CONFIG", config_path)
+    monkeypatch.setattr(engine, "ensure_tun_available", lambda: binary)
+    monkeypatch.setattr(engine, "_create_tun_job", lambda: calls.append("job-create") or 91)
+    monkeypatch.setattr(
+        engine, "_spawn_tun_in_job",
+        lambda handle, command, cwd: calls.append(
+            ("atomic-spawn", handle, command, cwd)
+        ) or tun_process,
+    )
+    monkeypatch.setattr(engine, "_resume_tun_process",
+                        lambda process: calls.append(("resume", process.pid)))
+    monkeypatch.setattr(engine, "_close_tun_job",
+                        lambda handle: calls.append(("job-close", handle)))
+    monkeypatch.setattr(engine, "_write_singbox_owner_record", lambda process: calls.append(("owner", process.pid)))
+    monkeypatch.setattr("uac_desktop.engine.subprocess.run",
+                        lambda command, **kwargs: calls.append(("check", command, kwargs)) or
+                        SimpleNamespace(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr("uac_desktop.engine.threading.Thread", ThreadStub)
+    monotonic = iter((0.0, 2.0))
+    monkeypatch.setattr("uac_desktop.engine.time.monotonic", lambda: next(monotonic))
+
+    engine.enable_tun()
+
+    written = json.loads(config_path.read_text(encoding="utf-8"))
+    assert written["route"]["final"] == "proxy"
+    assert "route_exclude_address" not in written["inbounds"][0]
+    assert calls[0][0] == "check"
+    assert calls[1] == "job-create"
+    assert calls[2][0] == "atomic-spawn"
+    assert calls[2][1] == 91
+    assert calls[2][2] == [
+        str(binary), "run", "-c", str(config_path),
+    ]
+    assert calls[3] == ("owner", tun_process.pid)
+    assert calls[4] == ("resume", tun_process.pid)
+    assert engine.tun_running is True
+    engine.disable_tun()
+    assert "terminate" in calls
+    assert ("job-close", 91) in calls
+    assert engine.tun_running is False
+
+
+def test_tun_process_is_atomically_created_inside_job(tmp_path):
+    if sys.platform != "win32":
+        return
+    job = Engine._create_tun_job()
+    process = None
+    try:
+        process = Engine._spawn_tun_in_job(
+            job,
+            [
+                sys.executable, "-c",
+                "import time; print('atomic-job-ok', flush=True); time.sleep(30)",
+            ],
+            tmp_path,
+        )
+        assert Engine._tun_process_in_job(job, process._handle)
+        assert process.poll() is None
+        Engine._resume_tun_process(process)
+        assert process.stdout.readline().strip() == "atomic-job-ok"
+        Engine._close_tun_job(job)
+        job = 0
+        assert process.wait(timeout=5) is not None
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+        if job:
+            Engine._close_tun_job(job)
+
+
+def test_failed_tun_stop_preserves_process_and_owner_for_recovery(monkeypatch):
+    engine = Engine(lambda _line: None, lambda _running: None,
+                    lambda _up, _down: None)
+    removed = []
+
+    class StuckProcess:
+        pid = 9911
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise PermissionError("busy")
+
+    process = StuckProcess()
+    engine.tun_process = process
+    engine._tun_job_handle = 73
+    monkeypatch.setattr(engine, "_close_tun_job",
+                        lambda _handle: (_ for _ in ()).throw(OSError("job busy")))
+    monkeypatch.setattr(engine, "_remove_singbox_owner_record",
+                        lambda pid=None: removed.append(pid))
+
+    try:
+        engine.disable_tun()
+        assert False, "a live TUN process must retain its recovery record"
+    except RuntimeError as exc:
+        assert "did not stop" in str(exc)
+
+    assert engine.tun_process is process
+    assert engine._tun_job_handle == 73
+    assert removed == []
 
 
 def test_minimal_log_filter_suppresses_only_routine_client_aborts():
