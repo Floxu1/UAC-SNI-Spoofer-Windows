@@ -135,6 +135,10 @@ class SniConversionResult:
     def already_sni(self) -> bool:
         return self.status == "already_sni"
 
+    @property
+    def direct(self) -> bool:
+        return self.status == "direct"
+
 
 @dataclass
 class SniConversionBatch:
@@ -153,6 +157,10 @@ class SniConversionBatch:
     @property
     def already_sni_count(self) -> int:
         return sum(result.status == "already_sni" for result in self.results)
+
+    @property
+    def direct_count(self) -> int:
+        return sum(result.status == "direct" for result in self.results)
 
     @property
     def incompatible_count(self) -> int:
@@ -336,8 +344,11 @@ def _compatibility_error(profile: ProxyProfile) -> str:
         security = query.get("security", "").strip().lower()
         if security not in {"", "tls"}:
             return f"Unsupported security: {security}"
-        network = (query.get("type") or query.get("network") or "ws").strip().lower()
-        if network not in {"ws", "httpupgrade"}:
+        network = (
+            query.get("type") or query.get("network")
+            or "ws"
+        ).strip().lower()
+        if network not in {"ws", "httpupgrade", "grpc", "xhttp", "tcp", "raw"}:
             return f"Unsupported transport: {network}"
         sni = next(
             (
@@ -366,8 +377,6 @@ def convert_to_sni(
     error = _compatibility_error(profile)
     if error:
         return SniConversionResult(source, None, "incompatible", error)
-    if is_sni_config(profile):
-        return SniConversionResult(source, replace(profile), "already_sni")
     parsed = urllib.parse.urlsplit(profile.source_uri)
     query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query = {
@@ -376,15 +385,22 @@ def convert_to_sni(
     }
     server_name = next(
         (
-            query.get(key.lower(), "").strip()
-            for key in ("sni", "servername", "serverName", "host", "authority")
-            if query.get(key.lower(), "").strip()
+            query.get(key, "").strip()
+            for key in ("sni", "servername", "host", "authority")
+            if query.get(key, "").strip()
         ),
         (parsed.hostname or profile.sni).strip(),
     )
+    if is_sni_config(profile):
+        return SniConversionResult(source, replace(profile), "already_sni")
     if not any(query.get(key, "").strip() for key in ("sni", "servername")):
-        query_pairs.append(("sni", server_name))
-    rewritten_query = urllib.parse.urlencode(query_pairs, doseq=True)
+        rewritten_query = (
+            f"{parsed.query}&sni={urllib.parse.quote(server_name, safe='')}"
+            if parsed.query else
+            f"sni={urllib.parse.quote(server_name, safe='')}"
+        )
+    else:
+        rewritten_query = parsed.query
     username, separator, _host = parsed.netloc.rpartition("@")
     userinfo = f"{username}@" if separator else ""
     rewritten = urllib.parse.urlunsplit(
@@ -411,6 +427,8 @@ def convert_to_sni(
     converted.port = parsed.port or 443
     converted.sni = server_name
     converted.origin = "sni-maker"
+    converted.route_mode = "sni"
+    converted.verified_route = False
     converted.last_ping_ok = False
     converted.last_ping_ms = 0.0
     converted.country_code = ""
@@ -486,7 +504,11 @@ def _test_result(profile: ProxyProfile, outcome: SniProbeResult) -> SniTestResul
         tested_profile.country_verified_at = 0.0
         tested_profile.country_source = ""
     if outcome.success and outcome.route_verified:
-        tested_profile.verified_spoof = True
+        if tested_profile.route_mode == "reality-direct":
+            tested_profile.verified_route = True
+            tested_profile.verified_spoof = False
+        else:
+            tested_profile.verified_spoof = True
     status = "failed"
     if outcome.success:
         status = "healthy" if outcome.route_verified else "preflight_ok"

@@ -53,6 +53,8 @@ class ProxyProfile:
     observed_country_name: str = ""
     country_verified_at: float = 0.0
     country_source: str = ""
+    route_mode: str = "sni"
+    verified_route: bool = False
 
     @property
     def target_label(self) -> str:
@@ -62,6 +64,10 @@ class ProxyProfile:
     @property
     def country_flag(self) -> str:
         return COUNTRIES.get(self.country_code.upper(), ("🌐", "", ""))[0]
+
+    @property
+    def route_is_verified(self) -> bool:
+        return bool(self.verified_spoof or self.verified_route)
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -73,6 +79,21 @@ class ProxyProfile:
                    "configHost": "config_host", "configPort": "config_port",
                    "lastPingOk": "last_ping_ok", "lastPingMs": "last_ping_ms"}
         clean = {aliases.get(k, k): v for k, v in raw.items() if aliases.get(k, k) in valid}
+        if "route_mode" not in clean:
+            try:
+                query = {
+                    str(key).lower(): str(value)
+                    for key, value in urllib.parse.parse_qsl(
+                        urllib.parse.urlsplit(
+                            str(clean.get("source_uri", "") or "")
+                        ).query,
+                        keep_blank_values=True,
+                    )
+                }
+                if query.get("security", "").lower() == "reality":
+                    clean["route_mode"] = "reality-direct"
+            except (TypeError, ValueError):
+                pass
         return cls(**clean)
 
 
@@ -282,13 +303,27 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
         protocol = parsed.scheme.lower()
         if protocol not in {"vless", "trojan", "vmess"} or not parsed.hostname:
             return None
-        query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
-        sni = next((query.get(k, "") for k in ("sni", "servername", "serverName", "host", "authority") if query.get(k)), parsed.hostname)
+        query = {
+            str(key).lower(): str(value)
+            for key, value in urllib.parse.parse_qsl(
+                parsed.query, keep_blank_values=True
+            )
+        }
+        sni = next((
+            query.get(key, "") for key in (
+                "sni", "servername", "host", "authority"
+            ) if query.get(key)
+        ), parsed.hostname)
         fragment = urllib.parse.unquote(parsed.fragment)
         name = fragment or f"{protocol.upper()} {parsed.hostname}"
         profile = ProxyProfile(name=name, source_uri=raw, protocol=protocol,
                                config_host=parsed.hostname, config_port=parsed.port or 443,
-                               origin="builtin" if suggested else "user", sni=sni)
+                               origin="builtin" if suggested else "user", sni=sni,
+                               route_mode=(
+                                   "reality-direct"
+                                   if query.get("security", "").lower() == "reality"
+                                   else "sni"
+                               ))
         match = SPOOF_META_RE.fullmatch(fragment)
         if match:
             sequence, country_code, latency_ms = match.groups()
@@ -335,26 +370,63 @@ def verified_profiles() -> list[ProxyProfile]:
 
 def parse_outbound(profile: ProxyProfile) -> dict:
     parsed = urllib.parse.urlsplit(profile.source_uri)
-    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    query = {
+        str(key).lower(): str(value)
+        for key, value in urllib.parse.parse_qsl(
+            parsed.query, keep_blank_values=True
+        )
+    }
     host = parsed.hostname or profile.config_host
-    sni = next((query.get(k, "") for k in ("sni", "serverName", "servername", "host", "authority") if query.get(k)), host)
+    sni = next((
+        query.get(key, "") for key in (
+            "sni", "servername", "host", "authority"
+        ) if query.get(key)
+    ), host)
     host_header = query.get("host") or query.get("authority") or sni or profile.sni
     path = query.get("path") or "/"
     if not path.startswith("/"):
         path = "/" + path
-    network = (query.get("type") or "ws").lower()
-    if network not in {"ws", "httpupgrade"}:
-        network = "ws"
+    security = (query.get("security") or "tls").strip().lower()
+    network = (
+        query.get("type") or query.get("network")
+        or ("raw" if security == "reality" else "ws")
+    ).strip().lower()
+    if network == "tcp":
+        network = "raw"
     try:
-        alter_id = max(0, int(query.get("aid") or query.get("alterId") or 0))
+        alter_id = max(0, int(query.get("aid") or query.get("alterid") or 0))
     except (TypeError, ValueError):
         alter_id = 0
+    alpn = [
+        value.strip()
+        for value in (query.get("alpn") or "").split(",")
+        if value.strip()
+    ]
+    insecure = str(
+        query.get("allowinsecure") or query.get("insecure") or ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     return {
         "protocol": parsed.scheme.lower(), "user": urllib.parse.unquote(parsed.username or ""),
         "host": host, "port": parsed.port or 443, "sni": sni, "host_header": host_header,
         "path": path, "network": network, "fingerprint": query.get("fp") or query.get("fingerprint") or "",
-        "pinned": query.get("pinnedPeerCertSha256") or query.get("pcs") or "",
-        "verify_name": query.get("verifyPeerCertByName") or query.get("vcn") or "",
+        "pinned": query.get("pinnedpeercertsha256") or query.get("pcs") or "",
+        "verify_name": query.get("verifypeercertbyname") or query.get("vcn") or "",
         "alter_id": alter_id,
         "user_security": query.get("scy") or query.get("cipher") or "auto",
+        "security": security,
+        "flow": query.get("flow") or "",
+        "encryption": query.get("encryption") or "none",
+        "reality_public_key": (
+            query.get("pbk") or query.get("publickey")
+            or query.get("password") or ""
+        ),
+        "reality_short_id": query.get("sid") or query.get("shortid") or "",
+        "reality_spider_x": query.get("spx") or query.get("spiderx") or "",
+        "service_name": query.get("servicename") or "",
+        "authority": query.get("authority") or "",
+        "mode": query.get("mode") or "",
+        "extra": query.get("extra") or "",
+        "header_type": query.get("headertype") or "none",
+        "alpn": alpn,
+        "insecure": insecure,
     }

@@ -4,6 +4,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from uac_desktop.engine import build_xray_config
 from uac_desktop.models import Tuning, parse_many
 from uac_desktop.sni_batch import (
@@ -29,6 +31,79 @@ TROJAN_URI = (
     "?security=tls&sni=trojan.example&type=ws&host=trojan.example&path=/"
     "#Trojan"
 )
+
+
+@pytest.mark.parametrize(
+    ("network", "settings_key"),
+    [("grpc", "grpcSettings"), ("tcp", "rawSettings")],
+)
+def test_reality_xray_config_preserves_transport_and_credentials(
+        network, settings_key):
+    uri = (
+        "vless://33333333-3333-4333-8333-333333333333@reality.example:443"
+        f"?security=reality&type={network}&sni=cover.example&fp=firefox"
+        "&pbk=xRD8N2qL8TcYKc7iQQuaqoZS_2dYsiNRmL3CdW8ZtgM&sid=01234567&spx=%2Fedge"
+        "&serviceName=maker&flow=xtls-rprx-vision#Reality"
+    )
+    profile = parse_many(uri)[0]
+
+    config = build_xray_config(profile, tuning=Tuning(xray_mux_enabled=True))
+    outbound = config["outbounds"][0]
+    stream = outbound["streamSettings"]
+
+    assert stream["security"] == "reality"
+    assert stream["network"] == ("raw" if network == "tcp" else network)
+    assert stream["realitySettings"] == {
+        "serverName": "cover.example",
+        "fingerprint": "firefox",
+        "publicKey": "xRD8N2qL8TcYKc7iQQuaqoZS_2dYsiNRmL3CdW8ZtgM",
+        "shortId": "01234567",
+        "spiderX": "/edge",
+    }
+    assert settings_key in stream
+    assert outbound["settings"]["vnext"][0]["users"][0]["flow"] == (
+        "xtls-rprx-vision"
+    )
+    assert "mux" not in outbound
+
+
+@pytest.mark.parametrize(
+    ("network", "settings_key"),
+    [
+        ("grpc", "grpcSettings"),
+        ("xhttp", "xhttpSettings"),
+        ("tcp", "rawSettings"),
+    ],
+)
+def test_tls_extended_transport_xray_fields(network, settings_key):
+    uri = (
+        "trojan://secret@transport.example:443"
+        f"?security=tls&type={network}&sni=cover.example"
+        "&host=host.example&path=%2Fedge&serviceName=maker"
+        "&authority=authority.example&mode=auto&headerType=none"
+        f"#{network}"
+    )
+    profile = parse_many(uri)[0]
+
+    config = build_xray_config(profile, tuning=Tuning(xray_mux_enabled=False))
+    stream = config["outbounds"][0]["streamSettings"]
+
+    assert stream["security"] == "tls"
+    assert stream["network"] == ("raw" if network == "tcp" else network)
+    assert settings_key in stream
+    if network == "grpc":
+        assert stream[settings_key] == {
+            "serviceName": "maker",
+            "authority": "authority.example",
+        }
+    elif network == "xhttp":
+        assert stream[settings_key] == {
+            "path": "/edge",
+            "host": "host.example",
+            "mode": "auto",
+        }
+    else:
+        assert stream[settings_key] == {"header": {"type": "none"}}
 
 
 def test_vmess_uri_is_supported_by_parser_and_xray_builder():
@@ -71,6 +146,100 @@ def test_batch_xray_config_maps_every_http_inbound_to_one_profile():
         )[0]
         assert endpoint["address"] == "127.0.0.1"
         assert endpoint["port"] == relay_port
+
+
+def test_batch_xray_config_direct_reality_keeps_original_endpoint():
+    direct = parse_many(
+        "vless://33333333-3333-4333-8333-333333333333@reality.example:443"
+        "?security=reality&type=grpc&sni=cover.example&fp=chrome"
+        "&pbk=xRD8N2qL8TcYKc7iQQuaqoZS_2dYsiNRmL3CdW8ZtgM&sid=01234567&serviceName=maker#Reality"
+    )[0]
+    direct.route_mode = "reality-direct"
+    converted = parse_many(VLESS_URI)[0]
+
+    config = build_batch_xray_config(
+        [direct, converted], [23001, 23002], [None, 41443],
+        Tuning(xray_mux_enabled=False),
+    )
+
+    direct_endpoint = config["outbounds"][0]["settings"]["vnext"][0]
+    converted_endpoint = config["outbounds"][1]["settings"]["vnext"][0]
+    assert direct_endpoint["address"] == "reality.example"
+    assert direct_endpoint["port"] == 443
+    assert converted_endpoint["address"] == "127.0.0.1"
+    assert converted_endpoint["port"] == 41443
+
+
+def test_batch_tester_direct_reality_does_not_start_pattern(
+        monkeypatch, tmp_path):
+    direct = parse_many(
+        "vless://33333333-3333-4333-8333-333333333333@reality.example:443"
+        "?security=reality&type=grpc&sni=cover.example&fp=chrome"
+        "&pbk=xRD8N2qL8TcYKc7iQQuaqoZS_2dYsiNRmL3CdW8ZtgM&sid=01234567&serviceName=maker#Reality"
+    )[0]
+    direct.route_mode = "reality-direct"
+    captured_config = {}
+
+    class Process:
+        returncode = None
+        stdout = None
+
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None if not self.terminated else 0
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            self.terminated = True
+            self.returncode = -9
+
+    process = Process()
+
+    def start_xray(tester, config_path, _cancel=None):
+        captured_config.update(__import__("json").loads(
+            config_path.read_text(encoding="utf-8")
+        ))
+        tester._process = process
+        return process
+
+    monkeypatch.setattr("uac_desktop.sni_batch.DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        "uac_desktop.sni_batch.PatternSniCore",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("Reality direct must not start Pattern")
+        ),
+    )
+    monkeypatch.setattr(SniBatchTester, "_start_xray", start_xray)
+    monkeypatch.setattr(
+        SniBatchTester, "_wait_ready",
+        staticmethod(lambda _process, _ports, timeout=5.0: None),
+    )
+    monkeypatch.setattr(
+        "uac_desktop.sni_batch._probe_proxy",
+        lambda profile, _port, _timeout, _cancel: LiveConfigResult(
+            profile=profile, ok=True, ping_ms=25,
+            country_code="JP", country="Japan",
+            exit_ip="203.0.113.8", source="test",
+        ),
+    )
+
+    results = SniBatchTester().run(
+        [direct], Tuning(), threading.Event(), workers=1, timeout=1
+    )
+
+    endpoint = captured_config["outbounds"][0]["settings"]["vnext"][0]
+    assert endpoint["address"] == "reality.example"
+    assert endpoint["port"] == 443
+    assert results[0].ok is True
+    assert process.terminated is True
 
 
 def test_batch_tester_starts_one_relay_per_remote_port_and_cleans_up(

@@ -811,9 +811,15 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         settings = {"servers": [{"address": upstream_address or parsed["host"],
                                   "port": parsed["port"], "password": parsed["user"]}]}
     elif parsed["protocol"] == "vless":
+        user = {
+            "id": parsed["user"],
+            "encryption": parsed["encryption"],
+        }
+        if parsed["flow"]:
+            user["flow"] = parsed["flow"]
         settings = {"vnext": [{"address": upstream_address or parsed["host"],
                                "port": parsed["port"],
-                               "users": [{"id": parsed["user"], "encryption": "none"}]}]}
+                               "users": [user]}]}
     elif parsed["protocol"] == "vmess":
         settings = {"vnext": [{"address": upstream_address or parsed["host"],
                                "port": parsed["port"],
@@ -822,25 +828,71 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
                                           "security": parsed["user_security"]}]}]}
     else:
         raise ValueError(f"Unsupported protocol: {parsed['protocol']}")
-    tls = {"serverName": parsed["sni"]}
-    if tuning.carrier_mode == "mci" and parsed["network"] in {"ws", "httpupgrade"}:
-
-
-        tls["alpn"] = ["http/1.1"]
-    if parsed["fingerprint"]:
-        tls["fingerprint"] = parsed["fingerprint"]
-    if parsed["pinned"]:
-        tls["pinnedPeerCertSha256"] = parsed["pinned"]
-    if parsed["verify_name"]:
-        tls["verifyPeerCertByName"] = parsed["verify_name"]
-    elif parsed["sni"].lower() != parsed["host_header"].lower():
-        tls["verifyPeerCertByName"] = f"{parsed['host_header']},{parsed['sni']}"
-    stream = {"network": parsed["network"], "security": "tls", "tlsSettings": tls}
+    stream = {
+        "network": parsed["network"],
+        "security": parsed["security"],
+    }
+    if parsed["security"] == "reality":
+        reality = {
+            "serverName": parsed["sni"],
+            "fingerprint": parsed["fingerprint"] or "chrome",
+            "publicKey": parsed["reality_public_key"],
+            "shortId": parsed["reality_short_id"],
+            "spiderX": parsed["reality_spider_x"],
+        }
+        stream["realitySettings"] = reality
+    elif parsed["security"] == "tls":
+        tls = {
+            "serverName": parsed["sni"],
+            "allowInsecure": parsed["insecure"],
+        }
+        if tuning.carrier_mode == "mci" and parsed["network"] in {
+                "ws", "httpupgrade"}:
+            tls["alpn"] = ["http/1.1"]
+        elif parsed["alpn"]:
+            tls["alpn"] = parsed["alpn"]
+        if parsed["fingerprint"]:
+            tls["fingerprint"] = parsed["fingerprint"]
+        if parsed["pinned"]:
+            tls["pinnedPeerCertSha256"] = parsed["pinned"]
+        if parsed["verify_name"]:
+            tls["verifyPeerCertByName"] = parsed["verify_name"]
+        elif parsed["sni"].lower() != parsed["host_header"].lower():
+            tls["verifyPeerCertByName"] = (
+                f"{parsed['host_header']},{parsed['sni']}"
+            )
+        stream["tlsSettings"] = tls
     if parsed["network"] == "httpupgrade":
         stream["httpupgradeSettings"] = {"path": parsed["path"], "host": parsed["host_header"]}
-    else:
+    elif parsed["network"] == "ws":
         stream["wsSettings"] = {"path": parsed["path"], "host": parsed["host_header"],
                                 "headers": {"Host": parsed["host_header"]}}
+    elif parsed["network"] == "grpc":
+        grpc = {"serviceName": parsed["service_name"]}
+        if parsed["authority"]:
+            grpc["authority"] = parsed["authority"]
+        stream["grpcSettings"] = grpc
+    elif parsed["network"] == "xhttp":
+        xhttp = {
+            "path": parsed["path"],
+            "host": parsed["host_header"],
+        }
+        if parsed["mode"]:
+            xhttp["mode"] = parsed["mode"]
+        if parsed["extra"]:
+            try:
+                extra = json.loads(parsed["extra"])
+            except (TypeError, ValueError):
+                extra = None
+            if isinstance(extra, dict):
+                xhttp["extra"] = extra
+        stream["xhttpSettings"] = xhttp
+    elif parsed["network"] == "raw":
+        stream["rawSettings"] = {
+            "header": {"type": parsed["header_type"] or "none"}
+        }
+    else:
+        raise ValueError(f"Unsupported transport: {parsed['network']}")
     rules = [{"type": "field", "network": "udp", "port": "443", "outboundTag": "block"}]
 
     if bypass_processes:
@@ -855,7 +907,10 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         "tag": "proxy", "protocol": parsed["protocol"], "settings": settings,
         "streamSettings": stream,
     }
-    if bool(tuning.xray_mux_enabled):
+    if (
+            bool(tuning.xray_mux_enabled)
+            and parsed["security"] != "reality"
+            and not parsed["flow"]):
         proxy_outbound["mux"] = {
             "enabled": True,
 
@@ -1527,9 +1582,15 @@ class Engine:
                 raise ValueError("Selected config has no VLESS/Trojan URI")
             self._log_level = tuning.log_level
             self._bypass_processes = list(bypass_processes or [])
+            parsed_outbound = parse_outbound(profile)
+            direct_reality = (
+                profile.route_mode == "reality-direct"
+                or parsed_outbound["security"] == "reality"
+            )
             upstream_address = resolve_xray_upstream(profile)
             self._check_cancel(cancel_event)
-            self.fragment.start(profile, tuning, strategy_override)
+            if not direct_reality:
+                self.fragment.start(profile, tuning, strategy_override)
             try:
                 self._check_cancel(cancel_event)
                 config = build_xray_config(

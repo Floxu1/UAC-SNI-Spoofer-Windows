@@ -169,7 +169,7 @@ def main() -> None:
     version = {}
     exec((stage_source / "uac_desktop" / "__init__.py").read_text(encoding="utf-8"), version)
     current = version["__version__"]
-    portable_zip = STAGE / f"UAC-Spoofer-Desktop-v{current}-Windows-x64.zip"
+    portable_zip = STAGE / f"UAC-Spoofer-Desktop-v{current}-Windows-x64-portable.zip"
     source_zip = STAGE / f"UAC-Spoofer-Desktop-v{current}-Source.zip"
     zip_tree(stage_portable, portable_zip)
     zip_tree(stage_source, source_zip)

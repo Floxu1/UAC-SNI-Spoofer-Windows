@@ -293,6 +293,30 @@ def test_auto_user_config_uses_only_verified_profiles(monkeypatch):
     assert ordered == [healthy]
 
 
+def test_auto_user_config_accepts_verified_reality_route(monkeypatch):
+    reality = profile(
+        "healthy-reality",
+        origin=USER_CONFIG_ORIGIN,
+        country="DE",
+        verified=False,
+        ping=52,
+    )
+    reality.route_mode = "reality-direct"
+    reality.verified_route = True
+    storage = StorageStub([reality])
+    dummy = routing_dummy(storage, source_index=1)
+    monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 10.0))
+
+    ordered = MainWindow._ordered_profiles(
+        dummy,
+        reality.sni,
+        threading.Event(),
+        auto_enabled=True,
+    )
+
+    assert ordered == [reality]
+
+
 def test_auto_user_config_never_falls_back_to_unverified_profiles(monkeypatch):
     unverified = profile(
         "untested-user-config",

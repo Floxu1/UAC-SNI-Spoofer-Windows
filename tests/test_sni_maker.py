@@ -262,27 +262,96 @@ def test_vmess_uri_style_is_rejected_by_sni_maker():
     assert imported.unsupported_by_protocol == {"vmess": 1}
 
 
-@pytest.mark.parametrize(
-    ("uri", "error"),
-    [
-        (
+def test_reality_config_is_excluded_from_sni_candidates():
+    uri = (
+        "vless://7b81d175-d180-4ec8-bbc5-dfe80e8d3b68@22.27.26.51:443"
+        "?type=grpc&headerType=none&security=reality&encryption=none"
+        "&sni=drafttest-rrew.ru&fp=firefox&pbk=xRD8N2qL8TcYKc7iQQuaqoZS_2dYsiNRmL3CdW8ZtgM"
+        "&sid=d9662905&serviceName=nexusGrpc&spx=%2Fedge"
+        "#Japan%20MIFA"
+    )
+    source = _profile(uri)
+
+    result = convert_to_sni(source)
+
+    assert result.status == "incompatible"
+    assert result.success is False
+    assert result.profile is None
+    assert result.error == "Unsupported security: reality"
+
+
+def test_saved_reality_profile_without_route_metadata_is_migrated():
+    profile = ProxyProfile.from_dict({
+        "source_uri": (
             "vless://00000000-0000-0000-0000-000000000001@one.example:443"
-            "?security=reality&type=ws&sni=one.example",
-            "Unsupported security: reality",
+            "?security=reality&type=tcp&sni=cover.example"
         ),
-        (
-            "trojan://secret@one.example:443"
-            "?security=tls&type=grpc&sni=one.example",
-            "Unsupported transport: grpc",
-        ),
-    ],
-)
-def test_incompatible_engine_transports_are_reported(uri, error):
+    })
+
+    assert profile.route_mode == "reality-direct"
+
+
+@pytest.mark.parametrize("network", ["grpc", "xhttp", "tcp", "httpupgrade"])
+def test_tls_extended_transports_are_convertible_without_query_loss(network):
+    uri = (
+        "trojan://secret@one.example:8443/original"
+        f"?security=tls&type={network}&sni=route.example"
+        "&host=edge.example&path=%2Fedge%3Fa%3D1&serviceName=maker"
+        "#Extended%20Transport"
+    )
+
+    result = convert_to_sni(_profile(uri))
+
+    assert result.status == "converted"
+    assert result.success is True
+    assert result.profile is not None
+    before = urllib.parse.urlsplit(uri)
+    after = urllib.parse.urlsplit(result.profile.source_uri)
+    assert after.hostname == "127.0.0.1"
+    assert after.port == 40443
+    assert after.path == before.path
+    assert after.query == before.query
+    assert after.fragment == before.fragment
+
+
+def test_security_none_remains_incompatible():
+    uri = (
+        "vless://00000000-0000-0000-0000-000000000001@one.example:80"
+        "?security=none&type=tcp&encryption=none#Plain"
+    )
+
     result = convert_to_sni(_profile(uri))
 
     assert result.status == "incompatible"
+    assert result.success is False
     assert result.profile is None
-    assert result.error == error
+    assert result.error == "Unsupported security: none"
+
+
+def test_conversion_batch_keeps_only_sni_candidates():
+    reality = _profile(
+        "vless://00000000-0000-0000-0000-000000000001@reality.example:443"
+        "?security=reality&type=grpc&sni=cover.example&fp=chrome"
+        "&pbk=xRD8N2qL8TcYKc7iQQuaqoZS_2dYsiNRmL3CdW8ZtgM&sid=01234567&serviceName=maker#Reality"
+    )
+    grpc_tls = _profile(
+        "trojan://secret@grpc.example:443"
+        "?security=tls&type=grpc&sni=grpc.example&serviceName=maker#TLS"
+    )
+    plain = _profile(
+        "vless://00000000-0000-0000-0000-000000000002@plain.example:80"
+        "?security=none&type=tcp#Plain"
+    )
+
+    batch = SniConfigMaker().convert_many([reality, grpc_tls, plain])
+
+    assert [result.status for result in batch.results] == [
+        "incompatible",
+        "converted",
+        "incompatible",
+    ]
+    assert [result.success for result in batch.results] == [False, True, False]
+    assert batch.profiles == [batch.results[1].profile]
 
 
 def test_file_and_github_blob_url_import(tmp_path):

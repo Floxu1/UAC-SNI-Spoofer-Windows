@@ -16,7 +16,7 @@ from typing import Callable
 import requests
 
 from .engine import Engine, build_xray_config
-from .models import ProxyProfile, Tuning
+from .models import ProxyProfile, Tuning, parse_outbound
 from .paths import BIN, DATA_DIR
 from .pattern_core.core import PatternSniCore
 from .sni_maker import ISO2_CODES
@@ -60,11 +60,13 @@ def _reserve_local_ports(count: int) -> list[tuple[int, socket.socket]]:
 
 def build_batch_xray_config(
         profiles: list[ProxyProfile], proxy_ports: list[int],
-        relay_port: int | list[int], tuning: Tuning) -> dict:
+        relay_port: int | None | list[int | None], tuning: Tuning) -> dict:
     relay_ports = (
-        [int(value) for value in relay_port]
+        [None if value is None else int(value) for value in relay_port]
         if isinstance(relay_port, (list, tuple))
-        else [int(relay_port)] * len(profiles)
+        else [
+            None if relay_port is None else int(relay_port)
+        ] * len(profiles)
     )
     if len(relay_ports) != len(profiles):
         raise ValueError("Relay port count does not match profile count")
@@ -83,7 +85,10 @@ def build_batch_xray_config(
             "settings": {"allowTransparent": False},
         })
         config = build_xray_config(
-            profile, tuning=tuning, upstream_address="127.0.0.1"
+            profile, tuning=tuning,
+            upstream_address=(
+                "127.0.0.1" if target_relay is not None else None
+            ),
         )
         outbound = config["outbounds"][0]
         outbound["tag"] = outbound_tag
@@ -91,8 +96,9 @@ def build_batch_xray_config(
                      or outbound["settings"].get("vnext") or [])
         if not endpoints:
             raise ValueError(f"Missing outbound endpoint for {profile.name}")
-        endpoints[0]["address"] = "127.0.0.1"
-        endpoints[0]["port"] = int(target_relay)
+        if target_relay is not None:
+            endpoints[0]["address"] = "127.0.0.1"
+            endpoints[0]["port"] = int(target_relay)
         outbounds.append(outbound)
         rules.append({
             "type": "field",
@@ -309,7 +315,18 @@ class SniBatchTester:
         remote_ports = [int(profile.port or 443) for profile in supported]
         if any(port < 1 or port > 65535 for port in remote_ports):
             raise ValueError("SNI Maker profile has an invalid remote port")
-        unique_remote_ports = list(dict.fromkeys(remote_ports))
+        direct_routes = [
+            (
+                profile.route_mode == "reality-direct"
+                or parse_outbound(profile)["security"] == "reality"
+            )
+            for profile in supported
+        ]
+        unique_remote_ports = list(dict.fromkeys(
+            remote_port
+            for remote_port, direct in zip(remote_ports, direct_routes)
+            if not direct
+        ))
         reservations = _reserve_local_ports(
             len(supported) + len(unique_remote_ports)
         )
@@ -323,7 +340,8 @@ class SniBatchTester:
             )
         }
         profile_relay_ports = [
-            relay_by_remote_port[remote_port] for remote_port in remote_ports
+            None if direct else relay_by_remote_port[remote_port]
+            for remote_port, direct in zip(remote_ports, direct_routes)
         ]
         probe_tuning = Tuning.from_dict(tuning.to_dict())
         probe_tuning.pattern_max_sessions = workers

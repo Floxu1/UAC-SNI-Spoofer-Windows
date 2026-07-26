@@ -26,7 +26,7 @@ if (Test-Path -LiteralPath $outputFull) {
 }
 New-Item -ItemType Directory -Path $outputFull | Out-Null
 
-$assetName = "UAC-Spoofer-Desktop-v$version-Windows-x64.zip"
+$assetName = "UAC-Spoofer-Desktop-v$version-Windows-x64-portable.zip"
 $assetPath = Join-Path $outputFull $assetName
 Compress-Archive -LiteralPath $distFull -DestinationPath $assetPath -CompressionLevel Optimal
 

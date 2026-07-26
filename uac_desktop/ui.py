@@ -1548,6 +1548,7 @@ class ProfileDialog(QDialog):
         out.name = self.name.text().strip() or source.name
         out.source_uri = source.source_uri; out.protocol = source.protocol
         out.config_host = source.config_host; out.config_port = source.config_port
+        out.route_mode = source.route_mode
         out.address = address; out.fallback_address = fallback_address
         out.port = port; out.sni = sni; out.method = method
         out.origin = self.profile.origin if self.profile else "user"
@@ -1557,6 +1558,7 @@ class ProfileDialog(QDialog):
             out.country_code = ""
             out.country_latency_ms = 0
             out.verified_spoof = False
+            out.verified_route = False
             out.rotating_exit = False
             out.observed_exit_ip = ""
             out.observed_country_code = ""
@@ -3532,7 +3534,10 @@ class MainWindow(QMainWindow):
             )
         ]
         if verified_only:
-            profiles = [profile for profile in profiles if profile.verified_spoof]
+            profiles = [
+                profile for profile in profiles
+                if profile.route_is_verified
+            ]
         return profiles
 
     def _country_metadata(self, code):
@@ -3859,6 +3864,8 @@ class MainWindow(QMainWindow):
         self.refresh_profiles()
 
     def _effective_profile_fake_sni(self, profile, carrier=None):
+        if profile.route_mode == "reality-direct":
+            return str(profile.sni or "").strip()
         carrier = carrier or self.storage.tuning.carrier_mode
         settings = self.storage.settings
         scoped_pins = settings.get("pattern_profile_sni_pins_by_carrier", {})
@@ -3881,7 +3888,11 @@ class MainWindow(QMainWindow):
         if profile is None:
             return ""
         fake_sni = self._effective_profile_fake_sni(profile, carrier)
-        return f"{profile.target_label}\nFake SNI {fake_sni}"
+        label = (
+            "Reality SNI"
+            if profile.route_mode == "reality-direct" else "Fake SNI"
+        )
+        return f"{profile.target_label}\n{label} {fake_sni}"
 
     def _attach_profile_row(self, widget, item, profile, text, icon):
         active = profile.id == self.storage.selected_id
@@ -4053,7 +4064,7 @@ class MainWindow(QMainWindow):
             ))
             item_icon = (
                 country_flag_icon(profile.country_code, 30, 20)
-                if profile.verified_spoof else
+                if profile.route_is_verified else
                 cyber_icon("file-cog" if profile.origin == "user" else "server", "#23f5e0" if profile.id == self.storage.selected_id else "#6f91b5", 20)
             )
             item.setIcon(item_icon)
@@ -4297,32 +4308,25 @@ class MainWindow(QMainWindow):
         for result in converted.results:
             profile = result.profile
             if profile is None:
-                raw = result.source_profile.source_uri
-                key = f"rejected:{config_signature(raw)}"
-                if self.maker_model.row_for_key(key) < 0:
-                    rows.append({
-                        "key": key,
-                        "uri": raw,
-                        "source_uri": raw,
-                        "status": "skipped",
-                        "country_code": "XX",
-                        "label": result.source_profile.name,
-                        "error": result.error or "Incompatible with SNI mode",
-                    })
                 continue
             key = config_signature(profile)
             if key in self._maker_profiles:
                 duplicate_existing += 1
                 continue
-            profile.address = VERIFIED_SPOOF_EDGE
-            profile.config_host = "127.0.0.1"
-            profile.config_port = 40443
-            profile.origin = USER_CONFIG_ORIGIN
-            profile.spoof_fake_sni = (
-                profile.spoof_fake_sni
-                or self.storage.tuning.pattern_fake_sni
-            )
+            if result.direct:
+                profile.origin = USER_CONFIG_ORIGIN
+                profile.spoof_fake_sni = ""
+            else:
+                profile.address = VERIFIED_SPOOF_EDGE
+                profile.config_host = "127.0.0.1"
+                profile.config_port = 40443
+                profile.origin = USER_CONFIG_ORIGIN
+                profile.spoof_fake_sni = (
+                    profile.spoof_fake_sni
+                    or self.storage.tuning.pattern_fake_sni
+                )
             profile.verified_spoof = False
+            profile.verified_route = False
             self._maker_profiles[key] = profile
             base_name = profile.name
             if base_name.endswith(" · SNI"):
@@ -4333,24 +4337,11 @@ class MainWindow(QMainWindow):
                 "key": key,
                 "uri": profile.source_uri,
                 "source_uri": result.source_profile.source_uri,
-                "status": "ready" if result.already_sni else "converted",
+                "status": "ready" if (
+                    result.already_sni or result.direct
+                ) else "converted",
                 "country_code": "XX",
                 "label": profile.name,
-            })
-        for raw in imported.unsupported_uris:
-            key = f"unsupported:{config_signature(raw)}"
-            if self.maker_model.row_for_key(key) >= 0 or any(
-                    row.get("key") == key for row in rows):
-                continue
-            protocol = raw.split("://", 1)[0].upper()
-            rows.append({
-                "key": key,
-                "uri": raw,
-                "source_uri": raw,
-                "status": "skipped",
-                "country_code": "XX",
-                "label": protocol,
-                "error": f"Unsupported protocol: {protocol}",
             })
         self._maker.add_profiles(added_profiles, source=str(meta.get("source", "")))
         self.maker_model.append_batch(rows, deduplicate=True)
@@ -4496,15 +4487,22 @@ class MainWindow(QMainWindow):
                 profile.observed_exit_ip = result.exit_ip
                 profile.country_verified_at = now
                 profile.country_source = result.source
-                profile.verified_spoof = True
-                profile.origin = USER_CONFIG_ORIGIN
+                direct = profile.route_mode == "reality-direct"
+                profile.verified_route = direct
+                profile.verified_spoof = not direct
+                profile.origin = (
+                    USER_CONFIG_ORIGIN
+                )
                 profile.spoof_fake_sni = (
-                    profile.spoof_fake_sni
-                    or self.storage.tuning.pattern_fake_sni
+                    "" if direct else (
+                        profile.spoof_fake_sni
+                        or self.storage.tuning.pattern_fake_sni
+                    )
                 )
                 country = result.country or verified_code
                 base_name = self._maker_base_names.get(key, profile.name)
-                profile.name = f"{country} · {base_name} · SNI"
+                route_label = "Reality" if direct else "SNI"
+                profile.name = f"{country} · {base_name} · {route_label}"
                 self._maker_country_labels[verified_code] = country
                 updates.append({
                     "key": key,
@@ -4518,13 +4516,21 @@ class MainWindow(QMainWindow):
                 profile.last_ping_ok = False
                 profile.last_ping_ms = 0.0
                 profile.verified_spoof = False
+                profile.verified_route = False
                 profile.country_code = ""
                 profile.observed_country_code = ""
                 profile.observed_country_name = ""
                 profile.observed_exit_ip = ""
                 profile.country_verified_at = 0.0
                 profile.country_source = ""
-                profile.name = f"{self._maker_base_names.get(key, profile.name)} · SNI"
+                route_label = (
+                    "Reality"
+                    if profile.route_mode == "reality-direct" else "SNI"
+                )
+                profile.name = (
+                    f"{self._maker_base_names.get(key, profile.name)}"
+                    f" · {route_label}"
+                )
                 updates.append({
                     "key": key,
                     "status": "failed",
@@ -4566,7 +4572,7 @@ class MainWindow(QMainWindow):
                     continue
                 updates.append({
                     "key": key,
-                    "status": "healthy" if profile.verified_spoof else "ready",
+                    "status": "healthy" if profile.route_is_verified else "ready",
                     "country_code": profile.observed_country_code or "XX",
                     "ping_ms": profile.last_ping_ms if profile.last_ping_ok else None,
                     "error": "",
@@ -4718,7 +4724,7 @@ class MainWindow(QMainWindow):
         duplicate_count = 0
         for result in results:
             profile = self._maker_profiles.get(result.key)
-            if profile is None or not profile.verified_spoof:
+            if profile is None or not profile.route_is_verified:
                 continue
             signature = config_signature(profile)
             if signature in existing:
@@ -5181,6 +5187,9 @@ class MainWindow(QMainWindow):
 
     def _profile_sni_candidates(self, profile, carrier=None, limit=3):
         carrier = carrier or self.storage.tuning.carrier_mode
+        if profile.route_mode == "reality-direct":
+            reality_sni = str(profile.sni or "").strip().lower()
+            return [reality_sni] if reality_sni else []
         candidates = self._sni_candidates(profile, carrier, limit)
         fallback = str(getattr(profile, "spoof_fake_sni", "") or "").strip().lower()
         if fallback and fallback not in candidates:
@@ -5223,7 +5232,10 @@ class MainWindow(QMainWindow):
             candidates = MainWindow._country_profiles(self, country_code)
         else:
             source_profiles = self._route_source_profiles()
-            verified = [profile for profile in source_profiles if profile.verified_spoof]
+            verified = [
+                profile for profile in source_profiles
+                if profile.route_is_verified
+            ]
             candidates = (
                 verified
                 if self._selected_route_source() == "user-config"
@@ -5245,7 +5257,7 @@ class MainWindow(QMainWindow):
         for profile in candidates:
             if not (
                     profile.origin == USER_CONFIG_ORIGIN
-                    and profile.verified_spoof and profile.last_ping_ok):
+                    and profile.route_is_verified and profile.last_ping_ok):
                 profile.last_ping_ok = ok
                 profile.last_ping_ms = latency
         self.storage.save_profiles()
@@ -5632,8 +5644,25 @@ class MainWindow(QMainWindow):
                      if seed_profile is not None else
                      self._sni_candidates(None, carrier=carrier))
         if not seed_snis and country_profiles:
-            seed_snis = [next((profile.spoof_fake_sni for profile in country_profiles
-                               if profile.spoof_fake_sni), VERIFIED_SPOOF_FAKE_SNI)]
+            seed_snis = [next((
+                profile.sni
+                if profile.route_mode == "reality-direct"
+                else profile.spoof_fake_sni
+                for profile in country_profiles
+                if (
+                    profile.sni
+                    if profile.route_mode == "reality-direct"
+                    else profile.spoof_fake_sni
+                )
+            ), VERIFIED_SPOOF_FAKE_SNI)]
+        if not seed_snis:
+            direct_seed = next((
+                profile.sni
+                for profile in self._route_source_profiles(verified_only=True)
+                if profile.route_mode == "reality-direct" and profile.sni
+            ), "")
+            if direct_seed:
+                seed_snis = [direct_seed]
         if not seed_snis:
             message = self.tr("هیچ SNI معتبر در مخزن اسکن پیدا نشد", "No valid SNI was found in the scan repository")
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
@@ -5750,7 +5779,7 @@ class MainWindow(QMainWindow):
                                     self.bridge.log.emit("MUX FALLBACK WIN; Mux disabled for this working route")
                             if self._attempt_cancelled(generation, cancel):
                                 raise EngineCancelled("Connection attempt cancelled")
-                            if page_ok and profile.verified_spoof:
+                            if page_ok and profile.route_is_verified:
                                 self.bridge.activity.emit(self.tr(
                                     "در حال بررسی کشور واقعی آی‌پی خروجی…",
                                     "Verifying the real exit-IP country…",
