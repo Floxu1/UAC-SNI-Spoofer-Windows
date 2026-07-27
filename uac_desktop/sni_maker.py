@@ -341,9 +341,21 @@ def _compatibility_error(profile: ProxyProfile) -> str:
             str(key).lower(): str(value)
             for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         }
+        credential = urllib.parse.unquote(parsed.username or "").strip()
+        if protocol == "vless" and not credential:
+            return "Missing VLESS UUID"
+        elif protocol == "trojan" and not credential:
+            return "Missing Trojan password"
         security = query.get("security", "").strip().lower()
         if security not in {"", "tls"}:
             return f"Unsupported security: {security}"
+        insecure = (
+            query.get("allowinsecure")
+            or query.get("insecure")
+            or ""
+        ).strip().lower()
+        if insecure in {"1", "true", "yes", "on"}:
+            return "Unsupported insecure TLS option"
         network = (
             query.get("type") or query.get("network")
             or "ws"

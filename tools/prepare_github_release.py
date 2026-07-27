@@ -132,6 +132,7 @@ def main() -> None:
     for name in (
         "main.py",
         "README.md",
+        "README.en.md",
         "requirements.txt",
         "build.ps1",
         "install-engine.ps1",
@@ -153,6 +154,7 @@ def main() -> None:
         clean_powershell_comments(path)
 
     copy_item(ROOT / "README.md", STAGE / "README.md")
+    copy_item(ROOT / "README.en.md", STAGE / "README.en.md")
     copy_item(ROOT / "requirements.txt", STAGE / "requirements.txt")
     licenses = STAGE / "LICENSES"
     licenses.mkdir()

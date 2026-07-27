@@ -81,6 +81,29 @@ def profile_ping(address: str, port: int, sni: str, timeout: float = 4) -> tuple
                     pass
 
 
+def profile_real_delay(
+        address: str, port: int, sni: str,
+        timeout: float = 3) -> tuple[bool, float]:
+    started = time.perf_counter()
+    raw = None
+    wrapped = None
+    try:
+        raw = socket.create_connection((address, port), timeout=timeout)
+        raw.settimeout(timeout)
+        context = ssl.create_default_context()
+        wrapped = context.wrap_socket(raw, server_hostname=sni)
+        return True, max(1.0, (time.perf_counter() - started) * 1000)
+    except OSError:
+        return False, 0.0
+    finally:
+        for connection in (wrapped, raw):
+            if connection:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+
 def _trace_once(domain: str, timeout: float, edge_ip: str | None = None) -> dict:
     """Measure ``domain`` through an optional, explicit TLS edge.
 

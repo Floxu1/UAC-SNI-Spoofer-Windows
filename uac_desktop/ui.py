@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import concurrent.futures
 import ctypes
 import html
 import math
@@ -42,7 +43,7 @@ from .app_config import PROJECT_URL, SUGGESTED_CONFIGS_URL, UPDATE_REPOSITORY_UR
 from .engine import Engine, EngineCancelled, format_bytes, mci_quality_score
 from .models import ProxyProfile, Tuning, parse_many
 from .network import (GeoLocation, ScanResult, current_ip, current_location,
-                      profile_ping, scan_domains, tcp_ping)
+                      profile_ping, profile_real_delay, scan_domains, tcp_ping)
 from .paths import ASSETS, DATA_DIR, LOG_FILE
 from .sni_batch import LiveConfigResult, SniBatchTester
 from .sni_maker import (
@@ -238,6 +239,10 @@ class Bridge(QObject):
     update_failed = Signal(str, int, bool)
     proxy_mode_applied = Signal(bool, bool, str, int, int)
     tun_mode_applied = Signal(bool, bool, str, int, int)
+    gateway_mode_applied = Signal(bool, bool, str, int, int)
+    gateway_runtime_state = Signal(str, int, str)
+    gateway_devices_changed = Signal(object)
+    profile_pings_done = Signal(object, str, int)
 
 
 def _system_motion_enabled() -> bool:
@@ -588,13 +593,20 @@ class NavButton(QPushButton):
 
 
 class ToggleOptionFrame(QFrame):
-    def __init__(self, toggle, parent=None):
+    def __init__(self, toggle, parent=None, row_click_enabled=True):
         super().__init__(parent)
         self.toggle = toggle
-        self.setCursor(Qt.PointingHandCursor)
+        self.row_click_enabled = bool(row_click_enabled)
+        self.setCursor(
+            Qt.PointingHandCursor if self.row_click_enabled else Qt.ArrowCursor
+        )
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self.isEnabled():
+        if (
+            self.row_click_enabled
+            and event.button() == Qt.LeftButton
+            and self.isEnabled()
+        ):
             self.toggle.toggle()
             event.accept()
             return
@@ -669,6 +681,162 @@ class ToggleSwitch(QCheckBox):
             painter.setPen(QPen(QColor(44, 199, 255, 160), 1.4, Qt.DashLine))
             painter.setBrush(Qt.NoBrush)
             painter.drawRoundedRect(QRectF(.5, .5, 47, 25), 12, 12)
+
+
+class GatewayDevicesPopup(QFrame):
+    def __init__(self, language="fa", parent=None):
+        super().__init__(parent, Qt.Popup | Qt.FramelessWindowHint)
+        self.setObjectName("gatewayDevicesPopup")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setWindowOpacity(1.0)
+        self.setFixedWidth(340)
+        self.language = language
+        self.devices = {}
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 13, 14, 13)
+        root.setSpacing(9)
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.icon = QLabel()
+        self.icon.setObjectName("gatewayPopupIcon")
+        self.icon.setFixedSize(34, 34)
+        self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setPixmap(cyber_pixmap("network", "#75fff0", 18))
+        titles = QVBoxLayout()
+        titles.setContentsMargins(0, 0, 0, 0)
+        titles.setSpacing(1)
+        self.title = QLabel()
+        self.title.setObjectName("gatewayPopupTitle")
+        self.subtitle = QLabel()
+        self.subtitle.setObjectName("gatewayPopupSubtitle")
+        titles.addWidget(self.title)
+        titles.addWidget(self.subtitle)
+        self.count = QLabel()
+        self.count.setObjectName("gatewayPopupCount")
+        self.count.setAlignment(Qt.AlignCenter)
+        header.addWidget(self.icon)
+        header.addLayout(titles, 1)
+        header.addWidget(self.count)
+        root.addLayout(header)
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("gatewayDevicesScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.list_widget = QWidget()
+        self.list_widget.setObjectName("gatewayDevicesList")
+        self.list_layout = QVBoxLayout(self.list_widget)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.setSpacing(6)
+        self.scroll.setWidget(self.list_widget)
+        root.addWidget(self.scroll)
+        self.set_language(language)
+
+    @staticmethod
+    def _address_key(item):
+        address = str(item[0])
+        parts = address.split(".")
+        if len(parts) == 4 and all(part.isdigit() for part in parts):
+            return 0, tuple(int(part) for part in parts)
+        return 1, address.casefold()
+
+    def set_language(self, language):
+        self.language = "en" if language == "en" else "fa"
+        self.setLayoutDirection(
+            Qt.LeftToRight if self.language == "en" else Qt.RightToLeft
+        )
+        self._render()
+
+    def update_devices(self, devices):
+        self.devices = {
+            str(address): str(mac or "")
+            for address, mac in dict(devices or {}).items()
+        }
+        self._render()
+
+    def _clear_rows(self):
+        while self.list_layout.count():
+            item = self.list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _render(self):
+        if not hasattr(self, "list_layout"):
+            return
+        self._clear_rows()
+        count = len(self.devices)
+        if self.language == "en":
+            self.title.setText("Connected devices")
+            self.subtitle.setText("Mobile Gateway live list")
+            self.count.setText(f"{count} online")
+        else:
+            self.title.setText("دستگاه‌های متصل")
+            self.subtitle.setText("فهرست زنده درگاه موبایل")
+            self.count.setText(f"{count} متصل")
+        if not self.devices:
+            empty = QFrame()
+            empty.setObjectName("gatewayDeviceEmpty")
+            empty_layout = QVBoxLayout(empty)
+            empty_layout.setContentsMargins(12, 13, 12, 13)
+            empty_layout.setSpacing(5)
+            empty_icon = QLabel()
+            empty_icon.setAlignment(Qt.AlignCenter)
+            empty_icon.setPixmap(cyber_pixmap("wifi", "#6f91b5", 23))
+            empty_text = QLabel(
+                "No device detected yet"
+                if self.language == "en"
+                else "هنوز دستگاهی شناسایی نشده است"
+            )
+            empty_text.setObjectName("gatewayDeviceEmptyText")
+            empty_text.setAlignment(Qt.AlignCenter)
+            empty_text.setWordWrap(True)
+            empty_layout.addWidget(empty_icon)
+            empty_layout.addWidget(empty_text)
+            self.list_layout.addWidget(empty)
+            body_height = 86
+        else:
+            for address, mac in sorted(
+                    self.devices.items(), key=self._address_key):
+                row = QFrame()
+                row.setObjectName("gatewayDeviceRow")
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(10, 7, 10, 7)
+                row_layout.setSpacing(9)
+                check = QLabel()
+                check.setObjectName("gatewayDeviceCheck")
+                check.setFixedSize(25, 25)
+                check.setAlignment(Qt.AlignCenter)
+                check.setPixmap(cyber_pixmap("check-circle", "#23f5a6", 20))
+                details = QVBoxLayout()
+                details.setContentsMargins(0, 0, 0, 0)
+                details.setSpacing(1)
+                ip_label = QLabel(address)
+                ip_label.setObjectName("gatewayDeviceIp")
+                ip_label.setProperty("technical", True)
+                ip_label.setLayoutDirection(Qt.LeftToRight)
+                ip_label.setAlignment(
+                    Qt.AlignLeft | Qt.AlignAbsolute | Qt.AlignVCenter
+                )
+                mac_label = QLabel(mac or "—")
+                mac_label.setObjectName("gatewayDeviceMac")
+                mac_label.setProperty("technical", True)
+                mac_label.setLayoutDirection(Qt.LeftToRight)
+                mac_label.setAlignment(
+                    Qt.AlignLeft | Qt.AlignAbsolute | Qt.AlignVCenter
+                )
+                details.addWidget(ip_label)
+                details.addWidget(mac_label)
+                state = QLabel("Connected" if self.language == "en" else "متصل")
+                state.setObjectName("gatewayDeviceState")
+                row_layout.addWidget(check)
+                row_layout.addLayout(details, 1)
+                row_layout.addWidget(state)
+                self.list_layout.addWidget(row)
+            body_height = min(270, count * 56)
+        self.list_layout.addStretch()
+        self.scroll.setFixedHeight(body_height)
+        self.setFixedHeight(81 + body_height)
 
 
 class PulseDot(QWidget):
@@ -991,7 +1159,9 @@ class ProfileListRow(QFrame):
     editRequested = Signal(str)
     deleteRequested = Signal(str)
 
-    def __init__(self, profile_id, text, icon, activate_text, active=False, parent=None):
+    def __init__(
+            self, profile_id, text, icon, activate_text, active=False,
+            ping_text="—", ping_state="unknown", parent=None):
         super().__init__(parent)
         self.profile_id = str(profile_id)
         self.setObjectName("profileListRow")
@@ -1039,6 +1209,12 @@ class ProfileListRow(QFrame):
         self.activate_button.setFixedHeight(30)
         self.activate_button.setFocusPolicy(Qt.NoFocus)
         self.activate_button.setEnabled(not active)
+        self.ping_badge = QLabel(str(ping_text))
+        self.ping_badge.setObjectName("profileRowPing")
+        self.ping_badge.setProperty("state", str(ping_state))
+        self.ping_badge.setAlignment(Qt.AlignCenter)
+        self.ping_badge.setFixedSize(84, 30)
+        self.ping_badge.setLayoutDirection(Qt.LeftToRight)
         self.edit_button = QToolButton()
         self.edit_button.setObjectName("profileRowEdit")
         self.edit_button.setIcon(cyber_icon("edit", "#79dfff", 16))
@@ -1053,6 +1229,7 @@ class ProfileListRow(QFrame):
         self.delete_button.setFocusPolicy(Qt.NoFocus)
         layout.addWidget(icon_label)
         layout.addLayout(text_box, 1)
+        layout.addWidget(self.ping_badge)
         layout.addWidget(self.activate_button)
         layout.addWidget(self.edit_button)
         layout.addWidget(self.delete_button)
@@ -1831,6 +2008,14 @@ class MainWindow(QMainWindow):
         self._proxy_mode_apply_lock = threading.Lock()
         self._mode_apply_generation = 0
         self._mode_apply_cancel = threading.Event()
+        self._gateway_requested = False
+        self._gateway_apply_lock = threading.Lock()
+        self._gateway_apply_generation = 0
+        self._gateway_apply_cancel = threading.Event()
+        self._gateway_apply_target = None
+        self._gateway_apply_reasons = {}
+        self._gateway_devices = {}
+        self._gateway_runtime_state = "inactive"
         self._connect_cancel = threading.Event()
         self._connect_thread: threading.Thread | None = None
         self._forced_profile_id = ""
@@ -1869,17 +2054,32 @@ class MainWindow(QMainWindow):
         self._maker_guide_button = None
         self._maker_guide_effect = None
         self._maker_guide_animation = None
+        self._profile_ping_generation = 0
+        self._profile_ping_busy = False
+        self._profile_ping_cancel = threading.Event()
         self._maker = SniConfigMaker(
             fake_sni=self.storage.tuning.pattern_fake_sni,
         )
         self.engine = Engine(self.bridge.log.emit, self.bridge.state.emit, self.bridge.traffic.emit)
+        gateway = getattr(self.engine, "gateway", None)
+        if gateway is not None:
+            gateway.state_changed = (
+                lambda state, count, detail:
+                self.bridge.gateway_runtime_state.emit(
+                    str(state), int(count), str(detail)
+                )
+            )
+            gateway.devices_changed = (
+                lambda devices:
+                self.bridge.gateway_devices_changed.emit(dict(devices))
+            )
         try:
             self.engine.recover_stale_tun()
         except Exception as exc:
             self._pending_file_log_lines.append(f"sing-box recovery pending: {exc}")
         self._build(); self._setup_tray(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
         self.activity_bar.set_activity("", "idle", False)
-        self._target_latency_timer = QTimer(self); self._target_latency_timer.setInterval(3000); self._target_latency_timer.timeout.connect(self._queue_target_latency_probe); self._target_latency_timer.start()
+        self._target_latency_timer = QTimer(self); self._target_latency_timer.setInterval(10000); self._target_latency_timer.timeout.connect(self._queue_target_latency_probe); self._target_latency_timer.start()
         QTimer.singleShot(300, self._queue_target_latency_probe)
         QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
         self._update_poll_timer = QTimer(self); self._update_poll_timer.setInterval(12 * 3600 * 1000); self._update_poll_timer.timeout.connect(lambda: self.check_for_updates(manual=False)); self._update_poll_timer.start()
@@ -1936,8 +2136,10 @@ class MainWindow(QMainWindow):
         scroll.setWidget(body)
         return scroll, body
 
-    def _toggle_option(self, toggle, persian, english):
-        wrapper = ToggleOptionFrame(toggle); wrapper.setObjectName("toggleOption")
+    def _toggle_option(self, toggle, persian, english, row_click_enabled=True):
+        wrapper = ToggleOptionFrame(
+            toggle, row_click_enabled=row_click_enabled
+        ); wrapper.setObjectName("toggleOption")
         layout = QHBoxLayout(wrapper); layout.setContentsMargins(10, 7, 10, 7); layout.setSpacing(10)
         label = self._bind_text(QLabel(), persian, english); label.setObjectName("controlLabel")
         label.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -2044,6 +2246,30 @@ class MainWindow(QMainWindow):
             "تمام ترافیک TCP و UDP ویندوز را از sing-box و هسته اسپوف عبور می‌دهد؛ پینگ CMD مستقیم و واقعی می‌ماند.",
             "Routes Windows TCP and UDP through sing-box and the spoof core; CMD ping remains direct and real.",
         ))
+        self.gateway_mode = ToggleSwitch(); self.gateway_mode.setChecked(False); self.gateway_option = self._toggle_option(self.gateway_mode, "درگاه موبایل", "Mobile Gateway", row_click_enabled=False)
+        self.gateway_option.setObjectName("gatewayModeOption"); self.gateway_option.setProperty("state", "off")
+        self.gateway_devices_badge = QToolButton()
+        self.gateway_devices_badge.setObjectName("gatewayDevicesBadge")
+        self.gateway_devices_badge.setText("0")
+        self.gateway_devices_badge.setIcon(cyber_icon("wifi", "#72eee7", 14))
+        self.gateway_devices_badge.setIconSize(QSize(14, 14))
+        self.gateway_devices_badge.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.gateway_devices_badge.setCursor(Qt.PointingHandCursor)
+        self.gateway_devices_badge.setFixedHeight(26)
+        self.gateway_devices_badge.setMinimumWidth(50)
+        self.gateway_devices_badge.setMaximumWidth(76)
+        self.gateway_devices_badge.setAccessibleName("Mobile Gateway connected devices")
+        self.gateway_option.layout().addWidget(
+            self.gateway_devices_badge, 0, Qt.AlignVCenter
+        )
+        self.gateway_devices_popup = GatewayDevicesPopup(self.language, self)
+        self.gateway_devices_badge.clicked.connect(
+            self._toggle_gateway_devices_popup
+        )
+        self.gateway_mode.setToolTip(self.tr(
+            "با یک کلیک، اینترنت موبایل را از درگاه شبکه این رایانه به تونل تأییدشده هدایت می‌کند.",
+            "One click routes mobile internet through this computer and the verified tunnel.",
+        ))
         self.proxy_option.setEnabled(not self.tun_mode.isChecked())
         self.carrier = QComboBox(); self.carrier.setObjectName("carrierModeCombo"); self.carrier.addItems(["auto", "mci", "irancell"]); self.carrier.setCurrentText(self.storage.tuning.carrier_mode); self.carrier.setMinimumWidth(100); self.carrier.setMaximumWidth(120); self.carrier.setAccessibleName("Carrier")
         self.carrier_control = QFrame(); self.carrier_control.setObjectName("carrierControl"); self.carrier_control.setMinimumWidth(190); self.carrier_control.setMaximumWidth(220); carrier_layout = QHBoxLayout(self.carrier_control); self.carrier_layout = carrier_layout; carrier_layout.setContentsMargins(7, 3, 7, 3); carrier_layout.setSpacing(6); self.carrier_label = self._bind_text(QLabel(), "اپراتور", "Carrier"); self.carrier_label.setObjectName("controlLabel"); carrier_layout.addWidget(self.carrier_label); carrier_layout.addWidget(self.carrier)
@@ -2088,30 +2314,33 @@ class MainWindow(QMainWindow):
         self._controls_compact = compact
         while self.controls_layout.count():
             self.controls_layout.takeAt(0)
-        for column in range(7):
+        for column in range(8):
             self.controls_layout.setColumnStretch(column, 0)
-        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option):
+        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option, self.gateway_option):
             option.layout().setContentsMargins(7, 5, 7, 5)
             option.layout().setSpacing(7)
         if compact:
             self.controls_layout.addWidget(self.auto_option, 0, 0)
-            self.controls_layout.addWidget(self.manual_option, 0, 1)
-            self.controls_layout.addWidget(self.tun_option, 0, 2)
+            self.controls_layout.addWidget(self.manual_option, 0, 1, 1, 2)
+            self.controls_layout.addWidget(self.gateway_option, 0, 3)
             self.controls_layout.addWidget(self.proxy_option, 1, 0)
-            self.controls_layout.addWidget(self.carrier_control, 1, 1)
-            self.controls_layout.addWidget(self.tune_button, 1, 2)
+            self.controls_layout.addWidget(self.tun_option, 1, 1)
+            self.controls_layout.addWidget(self.carrier_control, 1, 2)
+            self.controls_layout.addWidget(self.tune_button, 1, 3)
             self.controls_layout.setColumnStretch(0, 1)
-            self.controls_layout.setColumnStretch(1, 2)
+            self.controls_layout.setColumnStretch(1, 1)
             self.controls_layout.setColumnStretch(2, 1)
+            self.controls_layout.setColumnStretch(3, 1)
             self.tune_button.setMaximumWidth(16777215)
         else:
             self.controls_layout.addWidget(self.auto_option, 0, 0)
             self.controls_layout.addWidget(self.manual_option, 0, 1)
             self.controls_layout.addWidget(self.proxy_option, 0, 2)
             self.controls_layout.addWidget(self.tun_option, 0, 3)
-            self.controls_layout.addWidget(self.carrier_control, 0, 4)
-            self.controls_layout.setColumnStretch(5, 1)
-            self.controls_layout.addWidget(self.tune_button, 0, 6)
+            self.controls_layout.addWidget(self.gateway_option, 0, 4)
+            self.controls_layout.addWidget(self.carrier_control, 0, 5)
+            self.controls_layout.setColumnStretch(6, 1)
+            self.controls_layout.addWidget(self.tune_button, 0, 7)
             self.tune_button.setMaximumWidth(230)
 
     def _layout_home_dashboard(self, narrow=None, dense=None):
@@ -2158,7 +2387,7 @@ class MainWindow(QMainWindow):
         self._layout_control_bar(True)
         self.quick_controls.setFixedHeight(controls_height)
         self.controls_layout.setContentsMargins(10, 5, 10, 5)
-        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option):
+        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option, self.gateway_option):
             option.setFixedHeight(40)
         self.carrier_layout.setContentsMargins(4, 3, 4, 3)
         self.carrier_layout.setSpacing(4)
@@ -2256,11 +2485,23 @@ class MainWindow(QMainWindow):
         self.manual_list.set_empty_text(self.tr("هنوز کانفیگ دستی ندارید", "No manual configs yet"), self.tr("یک لینک VLESS یا Trojan اضافه یا از Clipboard وارد کنید.", "Add a VLESS or Trojan link, or import one from the clipboard."))
         self.user_config_list.set_empty_text(self.tr("هنوز User Config ندارید", "No User Configs yet"), self.tr("کانفیگ‌های سالم را از SNI Config Maker به این بخش اضافه کنید.", "Add healthy routes from SNI Config Maker to this library."))
         self.suggested_list.set_empty_text(self.tr("هنوز پیشنهادی دریافت نشده", "No suggestions downloaded"), self.tr("برای دریافت فهرست پیشنهادی، همگام‌سازی را اجرا کنید.", "Sync the suggested repository to populate this list."))
-        self.profile_tabs.addTab(self.user_config_list, "User Config"); self.profile_tabs.addTab(self.manual_list, self.tr("دستی", "Manual")); self.profile_tabs.addTab(self.suggested_list, self.tr("پیشنهادی", "Suggested")); self.profile_tabs.currentChanged.connect(self._update_config_actions); self.profile_tabs.currentChanged.connect(self._profile_tab_changed)
+        self.profile_pages = []
+        self.profile_page_layouts = []
+        for widget in (
+                self.user_config_list, self.manual_list,
+                self.suggested_list):
+            tab_page = QWidget()
+            tab_layout = QVBoxLayout(tab_page)
+            tab_layout.setContentsMargins(5, 4, 5, 5)
+            tab_layout.setSpacing(5)
+            tab_layout.addWidget(widget, 1)
+            self.profile_pages.append(tab_page)
+            self.profile_page_layouts.append(tab_layout)
         self.profile_selection_bar = QFrame()
         self.profile_selection_bar.setObjectName("profileSelectionBar")
+        self.profile_selection_bar.setFixedHeight(38)
         selection_layout = QHBoxLayout(self.profile_selection_bar)
-        selection_layout.setContentsMargins(10, 3, 10, 3)
+        selection_layout.setContentsMargins(10, 4, 10, 4)
         selection_layout.setSpacing(7)
         self.profile_select_all_checkbox = QCheckBox()
         self.profile_select_all_checkbox.setObjectName("profileSelectAll")
@@ -2273,6 +2514,25 @@ class MainWindow(QMainWindow):
         selection_layout.addWidget(self.profile_select_all_checkbox)
         selection_layout.addWidget(self.profile_select_all_label)
         selection_layout.addStretch()
+        self.profile_ping_all_btn = self._action_button(
+            "پینگ کل لیست", "Ping All", "gauge", "secondaryAction"
+        )
+        self.profile_ping_all_btn.setMinimumWidth(112)
+        self.profile_ping_all_btn.setMaximumWidth(142)
+        self.profile_sort_combo = QComboBox()
+        self.profile_sort_combo.setObjectName("profileSortCombo")
+        self.profile_sort_combo.setMinimumHeight(46)
+        self.profile_sort_combo.setMaximumHeight(52)
+        self.profile_sort_combo.setMinimumWidth(145)
+        self.profile_sort_combo.setMaximumWidth(190)
+        self.profile_sort_combo.addItem(
+            self.tr("مرتب‌سازی: کشور", "Sort: Country"), "country"
+        )
+        self.profile_sort_combo.addItem(
+            self.tr("مرتب‌سازی: کمترین پینگ", "Sort: Lowest ping"), "ping"
+        )
+        bar.insertWidget(3, self.profile_ping_all_btn)
+        bar.insertWidget(4, self.profile_sort_combo)
         self.profile_select_all_checkbox.setAccessibleName("Select all configurations in the active list")
         self.profile_select_all_checkbox.setToolTip(self.tr(
             "انتخاب یا لغو انتخاب همه کانفیگ‌های لیست فعال",
@@ -2281,12 +2541,33 @@ class MainWindow(QMainWindow):
         self.profile_select_all_checkbox.clicked.connect(
             self._set_current_profile_list_selection
         )
-        for widget in (
-                self.user_config_list, self.manual_list,
-                self.suggested_list):
-            widget.setViewportMargins(0, 42, 0, 0)
-            widget.resized.connect(self._position_profile_select_all)
-        panel_layout.addWidget(self.profile_tabs); root.addWidget(panel, 1)
+        self.profile_page_layouts[0].insertWidget(
+            0, self.profile_selection_bar
+        )
+        self.profile_tabs.addTab(
+            self.profile_pages[0], "User Config"
+        )
+        self.profile_tabs.addTab(
+            self.profile_pages[1], self.tr("دستی", "Manual")
+        )
+        self.profile_tabs.addTab(
+            self.profile_pages[2],
+            self.tr("پیشنهادی", "Suggested")
+        )
+        self.profile_tabs.currentChanged.connect(
+            self._update_config_actions
+        )
+        self.profile_tabs.currentChanged.connect(
+            self._profile_tab_changed
+        )
+        self.profile_ping_all_btn.clicked.connect(
+            self._ping_current_profile_list
+        )
+        self.profile_sort_combo.currentIndexChanged.connect(
+            self._profile_sort_changed
+        )
+        panel_layout.addWidget(self.profile_tabs)
+        root.addWidget(panel, 1)
         self._update_config_actions()
         return page
 
@@ -2559,8 +2840,8 @@ class MainWindow(QMainWindow):
         root.addLayout(info_grid); credits = QLabel(f"UAC Spoofer Desktop {__version__}  •  Credits to behroozuac"); credits.setObjectName("credits"); credits.setAlignment(Qt.AlignCenter); credits.setLayoutDirection(Qt.LeftToRight); root.addWidget(credits); root.addStretch(); return page
 
     def _wire(self):
-        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished)
-        self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.clear_user_btn.clicked.connect(self.delete_all_user_configs); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.country_combo.activated.connect(self._country_activated); self.auto_mode.toggled.connect(self._auto_mode_changed); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v)); self.proxy_mode.toggled.connect(self._proxy_mode_changed); self.tun_mode.toggled.connect(self._tun_mode_changed)
+        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.profile_pings_done.connect(self._profile_pings_finished); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished); self.bridge.gateway_mode_applied.connect(self._gateway_mode_apply_finished); self.bridge.gateway_runtime_state.connect(self._gateway_runtime_state_changed); self.bridge.gateway_devices_changed.connect(self._gateway_devices_updated)
+        self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.clear_user_btn.clicked.connect(self.delete_all_user_configs); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.country_combo.activated.connect(self._country_activated); self.auto_mode.toggled.connect(self._auto_mode_changed); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v)); self.proxy_mode.toggled.connect(self._proxy_mode_changed); self.tun_mode.toggled.connect(self._tun_mode_changed); self.gateway_mode.toggled.connect(self._gateway_mode_changed)
         self.scan_tabs.currentChanged.connect(self._update_scan_selection)
         self.route_source_tabs.currentChanged.connect(self._route_source_changed)
         self.maker_repo_btn.clicked.connect(self._maker_fetch_repository); self.maker_repo_reset_btn.clicked.connect(lambda: self.maker_repo_url.setText(DEFAULT_SNI_MAKER_URL)); self.maker_repo_url.textChanged.connect(self._maker_repo_url_changed)
@@ -2734,9 +3015,10 @@ class MainWindow(QMainWindow):
     def _update_config_actions(self, *_):
         if not hasattr(self, "profile_tabs"):
             return
-        self._sync_profile_select_all(self.profile_tabs.currentWidget())
+        widget = self._current_profile_list()
+        self._sync_profile_select_all(widget)
         self._position_profile_select_all()
-        user_active = self.profile_tabs.currentWidget() is self.user_config_list
+        user_active = widget is self.user_config_list
         self.clear_user_btn.setVisible(user_active)
         self.clear_user_btn.setEnabled(
             user_active and any(
@@ -2855,6 +3137,7 @@ class MainWindow(QMainWindow):
             "انتخاب یا لغو انتخاب همه کانفیگ‌های لیست فعال",
             "Select or clear every configuration in the active list",
         ))
+        self._sync_profile_sort_control()
         self._position_profile_select_all()
         self.route_source_tabs.setTabText(0, self.tr("پیشنهادی", "Suggested")); self.route_source_tabs.setTabText(1, "User Config")
         self.scan_tabs.setTabText(0, self.tr("نتایج", "Results")); self.scan_tabs.setTabText(1, self.tr("ذخیره‌شده", "Saved"))
@@ -2958,7 +3241,13 @@ class MainWindow(QMainWindow):
             "تمام ترافیک TCP و UDP ویندوز را از sing-box و هسته اسپوف عبور می‌دهد؛ پینگ CMD مستقیم و واقعی می‌ماند.",
             "Routes Windows TCP and UDP through sing-box and the spoof core; CMD ping remains direct and real.",
         ))
+        self.gateway_mode.setToolTip(self.tr(
+            "با یک کلیک، اینترنت موبایل را از درگاه شبکه این رایانه به تونل تأییدشده هدایت می‌کند.",
+            "One click routes mobile internet through this computer and the verified tunnel.",
+        ))
+        self._gateway_devices_updated(self._gateway_devices)
         self.proxy_option.setEnabled(not self._tun_mode_enabled())
+        self._sync_gateway_controls()
         self._configure_technical_widgets()
         self._layout_home_dashboard()
         self._layout_sni_maker()
@@ -3019,7 +3308,7 @@ class MainWindow(QMainWindow):
 
     def _set_current_profile_list_selection(self, checked):
         self._set_profile_list_selection(
-            self.profile_tabs.currentWidget(), checked
+            self._current_profile_list(), checked
         )
 
     def _set_profile_list_selection(self, widget, checked):
@@ -3042,7 +3331,7 @@ class MainWindow(QMainWindow):
 
     def _sync_profile_select_all(self, widget):
         checkbox = getattr(self, "profile_select_all_checkbox", None)
-        if checkbox is None or widget is not self.profile_tabs.currentWidget():
+        if checkbox is None or widget is not self._current_profile_list():
             return
         selectable = [
             widget.item(row)
@@ -3053,25 +3342,206 @@ class MainWindow(QMainWindow):
         checkbox.setEnabled(bool(selectable))
         checkbox.setChecked(bool(selectable) and selected == len(selectable))
 
+    def _current_profile_list(self):
+        index = self.profile_tabs.currentIndex()
+        widgets = (
+            self.user_config_list, self.manual_list,
+            self.suggested_list,
+        )
+        return widgets[index] if 0 <= index < len(widgets) else None
+
+    def _profile_tab_index(self, widget):
+        widgets = (
+            self.user_config_list, self.manual_list,
+            self.suggested_list,
+        )
+        try:
+            return widgets.index(widget)
+        except ValueError:
+            return -1
+
+    def _current_profile_list_key(self):
+        widget = self._current_profile_list()
+        if widget is self.user_config_list:
+            return "user-config"
+        if widget is self.manual_list:
+            return "manual"
+        if widget is self.suggested_list:
+            return "suggested"
+        return ""
+
+    def _profiles_for_list_key(self, key):
+        if key == "user-config":
+            return [
+                profile for profile in self.storage.profiles
+                if profile.origin == USER_CONFIG_ORIGIN
+            ]
+        if key == "manual":
+            return [
+                profile for profile in self.storage.profiles
+                if profile.origin == "user"
+            ]
+        if key == "suggested":
+            return [
+                profile for profile in self.storage.profiles
+                if profile.origin not in DIRECT_PROFILE_ORIGINS
+            ]
+        return []
+
+    def _profile_sort_mode(self, key):
+        value = str(self.storage.settings.get(
+            f"config_sort_{key}", "country"
+        ) or "country").lower()
+        return value if value in {"country", "ping"} else "country"
+
+    def _sync_profile_sort_control(self):
+        combo = getattr(self, "profile_sort_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.setItemText(
+            0, self.tr("مرتب‌سازی: کشور", "Sort: Country")
+        )
+        combo.setItemText(
+            1, self.tr("مرتب‌سازی: کمترین پینگ", "Sort: Lowest ping")
+        )
+        mode = self._profile_sort_mode(self._current_profile_list_key())
+        index = combo.findData(mode)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+
+    def _profile_sort_changed(self, _index):
+        key = self._current_profile_list_key()
+        mode = self.profile_sort_combo.currentData()
+        if not key or mode not in {"country", "ping"}:
+            return
+        self.storage.settings[f"config_sort_{key}"] = mode
+        self.storage.save_settings()
+        self.refresh_profiles()
+
+    def _ping_current_profile_list(self):
+        if self._profile_ping_busy:
+            return
+        key = self._current_profile_list_key()
+        profiles = self._profiles_for_list_key(key)
+        if not profiles:
+            self.show_toast(
+                self.tr("این لیست کانفیگی ندارد", "This list has no configs"),
+                "warning",
+            )
+            return
+        self._profile_ping_generation += 1
+        generation = self._profile_ping_generation
+        self._profile_ping_busy = True
+        self._profile_ping_cancel = threading.Event()
+        cancel = self._profile_ping_cancel
+        self.profile_ping_all_btn.setEnabled(False)
+        self.profile_ping_all_btn.setText(
+            self.tr("در حال پینگ…", "Pinging…")
+        )
+        self._set_activity(
+            f"در حال پینگ گرفتن از {len(profiles)} کانفیگ…",
+            f"Pinging {len(profiles)} configs…",
+        )
+        targets = [
+            (
+                profile.id,
+                profile.address,
+                int(profile.port or 443),
+                self._effective_profile_fake_sni(profile),
+            )
+            for profile in profiles
+        ]
+
+        def probe(target):
+            profile_id, address, port, sni = target
+            if cancel.is_set():
+                return profile_id, False, 0.0
+            samples = []
+            for _sample in range(2):
+                if cancel.is_set():
+                    break
+                ok, latency = profile_real_delay(
+                    address, port, sni, 2.5
+                )
+                if ok and latency > 0:
+                    samples.append(float(latency))
+            return (
+                profile_id, bool(samples),
+                min(samples) if samples else 0.0,
+            )
+
+        def work():
+            results = []
+            workers = min(8, max(1, len(targets)))
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers,
+                    thread_name_prefix="config-ping") as pool:
+                futures = [pool.submit(probe, target) for target in targets]
+                for future in concurrent.futures.as_completed(futures):
+                    if cancel.is_set():
+                        break
+                    try:
+                        results.append(future.result())
+                    except Exception:
+                        pass
+            self.bridge.profile_pings_done.emit(results, key, generation)
+
+        threading.Thread(
+            target=work, name="config-list-ping", daemon=True
+        ).start()
+
+    def _profile_pings_finished(self, results, key, generation):
+        if generation != self._profile_ping_generation:
+            return
+        by_id = {
+            str(profile_id): (bool(ok), float(latency or 0.0))
+            for profile_id, ok, latency in results
+        }
+        successful = 0
+        for profile in self._profiles_for_list_key(key):
+            if profile.id not in by_id:
+                continue
+            ok, latency = by_id[profile.id]
+            profile.last_ping_ok = ok
+            profile.last_ping_ms = latency if ok else 0.0
+            profile.country_latency_ms = (
+                int(round(latency)) if ok else 0
+            )
+            successful += int(ok)
+        self.storage.save_profiles()
+        self._profile_ping_busy = False
+        self.profile_ping_all_btn.setEnabled(True)
+        self.profile_ping_all_btn.setText(
+            self.tr("پینگ کل لیست", "Ping All")
+        )
+        self.refresh_profiles()
+        self._set_activity(
+            f"پینگ کامل شد؛ {successful} از {len(by_id)} کانفیگ پاسخ داد.",
+            f"Ping completed; {successful} of {len(by_id)} configs responded.",
+            "success", False,
+        )
+
     def _position_profile_select_all(self):
         checkbox = getattr(self, "profile_select_all_checkbox", None)
         bar = getattr(self, "profile_selection_bar", None)
         if checkbox is None or bar is None:
             return
-        widget = self.profile_tabs.currentWidget()
+        widget = self._current_profile_list()
         if widget not in (
                 self.user_config_list, self.manual_list,
                 self.suggested_list):
             bar.hide()
             return
-        if bar.parent() is not widget:
-            bar.setParent(widget)
+        index = self.profile_tabs.currentIndex()
+        layout = self.profile_page_layouts[index]
+        if layout.indexOf(bar) != 0:
+            layout.insertWidget(0, bar)
         bar.setLayoutDirection(
             Qt.LeftToRight if self.language == "en" else Qt.RightToLeft
         )
-        bar.setGeometry(5, 4, max(80, widget.width() - 10), 34)
+        self._sync_profile_sort_control()
         bar.show()
-        bar.raise_()
 
     def _mode_apply_current(self, mode_generation, connect_generation,
                             cancel, run_id):
@@ -3157,6 +3627,7 @@ class MainWindow(QMainWindow):
             self.proxy_option.setProperty("active", fallback)
             _restyle(self.proxy_option)
             self._handle_error(error)
+            QTimer.singleShot(0, self._queue_target_latency_probe)
             return
         self._set_activity(
             "پروکسی ویندوز فعال شد؛ هسته اسپوف همچنان متصل است." if enabled else
@@ -3165,6 +3636,7 @@ class MainWindow(QMainWindow):
             "Only Windows Proxy was disabled; the spoof core remains active.",
             "success", False,
         )
+        QTimer.singleShot(0, self._queue_target_latency_probe)
 
     def _apply_proxy_mode_after_probe(self, cancel=None,
                                       expected_run_id=None) -> bool:
@@ -3411,6 +3883,392 @@ class MainWindow(QMainWindow):
         )
         if hasattr(self, "_queue_target_latency_probe"):
             QTimer.singleShot(0, self._queue_target_latency_probe)
+
+    def _gateway_runtime_active(self) -> bool:
+        value = getattr(self.engine, "gateway_running", False)
+        try:
+            return bool(value() if callable(value) else value)
+        except Exception:
+            return False
+
+    def _position_gateway_devices_popup(self):
+        popup = getattr(self, "gateway_devices_popup", None)
+        badge = getattr(self, "gateway_devices_badge", None)
+        if popup is None or badge is None or not popup.isVisible():
+            return
+        below = badge.mapToGlobal(QPoint(0, badge.height() + 7))
+        trailing = badge.mapToGlobal(QPoint(badge.width(), badge.height() + 7))
+        screen = QApplication.screenAt(below)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        window_origin = self.mapToGlobal(QPoint(0, 0))
+        window_left = window_origin.x() + 8
+        window_top = window_origin.y() + 8
+        window_right = window_origin.x() + self.width() - 9
+        window_bottom = window_origin.y() + self.height() - 9
+        x = (
+            below.x()
+            if self.language == "en"
+            else trailing.x() - popup.width()
+        )
+        y = below.y()
+        if available is not None:
+            left = max(available.left() + 6, window_left)
+            top = max(available.top() + 6, window_top)
+            right = min(available.right() - 5, window_right)
+            bottom = min(available.bottom() - 5, window_bottom)
+            if y + popup.height() > bottom:
+                y = badge.mapToGlobal(QPoint(
+                    0, -popup.height() - 7
+                )).y()
+            x = max(
+                left,
+                min(x, right - popup.width()),
+            )
+            y = max(
+                top,
+                min(y, bottom - popup.height()),
+            )
+        popup.move(x, y)
+
+    def _toggle_gateway_devices_popup(self):
+        popup = getattr(self, "gateway_devices_popup", None)
+        if popup is None:
+            return
+        if popup.isVisible():
+            popup.hide()
+            return
+        popup.set_language(self.language)
+        popup.update_devices(self._gateway_devices)
+        popup.show()
+        self._position_gateway_devices_popup()
+        popup.raise_()
+
+    def _gateway_devices_updated(self, devices):
+        self._gateway_devices = dict(devices or {})
+        toggle = getattr(self, "gateway_mode", None)
+        if toggle is None:
+            return
+        count = len(self._gateway_devices)
+        active = self._gateway_runtime_active()
+        badge = getattr(self, "gateway_devices_badge", None)
+        if badge is not None:
+            badge.setText(str(count))
+            badge.setProperty("hasDevices", bool(count))
+            badge.setProperty("gatewayActive", active)
+            badge.setAccessibleName(self.tr(
+                f"{count} دستگاه متصل به درگاه موبایل",
+                f"{count} devices connected to Mobile Gateway",
+            ))
+            badge.setToolTip(self.tr(
+                "نمایش دستگاه‌های متصل",
+                "Show connected devices",
+            ))
+            _restyle(badge)
+        popup = getattr(self, "gateway_devices_popup", None)
+        if popup is not None:
+            popup.set_language(self.language)
+            popup.update_devices(self._gateway_devices)
+            if popup.isVisible():
+                self._position_gateway_devices_popup()
+        detail = self.tr(
+            f" دستگاه شناسایی‌شده: {count}." if count else "",
+            f" Detected devices: {count}." if count else "",
+        )
+        toggle.setToolTip(self.tr(
+            "با یک کلیک، اینترنت موبایل را از درگاه شبکه این رایانه به تونل تأییدشده هدایت می‌کند.",
+            "One click routes mobile internet through this computer and the verified tunnel.",
+        ) + detail)
+
+    def _gateway_runtime_state_changed(self, state, device_count=0, detail=""):
+        state = str(state or "").strip().lower()
+        self._gateway_runtime_state = state
+        if state == "active" and self._gateway_requested:
+            self._set_gateway_toggle(True)
+        elif (state in {"inactive", "error", "restore-pending"}
+              and self._gateway_apply_target is None):
+            self._gateway_requested = False
+            self._cancel_gateway_apply()
+            self._set_gateway_toggle(False)
+            popup = getattr(self, "gateway_devices_popup", None)
+            if popup is not None:
+                popup.hide()
+        self._sync_gateway_controls()
+        if state in {"error", "restore-pending"} and detail:
+            self._append_log(
+                f"Mobile Gateway {state}: {detail}"
+            )
+
+    def _set_gateway_toggle(self, checked):
+        toggle = getattr(self, "gateway_mode", None)
+        if toggle is None:
+            return
+        checked = bool(checked)
+        toggle.blockSignals(True)
+        toggle.setChecked(checked)
+        toggle.blockSignals(False)
+        animation = getattr(toggle, "_thumb_animation", None)
+        if animation is not None:
+            animation.stop()
+        set_position = getattr(toggle, "_set_thumb_position", None)
+        if callable(set_position):
+            set_position(1.0 if checked else 0.0)
+
+    def _sync_gateway_controls(self):
+        requested = bool(getattr(self, "_gateway_requested", False))
+        active = self._gateway_runtime_active()
+        target = getattr(self, "_gateway_apply_target", None)
+        transitioning = target is not None
+        state = (
+            "starting" if target is True else
+            "stopping" if target is False else
+            "active" if active else
+            "requested" if requested else
+            "off"
+        )
+        option = getattr(self, "gateway_option", None)
+        if option is not None:
+            option.setProperty("state", state)
+            option.setProperty("active", active)
+            option.setProperty("busy", transitioning)
+            _restyle(option)
+        gateway_mode = getattr(self, "gateway_mode", None)
+        if gateway_mode is not None:
+            gateway_mode.setEnabled(not transitioning)
+        badge = getattr(self, "gateway_devices_badge", None)
+        if badge is not None:
+            badge.setProperty("gatewayActive", active)
+            badge.setProperty(
+                "hasDevices", bool(getattr(self, "_gateway_devices", {}))
+            )
+            _restyle(badge)
+        locked = requested or active or transitioning
+        tun_mode = getattr(self, "tun_mode", None)
+        tun_option = getattr(self, "tun_option", None)
+        if tun_mode is not None:
+            tun_mode.setEnabled(not locked)
+        if tun_option is not None:
+            tun_option.setEnabled(not locked)
+
+    def _cancel_gateway_apply(self):
+        event = getattr(self, "_gateway_apply_cancel", None)
+        if event is not None:
+            event.set()
+        self._gateway_apply_generation = int(
+            getattr(self, "_gateway_apply_generation", 0)
+        ) + 1
+        self._gateway_apply_target = None
+        reasons = getattr(self, "_gateway_apply_reasons", None)
+        if isinstance(reasons, dict):
+            reasons.clear()
+
+    def _begin_gateway_apply(self, enabled, reason):
+        self._cancel_gateway_apply()
+        self._gateway_apply_cancel = threading.Event()
+        self._gateway_apply_target = bool(enabled)
+        generation = self._gateway_apply_generation
+        self._gateway_apply_reasons[generation] = str(reason or "user")
+        return (
+            generation,
+            self._connect_generation,
+            self._gateway_apply_cancel,
+            int(getattr(self.engine, "run_id", 0)),
+        )
+
+    def _gateway_apply_current(self, enabled, generation, connect_generation,
+                               cancel, run_id):
+        current = (
+            not cancel.is_set()
+            and generation == self._gateway_apply_generation
+        )
+        if not current or not enabled:
+            return current
+        return (
+            not self._closing
+            and connect_generation == self._connect_generation
+            and run_id == int(getattr(self.engine, "run_id", 0))
+            and bool(self.engine.running)
+            and bool(getattr(self, "_ui_running", False))
+            and not self.connecting
+            and bool(self._gateway_requested)
+        )
+
+    def _queue_gateway_mode_apply(self, enabled, reason="user", force=False):
+        enabled = bool(enabled)
+        active = self._gateway_runtime_active()
+        if enabled:
+            if (not self._gateway_requested or not self.engine.running
+                    or not getattr(self, "_ui_running", False)
+                    or self.connecting):
+                return
+            if active:
+                self._sync_gateway_controls()
+                return
+        elif not force and not active and self._gateway_apply_target is not True:
+            self._sync_gateway_controls()
+            return
+        if self._gateway_apply_target is enabled:
+            return
+        generation, connect_generation, cancel, run_id = (
+            self._begin_gateway_apply(enabled, reason)
+        )
+        self._set_gateway_toggle(enabled)
+        self._sync_gateway_controls()
+
+        def current():
+            return self._gateway_apply_current(
+                enabled, generation, connect_generation, cancel, run_id
+            )
+
+        if reason == "user":
+            self._set_activity(
+                "در حال فعال‌سازی درگاه موبایل…" if enabled else
+                "در حال خاموش کردن درگاه موبایل…",
+                "Activating Mobile Gateway…" if enabled else
+                "Disabling Mobile Gateway…",
+            )
+
+        def work():
+            success = False
+            error = ""
+            try:
+                with self._gateway_apply_lock:
+                    if not current():
+                        return
+                    if enabled:
+                        self.engine.enable_gateway(
+                            expected_run_id=run_id,
+                            cancel_event=cancel,
+                        )
+                        if not current():
+                            try:
+                                self.engine.disable_gateway(
+                                    reason="cancelled",
+                                    expected_run_id=run_id,
+                                )
+                            except Exception:
+                                pass
+                            return
+                        success = self._gateway_runtime_active()
+                        if not success:
+                            error = "Mobile Gateway did not enter the running state"
+                    else:
+                        expected_run_id = run_id if reason == "user" else None
+                        self.engine.disable_gateway(
+                            reason=str(reason or "user"),
+                            expected_run_id=expected_run_id,
+                        )
+                        if not current():
+                            return
+                        success = not self._gateway_runtime_active()
+                        if not success:
+                            error = "Mobile Gateway is still running"
+            except Exception as exc:
+                error = str(exc)
+                active_now = self._gateway_runtime_active()
+                success = active_now if enabled else not active_now
+                if success:
+                    error = ""
+            if current():
+                self.bridge.gateway_mode_applied.emit(
+                    enabled, success, error, generation, run_id
+                )
+
+        threading.Thread(
+            target=work, name=f"gateway-mode-{generation}", daemon=True
+        ).start()
+
+    def _reset_gateway_mode(self, reason="disconnect", stop=True):
+        requested = bool(getattr(self, "_gateway_requested", False))
+        active = self._gateway_runtime_active()
+        pending_enable = self._gateway_apply_target is True
+        self._gateway_requested = False
+        self._cancel_gateway_apply()
+        self._set_gateway_toggle(False)
+        self._sync_gateway_controls()
+        if stop and (requested or active or pending_enable):
+            self._queue_gateway_mode_apply(False, reason=reason, force=True)
+        return requested or active or pending_enable
+
+    def _gateway_mode_changed(self, enabled):
+        enabled = bool(enabled)
+        if not enabled:
+            self._reset_gateway_mode(reason="user", stop=True)
+            return
+        self._gateway_requested = True
+        self._cancel_gateway_apply()
+        self._sync_gateway_controls()
+        if (self.engine.running and getattr(self, "_ui_running", False)
+                and not self.connecting):
+            self._queue_gateway_mode_apply(True, reason="user")
+            return
+        self._set_activity(
+            "درگاه موبایل درخواست شد؛ ابتدا اتصال امن بررسی می‌شود…",
+            "Mobile Gateway requested; verifying the secure connection first…",
+        )
+        if not self.connecting:
+            self.toggle_connection()
+            if (not self.connecting
+                    and not getattr(self, "_ui_running", False)):
+                self._reset_gateway_mode(
+                    reason="connection-failed", stop=True
+                )
+
+    def _gateway_mode_apply_finished(self, enabled, success, error,
+                                     generation=None, run_id=None):
+        if (generation is not None
+                and generation != self._gateway_apply_generation):
+            return
+        reason = self._gateway_apply_reasons.pop(
+            generation, "user"
+        ) if generation is not None else "user"
+        self._gateway_apply_target = None
+        active = self._gateway_runtime_active()
+        if enabled:
+            if success and active and self._gateway_requested:
+                self._sync_gateway_controls()
+                self._set_activity(
+                    "درگاه موبایل فعال شد؛ ترافیک دستگاه از تونل عبور می‌کند.",
+                    "Mobile Gateway is active; device traffic is using the tunnel.",
+                    "success", False,
+                )
+                return
+            message = error or self.tr(
+                "فعال‌سازی درگاه موبایل کامل نشد",
+                "Mobile Gateway activation did not complete",
+            )
+            self._gateway_requested = False
+            self._cancel_gateway_apply()
+            self._set_gateway_toggle(False)
+            self._sync_gateway_controls()
+            if active:
+                self._queue_gateway_mode_apply(
+                    False, reason="activation-failed", force=True
+                )
+            self._handle_error(message)
+            return
+        if success or not active:
+            self._sync_gateway_controls()
+            if reason == "user" and getattr(self, "_ui_running", False):
+                self._set_activity(
+                    "درگاه موبایل خاموش شد؛ اتصال ویندوز فعال ماند.",
+                    "Mobile Gateway disabled; the Windows connection stayed active.",
+                    "success", False,
+                )
+            return
+        if reason == "user":
+            self._gateway_requested = True
+            self._set_gateway_toggle(True)
+        self._sync_gateway_controls()
+        message = error or self.tr(
+            "خاموش کردن درگاه موبایل کامل نشد",
+            "Mobile Gateway did not stop cleanly",
+        )
+        if reason == "user":
+            self._handle_error(message)
+        else:
+            self._append_log(f"Mobile Gateway cleanup pending: {message}")
 
     def _apply_connection_mode_after_probe(self, cancel=None) -> str:
         expected_run_id = getattr(self.engine, "run_id", None)
@@ -3745,7 +4603,12 @@ class MainWindow(QMainWindow):
             save()
 
     def _profile_tab_changed(self, index):
-        widget = self.profile_tabs.widget(index)
+        widget = (
+            self.user_config_list, self.manual_list,
+            self.suggested_list,
+        )[index]
+        self._sync_profile_sort_control()
+        self._position_profile_select_all()
         if widget is not self.user_config_list and widget is not self.manual_list:
             return
         auto_mode = getattr(self, "auto_mode", None)
@@ -3827,14 +4690,14 @@ class MainWindow(QMainWindow):
         if select_profile:
             if enabled:
                 self.profile_tabs.setCurrentIndex(
-                    self.profile_tabs.indexOf(
+                    self._profile_tab_index(
                         self.user_config_list
                         if self._selected_route_source() == "user-config"
                         else self.suggested_list
                     )
                 )
             else:
-                direct_index = self.profile_tabs.indexOf(
+                direct_index = self._profile_tab_index(
                     self.user_config_list
                     if MainWindow._direct_source_origin(self) == USER_CONFIG_ORIGIN
                     else self.manual_list
@@ -3884,7 +4747,7 @@ class MainWindow(QMainWindow):
         return str(value or profile.spoof_fake_sni
                    or self.storage.tuning.pattern_fake_sni or profile.sni).strip()
 
-    def _profile_route_label(self, profile, carrier=None):
+    def _profile_route_label(self, profile, carrier=None, include_ping=True):
         if profile is None:
             return ""
         fake_sni = self._effective_profile_fake_sni(profile, carrier)
@@ -3892,7 +4755,12 @@ class MainWindow(QMainWindow):
             "Reality SNI"
             if profile.route_mode == "reality-direct" else "Fake SNI"
         )
-        return f"{profile.target_label}\n{label} {fake_sni}"
+        target = (
+            profile.target_label
+            if include_ping else
+            f"{profile.address}:{profile.port} / {profile.sni}"
+        )
+        return f"{target}\n{label} {fake_sni}"
 
     def _attach_profile_row(self, widget, item, profile, text, icon):
         active = profile.id == self.storage.selected_id
@@ -3901,6 +4769,17 @@ class MainWindow(QMainWindow):
             self.tr("فعال است", "Active") if active
             else self.tr("فعال‌سازی", "Activate"),
             active=active,
+            ping_text=(
+                f"{profile.last_ping_ms:.0f} ms"
+                if profile.last_ping_ok else "—"
+            ),
+            ping_state=(
+                "fast" if profile.last_ping_ok
+                and profile.last_ping_ms <= 180 else
+                "medium" if profile.last_ping_ok
+                and profile.last_ping_ms <= 500 else
+                "slow" if profile.last_ping_ok else "unknown"
+            ),
         )
         row.setToolTip(item.toolTip() or text)
         row.activate_button.setToolTip(self.tr(
@@ -3937,19 +4816,58 @@ class MainWindow(QMainWindow):
 
     def _activate_profile_by_id(self, profile_id):
         wanted = str(profile_id)
-        for widget in (
-                self.user_config_list, self.manual_list,
-                self.suggested_list):
-            for row in range(widget.count()):
-                item = widget.item(row)
-                if str(item.data(Qt.UserRole) or "") != wanted:
-                    continue
-                self.profile_tabs.setCurrentWidget(widget)
+        profile = next(
+            (value for value in self.storage.profiles
+             if str(value.id) == wanted),
+            None,
+        )
+        if profile is None:
+            return
+        worker = getattr(self, "_connect_thread", None)
+        worker_active = bool(
+            worker is not None
+            and callable(getattr(worker, "is_alive", None))
+            and worker.is_alive()
+        )
+        switch_active = bool(
+            self.connecting or self.engine.running
+            or self._profile_switch_waiting or worker_active
+        )
+        self.storage.selected_id = profile.id
+        if profile.origin in DIRECT_PROFILE_ORIGINS:
+            self._forced_profile_id = profile.id
+            MainWindow._remember_direct_profile(self, profile)
+        if switch_active:
+            self._queue_profile_switch(profile.id)
+        route_tabs = getattr(self, "route_source_tabs", None)
+        route_index = None
+        if profile.origin == USER_CONFIG_ORIGIN:
+            self.storage.settings["route_source"] = "user-config"
+            route_index = 1
+        elif profile.origin not in DIRECT_PROFILE_ORIGINS:
+            self.storage.settings["route_source"] = "suggested"
+            route_index = 0
+        if route_tabs is not None and route_index is not None:
+            blocked = route_tabs.blockSignals(True)
+            route_tabs.setCurrentIndex(route_index)
+            route_tabs.blockSignals(blocked)
+        save_settings = getattr(self.storage, "save_settings", None)
+        if callable(save_settings):
+            save_settings()
+        widget = (
+            self.manual_list if profile.origin == "user"
+            else self.user_config_list
+            if profile.origin == USER_CONFIG_ORIGIN
+            else self.suggested_list
+        )
+        self.profile_tabs.setCurrentIndex(self._profile_tab_index(widget))
+        self.refresh_profiles()
+        for row in range(widget.count()):
+            item = widget.item(row)
+            if str(item.data(Qt.UserRole) or "") == wanted:
                 widget.clearSelection()
                 widget.setCurrentItem(item)
-                self._profile_clicked(item)
-                self.refresh_profiles()
-                return
+                break
 
     def _edit_profile_by_id(self, profile_id):
         profile = next(
@@ -3987,31 +4905,45 @@ class MainWindow(QMainWindow):
             key=benchmark_rank)]
         def profile_sort_key(profile):
             if profile.origin == "user":
-                return (0, "", 0, 0, profile.name.casefold())
-            if profile.origin == USER_CONFIG_ORIGIN:
-                code = str(profile.country_code or "ZZ").upper()
-                _flag, english, _persian = self._country_metadata(code)
+                group, source = 0, "manual"
+            elif profile.origin == USER_CONFIG_ORIGIN:
+                group, source = 1, "user-config"
+            else:
+                group, source = 2, "suggested"
+            code = str(
+                profile.observed_country_code
+                or profile.country_code or "ZZ"
+            ).upper()
+            _flag, english, _persian = self._country_metadata(code)
+            country = f"{english.casefold()}:{code}"
+            ping = (
+                profile.last_ping_ms
+                if profile.last_ping_ok else 999999
+            )
+            if MainWindow._profile_sort_mode(self, source) == "ping":
                 return (
-                    1, f"{english.casefold()}:{code}",
-                    not profile.last_ping_ok,
-                    profile.last_ping_ms if profile.last_ping_ok else 999999,
-                    profile.name.casefold(),
+                    group, not profile.last_ping_ok, ping,
+                    country, profile.name.casefold(),
                 )
             return (
-                2, "",
-                ranked_ids.index(profile.id) if profile.id in ranked_ids else 999,
-                profile.last_ping_ms if profile.last_ping_ok else 999999,
-                profile.name.casefold(),
+                group, country, not profile.last_ping_ok,
+                ping, profile.name.casefold(),
             )
         profiles = sorted(self.storage.profiles, key=profile_sort_key)
         user_country_counts = {}
         for profile in profiles:
-            if profile.origin == USER_CONFIG_ORIGIN:
+            if (
+                    profile.origin == USER_CONFIG_ORIGIN
+                    and MainWindow._profile_sort_mode(
+                        self, "user-config") == "country"):
                 code = str(profile.country_code or "XX").upper()
                 user_country_counts[code] = user_country_counts.get(code, 0) + 1
         current_user_country = None
         for profile in profiles:
-            if profile.origin == USER_CONFIG_ORIGIN:
+            if (
+                    profile.origin == USER_CONFIG_ORIGIN
+                    and MainWindow._profile_sort_mode(
+                        self, "user-config") == "country"):
                 code = str(profile.country_code or "XX").upper()
                 if code != current_user_country:
                     current_user_country = code
@@ -4771,7 +5703,7 @@ class MainWindow(QMainWindow):
         self.storage.save_settings()
         self.refresh_profiles()
         self.profile_tabs.setCurrentIndex(
-            self.profile_tabs.indexOf(self.user_config_list)
+            self._profile_tab_index(self.user_config_list)
         )
         for row in range(self.user_config_list.count()):
             item = self.user_config_list.item(row)
@@ -4819,7 +5751,7 @@ class MainWindow(QMainWindow):
         self.show_toast(self.tr("فایل خروجی ذخیره شد", "Export file saved"), "success")
 
     def selected_profile_items(self):
-        widget = self.profile_tabs.currentWidget()
+        widget = self._current_profile_list()
         if (
                 widget is not self.user_config_list
                 and widget is not self.manual_list
@@ -4834,7 +5766,7 @@ class MainWindow(QMainWindow):
         items = self.selected_profile_items()
         if not items:
             return None
-        widget = self.profile_tabs.currentWidget()
+        widget = self._current_profile_list()
         current = widget.currentItem()
         return current if current in items else items[0]
 
@@ -4868,7 +5800,15 @@ class MainWindow(QMainWindow):
                 save_settings()
             self.active_profile.setText(selected.name); self.route_card.set_secondary(self._profile_route_label(selected))
         self._update_config_actions()
-        if selected and (self.connecting or self.engine.running or self._profile_switch_waiting):
+        worker = getattr(self, "_connect_thread", None)
+        worker_active = bool(
+            worker is not None
+            and callable(getattr(worker, "is_alive", None))
+            and worker.is_alive()
+        )
+        if selected and (
+                self.connecting or self.engine.running
+                or self._profile_switch_waiting or worker_active):
             self._queue_profile_switch(profile_id)
 
     def add_profile(self):
@@ -5060,6 +6000,12 @@ class MainWindow(QMainWindow):
             )
         return tuning
 
+    @staticmethod
+    def _initial_connection_strategy(carrier, country_code=""):
+        if country_code:
+            return "wrong_seq"
+        return "tls_sni_records" if carrier == "mci" else "wrong_seq"
+
     def _profile_mux_enabled(self, profile, tuning, carrier=None) -> bool:
         """Use a fresh route-specific compatibility result without changing Advanced."""
         if not tuning.xray_mux_enabled:
@@ -5192,9 +6138,17 @@ class MainWindow(QMainWindow):
             return [reality_sni] if reality_sni else []
         candidates = self._sni_candidates(profile, carrier, limit)
         fallback = str(getattr(profile, "spoof_fake_sni", "") or "").strip().lower()
-        if fallback and fallback not in candidates:
-            candidates.append(fallback)
-        return candidates
+        if fallback:
+            if (
+                    profile.origin == USER_CONFIG_ORIGIN
+                    and profile.route_is_verified):
+                candidates = [
+                    fallback,
+                    *(value for value in candidates if value != fallback),
+                ]
+            elif fallback not in candidates:
+                candidates.append(fallback)
+        return candidates[:max(1, limit)]
 
     def _verified_route_result(self, domain, carrier):
         candidates = []
@@ -5576,6 +6530,9 @@ class MainWindow(QMainWindow):
             self._set_connection_visual("disconnecting")
             self._set_activity("در حال لغو عملیات اتصال…", "Cancelling the connection attempt…")
             self.bridge.log.emit("CONNECT CANCEL requested by user")
+            reset_gateway = getattr(self, "_reset_gateway_mode", None)
+            if callable(reset_gateway):
+                reset_gateway(reason="disconnect", stop=True)
             self._cancel_connect_attempt(notify=True)
             self._set_state(False)
             self._set_activity("عملیات اتصال لغو شد.", "Connection attempt cancelled.", "warning", False)
@@ -5590,6 +6547,9 @@ class MainWindow(QMainWindow):
                 else "Stopping the tunnel and restoring the system proxy…" if self._proxy_mode_enabled()
                 else "Stopping the spoof core…",
             )
+            reset_gateway = getattr(self, "_reset_gateway_mode", None)
+            if callable(reset_gateway):
+                reset_gateway(reason="disconnect", stop=True)
             self._cancel_connect_attempt(notify=True)
             self._set_state(False)
             return
@@ -5693,9 +6653,9 @@ class MainWindow(QMainWindow):
             last_error = ""
 
 
-            strategy = ("wrong_seq" if country_code or (
-                forced_profile is not None and forced_profile.verified_spoof
-            ) else ("tls_sni_records" if carrier == "mci" else "wrong_seq"))
+            strategy = MainWindow._initial_connection_strategy(
+                carrier, country_code
+            )
             try:
                 self.bridge.activity.emit(self.tr(f"در حال آزمایش دسترسی {ltr_isolate('SNI')}…", "Testing SNI reachability…"), "running", True)
                 profiles = self._ordered_profiles(
@@ -5941,12 +6901,19 @@ class MainWindow(QMainWindow):
                 and not bool(getattr(self.engine, "tun_running", False))):
             running = False
         was_running = getattr(self, "_ui_running", False)
+        if not running:
+            reset_gateway = getattr(self, "_reset_gateway_mode", None)
+            if callable(reset_gateway):
+                reset_gateway(reason="disconnect", stop=True)
         self._ui_running = bool(running)
         self.connecting = False
         self.proxy_mode.setEnabled(True)
         self.tun_mode.setEnabled(True)
         self.tun_option.setEnabled(True)
         self.proxy_option.setEnabled(not self._tun_mode_enabled())
+        sync_gateway = getattr(self, "_sync_gateway_controls", None)
+        if callable(sync_gateway):
+            sync_gateway()
         if running:
             self.connection_error = ""; self._set_connection_visual("connected")
             self._set_activity("اتصال امن برقرار شد.", "Connection established.", "success", False)
@@ -5954,6 +6921,15 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(0, self._queue_tun_mode_apply)
             elif not self._tun_mode_enabled():
                 QTimer.singleShot(0, self._queue_proxy_mode_apply)
+            gateway_runtime = getattr(self, "_gateway_runtime_active", None)
+            if (getattr(self, "_gateway_requested", False)
+                    and callable(gateway_runtime)
+                    and not gateway_runtime()):
+                QTimer.singleShot(
+                    0, lambda: self._queue_gateway_mode_apply(
+                        True, reason="user"
+                    )
+                )
         elif self.connection_error:
             self._set_connection_visual("error")
         else:
@@ -5980,31 +6956,69 @@ class MainWindow(QMainWindow):
         self._target_latency_generation += 1
         generation = self._target_latency_generation
         use_tun = bool(getattr(self.engine, "tun_running", False))
+        proxy_active = bool(
+            not use_tun
+            and getattr(self.engine, "running", False)
+            and getattr(self.engine, "_proxy_enabled", False)
+        )
+        run_id = int(getattr(self.engine, "run_id", 0) or 0)
 
         def work():
-            mode = "tun" if use_tun else "direct"
-            value = _tun_tls_latency_8888() if use_tun else _direct_ping_8888()
-            if value is None and use_tun:
+            if use_tun:
+                mode = "tun"
+                value = _tun_tls_latency_8888()
+            elif proxy_active:
+                mode = f"proxy|{run_id}"
+                value = self.engine.measure_proxy_latency(timeout=5.0)
+            else:
+                mode = "direct"
+                value = _direct_ping_8888()
+            if value is None and mode == "tun":
                 value = _direct_ping_8888()
                 mode = "direct-fallback"
             self.bridge.target_latency.emit(float(value or 0.0), mode, generation)
 
-        threading.Thread(target=work, name="latency-8.8.8.8", daemon=True).start()
+        thread_name = "latency-8.8.8.8" if use_tun else "latency-active-config"
+        threading.Thread(target=work, name=thread_name, daemon=True).start()
 
     def _target_latency_finished(self, milliseconds, mode, generation):
         if generation != self._target_latency_generation:
             return
         self._target_latency_busy = False
+        base_mode = str(mode).split("|", 1)[0]
         current_tun = bool(getattr(self.engine, "tun_running", False))
-        stale_mode = (mode == "tun" and not current_tun) or (mode == "direct" and current_tun)
+        current_proxy = bool(
+            not current_tun
+            and getattr(self.engine, "running", False)
+            and getattr(self.engine, "_proxy_enabled", False)
+        )
+        stale_mode = (
+            (base_mode == "tun" and not current_tun)
+            or (base_mode == "direct-fallback" and not current_tun)
+            or (base_mode == "direct" and (current_tun or current_proxy))
+            or (
+                base_mode == "proxy"
+                and (
+                    not current_proxy
+                    or str(getattr(self.engine, "run_id", 0))
+                    != str(mode).partition("|")[2]
+                )
+            )
+        )
         if not stale_mode:
             value = max(0.0, float(milliseconds))
             self.ping_label.setText(f"{value:.0f} ms" if value > 0 else "Timeout")
-            secondary = {
-                "tun": "8.8.8.8 • TUN TLS",
-                "direct": "8.8.8.8 • Direct ICMP",
-                "direct-fallback": "8.8.8.8 • Direct fallback",
-            }.get(mode, "8.8.8.8")
+            if base_mode == "proxy":
+                secondary = self.tr(
+                    "کانفیگ فعال • تأخیر زنده",
+                    "Active config • Live delay",
+                )
+            else:
+                secondary = {
+                    "tun": "8.8.8.8 • TUN TLS",
+                    "direct": "8.8.8.8 • Direct ICMP",
+                    "direct-fallback": "8.8.8.8 • Direct fallback",
+                }.get(base_mode, "8.8.8.8")
             self.latency_card.set_secondary(secondary)
             if value > 0:
                 self.latency_card.sparkline.add_value(value)
@@ -6658,6 +7672,7 @@ class MainWindow(QMainWindow):
         self._layout_tool_cards(self.width() < 1180)
         self._position_toast()
         self._position_update_notification()
+        self._position_gateway_devices_popup()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -6766,6 +7781,18 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self._tray is not None:
             self._tray.hide()
+        self._gateway_requested = False
+        self._cancel_gateway_apply()
+        self._set_gateway_toggle(False)
+        self._sync_gateway_controls()
+        try:
+            disable_gateway = getattr(self.engine, "disable_gateway", None)
+            if callable(disable_gateway):
+                disable_gateway(reason="shutdown")
+        except Exception as exc:
+            self._pending_file_log_lines.append(
+                f"Shutdown gateway cleanup pending: {exc}"
+            )
         self._target_latency_generation += 1
         self._target_latency_timer.stop()
         self._bypass_apply_timer.stop()
@@ -6773,6 +7800,8 @@ class MainWindow(QMainWindow):
         self._maker_cancel_event.set()
         self._maker_generation += 1
         self._maker_import_generation += 1
+        self._profile_ping_cancel.set()
+        self._profile_ping_generation += 1
         maker_tester, self._maker_tester = self._maker_tester, None
         if maker_tester is not None:
             try:
@@ -6793,6 +7822,9 @@ class MainWindow(QMainWindow):
             self._flush_log_buffer(final=True)
 
     def closeEvent(self, event):
+        popup = getattr(self, "gateway_devices_popup", None)
+        if popup is not None:
+            popup.hide()
         if not self._force_quit:
             action = self._ask_close_action()
             if action == "tray" and self._hide_to_tray():
@@ -6895,12 +7927,34 @@ QLabel#metricLabel, QLabel#fieldLabel { color: #a9bdd7; font-size: 11px; font-we
 QLabel#metricValue { color: #f7fbff; font-size: 22px; font-weight: 850; }
 QLabel#metricSecondary { color: #55e7df; font-family: "Cascadia Mono", "Segoe UI", "Consolas"; font-size: 11px; font-weight: 650; }
 QFrame#quickControls, QFrame#sniActionBar { background: rgba(9,25,54,0.86); border: 1px solid rgba(54,211,255,0.24); border-radius: 18px; }
-QFrame#toggleOption, QFrame#proxyModeOption, QFrame#tunModeOption, QFrame#carrierControl { background: rgba(8,24,47,0.74); border: 1px solid rgba(54,211,255,0.13); border-radius: 12px; }
-QFrame#toggleOption:hover, QFrame#proxyModeOption:hover, QFrame#tunModeOption:hover, QFrame#carrierControl:hover { border-color: rgba(54,211,255,0.35); background: rgba(12,36,61,0.82); }
+QFrame#toggleOption, QFrame#proxyModeOption, QFrame#tunModeOption, QFrame#gatewayModeOption, QFrame#carrierControl { background: rgba(8,24,47,0.74); border: 1px solid rgba(54,211,255,0.13); border-radius: 12px; }
+QFrame#toggleOption:hover, QFrame#proxyModeOption:hover, QFrame#tunModeOption:hover, QFrame#gatewayModeOption:hover, QFrame#carrierControl:hover { border-color: rgba(54,211,255,0.35); background: rgba(12,36,61,0.82); }
 QFrame#proxyModeOption[active="true"] { border-color: rgba(35,245,224,0.38); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,55,64,0.84),stop:1 rgba(10,35,63,0.82)); }
 QFrame#proxyModeOption[active="false"] { border-color: rgba(111,145,181,0.24); background: rgba(8,21,40,0.72); }
 QFrame#tunModeOption[active="true"] { border-color: rgba(97,220,255,0.62); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,60,78,0.92),stop:1 rgba(28,39,91,0.88)); }
 QFrame#tunModeOption[active="false"] { border-color: rgba(111,145,181,0.24); background: rgba(8,21,40,0.72); }
+QFrame#gatewayModeOption[state="requested"], QFrame#gatewayModeOption[state="starting"] { border-color: rgba(255,209,102,0.64); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(74,56,24,0.9),stop:1 rgba(16,46,68,0.9)); }
+QFrame#gatewayModeOption[state="stopping"] { border-color: rgba(255,118,145,0.58); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(69,26,48,0.9),stop:1 rgba(16,39,65,0.9)); }
+QFrame#gatewayModeOption[state="active"] { border-color: rgba(102,255,231,0.78); background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 rgba(8,78,74,0.94),stop:0.55 rgba(11,55,78,0.94),stop:1 rgba(55,35,104,0.92)); }
+QFrame#gatewayModeOption[state="off"] { border-color: rgba(111,145,181,0.24); background: rgba(8,21,40,0.72); }
+QToolButton#gatewayDevicesBadge { min-width: 48px; max-width: 76px; min-height: 24px; max-height: 24px; padding: 0 8px; color: #a9bdd4; background: #0a2038; border: 1px solid rgba(91,143,183,0.48); border-radius: 10px; font-size: 10px; font-weight: 850; }
+QToolButton#gatewayDevicesBadge:hover, QToolButton#gatewayDevicesBadge:focus { color: #f2ffff; background: rgba(12,61,75,0.94); border-color: rgba(91,255,239,0.76); }
+QToolButton#gatewayDevicesBadge[gatewayActive="true"] { color: #dffffa; border-color: rgba(35,245,224,0.54); background: rgba(7,68,71,0.86); }
+QToolButton#gatewayDevicesBadge[hasDevices="true"] { color: #edfff8; border-color: rgba(35,245,166,0.72); background: rgba(6,78,63,0.92); }
+QFrame#gatewayDevicesPopup { background-color: #081b33; border: 1px solid #278c9f; border-radius: 17px; }
+QLabel#gatewayPopupIcon { background: rgba(11,74,82,0.76); border: 1px solid rgba(73,246,231,0.38); border-radius: 11px; }
+QLabel#gatewayPopupTitle { color: #f5ffff; font-size: 14px; font-weight: 900; }
+QLabel#gatewayPopupSubtitle { color: #87a8c5; font-size: 10px; font-weight: 600; }
+QLabel#gatewayPopupCount { color: #aaffee; background: rgba(7,67,69,0.66); border: 1px solid rgba(35,245,224,0.3); border-radius: 9px; padding: 4px 8px; font-size: 10px; font-weight: 850; }
+QScrollArea#gatewayDevicesScroll, QScrollArea#gatewayDevicesScroll > QWidget, QWidget#gatewayDevicesList { background: transparent; border: 0; }
+QFrame#gatewayDeviceRow { background: rgba(8,30,54,0.88); border: 1px solid rgba(69,151,190,0.3); border-radius: 11px; }
+QFrame#gatewayDeviceRow:hover { background: rgba(10,46,65,0.94); border-color: rgba(35,245,224,0.5); }
+QLabel#gatewayDeviceCheck { background: rgba(9,78,61,0.48); border: 1px solid rgba(35,245,166,0.34); border-radius: 9px; }
+QLabel#gatewayDeviceIp { color: #f2fbff; font-size: 12px; font-weight: 800; }
+QLabel#gatewayDeviceMac { color: #7999b9; font-size: 9px; font-weight: 600; }
+QLabel#gatewayDeviceState { color: #55f5b4; font-size: 10px; font-weight: 850; }
+QFrame#gatewayDeviceEmpty { background: rgba(7,21,42,0.62); border: 1px dashed rgba(86,137,177,0.35); border-radius: 12px; }
+QLabel#gatewayDeviceEmptyText { color: #8da6bf; font-size: 11px; font-weight: 650; }
 QLabel#controlLabel { color: #d3e0ee; font-size: 12px; font-weight: 650; }
 QCheckBox#toggleSwitch { background: transparent; border: 0; padding: 0; }
 
@@ -6997,9 +8051,14 @@ QToolButton#profileRowActivate[active="true"] { background: rgba(25,111,111,0.72
 QToolButton#profileRowEdit, QToolButton#profileRowDelete { background: rgba(9,31,55,0.88); border: 1px solid rgba(74,130,168,0.42); border-radius: 8px; padding: 0; }
 QToolButton#profileRowEdit:hover { background: rgba(21,73,98,0.94); border-color: rgba(98,220,255,0.78); }
 QToolButton#profileRowDelete:hover { background: rgba(91,25,45,0.94); border-color: rgba(255,98,125,0.86); }
+QLabel#profileRowPing { background: rgba(10,31,54,0.98); border: 1px solid rgba(86,135,173,0.55); border-radius: 9px; color: #8faac1; font-family: "Cascadia Mono", "Segoe UI"; font-size: 12px; font-weight: 900; }
+QLabel#profileRowPing[state="fast"] { background: rgba(10,82,75,0.92); border-color: rgba(35,245,166,0.72); color: #b9ffeb; }
+QLabel#profileRowPing[state="medium"] { background: rgba(88,67,18,0.9); border-color: rgba(255,209,102,0.7); color: #ffe8a8; }
+QLabel#profileRowPing[state="slow"] { background: rgba(89,29,49,0.92); border-color: rgba(255,92,124,0.72); color: #ffc0ce; }
 QFrame#profileSelectionBar { background: rgba(7,27,49,0.98); border: 1px solid rgba(54,211,255,0.22); border-radius: 9px; }
 QLabel#profileSelectionLabel { background: transparent; border: 0; color: #a9c7dc; font-size: 11px; font-weight: 700; }
 QCheckBox#profileSelectAll { background: transparent; border: 0; padding: 0; }
+QComboBox#profileSortCombo { background: rgba(5,22,40,0.98); border: 1px solid rgba(82,148,188,0.52); border-radius: 8px; padding: 3px 9px; font-size: 11px; font-weight: 700; }
 
 QFrame#scanControlCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(10,31,62,0.94),stop:1 rgba(7,22,45,0.92)); border: 1px solid rgba(54,211,255,0.26); border-radius: 19px; }
 QFrame#scanOptions { background: rgba(7,24,48,0.82); border: 1px solid rgba(54,211,255,0.18); border-radius: 14px; }

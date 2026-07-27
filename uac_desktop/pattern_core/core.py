@@ -356,6 +356,10 @@ class PatternSniCore:
         """The edge selected by the live Pattern route, or an empty string."""
         return self._preferred_edge or ""
 
+    @property
+    def edge_addresses(self) -> tuple[str, ...]:
+        return tuple(self._edges)
+
     @staticmethod
     def _fake_sni_bytes(value: str) -> bytes:
         try:

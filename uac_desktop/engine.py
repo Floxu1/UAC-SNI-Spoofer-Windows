@@ -20,6 +20,7 @@ import psutil
 import requests
 
 from . import __version__
+from .gateway import GatewayManager
 from .models import ProxyProfile, Tuning, parse_outbound
 from .pattern_core import PatternSniCore
 from .paths import (BIN, DATA_DIR, SING_BOX_CONFIG, SING_BOX_OWNER_FILE,
@@ -803,7 +804,7 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
     parsed = parse_outbound(profile)
     inbounds = [
         {"listen": "127.0.0.1", "port": SOCKS_PORT, "protocol": "socks", "tag": "socks-in",
-         "settings": {"auth": "noauth", "udp": True}},
+         "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"}},
         {"listen": "127.0.0.1", "port": HTTP_PORT, "protocol": "http", "tag": "http-in",
          "settings": {"allowTransparent": False}},
     ]
@@ -844,7 +845,6 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
     elif parsed["security"] == "tls":
         tls = {
             "serverName": parsed["sni"],
-            "allowInsecure": parsed["insecure"],
         }
         if tuning.carrier_mode == "mci" and parsed["network"] in {
                 "ws", "httpupgrade"}:
@@ -893,7 +893,7 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         }
     else:
         raise ValueError(f"Unsupported transport: {parsed['network']}")
-    rules = [{"type": "field", "network": "udp", "port": "443", "outboundTag": "block"}]
+    rules = []
 
     if bypass_processes:
         rules.insert(0, {"type": "field", "process": bypass_processes, "outboundTag": "direct"})
@@ -913,9 +913,11 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
             and not parsed["flow"]):
         proxy_outbound["mux"] = {
             "enabled": True,
-
-
             "concurrency": max(1, min(32, int(tuning.xray_mux_concurrency))),
+            "xudpConcurrency": max(
+                1, min(32, int(tuning.xray_mux_concurrency))
+            ),
+            "xudpProxyUDP443": "allow",
         }
     return {
         "log": {"loglevel": xray_log_level},
@@ -930,12 +932,46 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
 
 
 def build_singbox_tun_config(
-        bypass_processes: list[str] | None = None) -> dict:
+        bypass_processes: list[str] | None = None,
+        direct_edge_addresses: list[str] | tuple[str, ...] | None = None,
+        gateway_networks: list[str] | tuple[str, ...] | None = None,
+        gateway_host_addresses: list[str] | tuple[str, ...] | None = None,
+        gateway_interface: str | None = None) -> dict:
     direct_rules = [
         {"process_name": ["xray.exe"], "action": "route", "outbound": "direct"},
-        {"port": 53, "action": "hijack-dns"},
-        {"network": "icmp", "action": "route", "outbound": "direct"},
     ]
+    edges = []
+    for value in direct_edge_addresses or []:
+        try:
+            address = str(ipaddress.IPv4Address(str(value)))
+        except ipaddress.AddressValueError:
+            continue
+        if address not in edges:
+            edges.append(address)
+    app_process = os.path.basename(sys.executable).strip()
+    if edges and app_process:
+        direct_rules.append({
+            "process_name": [app_process],
+            "ip_cidr": [f"{address}/32" for address in edges],
+            "action": "route",
+            "outbound": "direct",
+        })
+    networks = []
+    for value in gateway_networks or []:
+        try:
+            network = ipaddress.ip_network(str(value).strip(), strict=False)
+        except ValueError:
+            continue
+        if network.version != 4:
+            continue
+        normalized = str(network)
+        if normalized not in networks:
+            networks.append(normalized)
+    source_scope = {"source_ip_cidr": networks} if networks else {}
+    direct_rules.extend([
+        {**source_scope, "port": 53, "action": "hijack-dns"},
+        {"network": "icmp", "action": "route", "outbound": "direct"},
+    ])
     processes = []
     protected = {"sing-box.exe", os.path.basename(sys.executable).lower()}
     for value in bypass_processes or []:
@@ -949,9 +985,28 @@ def build_singbox_tun_config(
             "action": "route",
             "outbound": "direct",
         })
-    direct_rules.extend([
-        {"ip_is_private": True, "action": "route", "outbound": "direct"},
-    ])
+    if networks:
+        direct_rules.append({
+            "source_ip_cidr": networks,
+            "ip_cidr": networks,
+            "action": "route",
+            "outbound": "direct",
+        })
+        direct_rules.append({
+            "source_ip_cidr": networks,
+            "action": "route",
+            "outbound": "proxy",
+        })
+    else:
+        direct_rules.append({
+            "ip_is_private": True,
+            "action": "route",
+            "outbound": "direct",
+        })
+    direct_outbound = {"type": "direct", "tag": "direct"}
+    physical_interface = str(gateway_interface or "").strip()
+    if networks and physical_interface:
+        direct_outbound["bind_interface"] = physical_interface
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -962,6 +1017,17 @@ def build_singbox_tun_config(
                 "server_port": 53,
                 "detour": "proxy",
             }],
+            **({
+                "rules": [{
+                    "domain_regex": [
+                        r"(?i)\.(?:instagram\.com|facebook\.com|"
+                        r"cdninstagram\.com|fbcdn\.net|fbsbx\.com)"
+                        r"\.(?:home|lan|localdomain)$",
+                    ],
+                    "action": "predefined",
+                    "rcode": "NXDOMAIN",
+                }],
+            } if networks else {}),
             "final": "remote-dns",
             "strategy": "ipv4_only",
         },
@@ -972,7 +1038,12 @@ def build_singbox_tun_config(
             "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
             "mtu": 1400,
             "auto_route": True,
-            "strict_route": True,
+            "strict_route": not bool(networks),
+            **({
+                "route_exclude_address": [
+                    f"{address}/32" for address in edges
+                ],
+            } if edges else {}),
             "stack": "mixed",
         }],
         "outbounds": [
@@ -983,7 +1054,7 @@ def build_singbox_tun_config(
                 "server_port": SOCKS_PORT,
                 "version": "5",
             },
-            {"type": "direct", "tag": "direct"},
+            direct_outbound,
         ],
         "route": {
             "auto_detect_interface": True,
@@ -999,6 +1070,7 @@ class Engine:
         self.log, self.state, self.traffic = log, state, traffic
         self.fragment = PatternSniCore(log, traffic)
         self.system_proxy = WindowsProxy(log)
+        self.gateway = GatewayManager(engine=self, log=log)
         self.process: subprocess.Popen | None = None
         self.tun_process: subprocess.Popen | None = None
         self._tun_job_handle = None
@@ -1009,6 +1081,10 @@ class Engine:
         self._tun_run_id = 0
         self._active = False
         self._proxy_enabled = False
+        self._tun_leases: set[str] = set()
+        self._gateway_owns_tun = False
+        self._gateway_restore_proxy = False
+        self._tun_gateway_networks: tuple[str, ...] = ()
         self._bypass_processes: list[str] = []
         self._log_level = "normal"
         self.last_probe_ms: float | None = None
@@ -1035,6 +1111,10 @@ class Engine:
     @property
     def tun_running(self) -> bool:
         return self.tun_process is not None and self.tun_process.poll() is None
+
+    @property
+    def gateway_running(self) -> bool:
+        return bool(self.gateway.active)
 
     @property
     def run_id(self) -> int:
@@ -1639,6 +1719,15 @@ class Engine:
             self._check_cancel(cancel_event)
             if not self.running:
                 raise RuntimeError("Cannot enable Windows proxy before the engine is running")
+            if (
+                "gateway" in getattr(self, "_tun_leases", set())
+                and not getattr(self, "_tun_gateway_networks", ())
+            ):
+                self.system_proxy.suspend_for_tun()
+                self._gateway_restore_proxy = True
+                self._proxy_enabled = False
+                self._check_cancel(cancel_event)
+                return
             if not self._proxy_enabled:
                 self.system_proxy.resume()
                 self._proxy_enabled = True
@@ -1648,6 +1737,8 @@ class Engine:
         """Restore Windows proxy state without stopping Xray or Patterniha."""
         with self._lifecycle_lock:
             self._check_run_id(expected_run_id)
+            if "gateway" in getattr(self, "_tun_leases", set()):
+                self._gateway_restore_proxy = False
             if self._proxy_enabled or self.system_proxy.has_pending_restore:
                 try:
                     self.system_proxy.suspend()
@@ -1668,16 +1759,27 @@ class Engine:
                 self._proxy_enabled = False
 
     def enable_tun(self, cancel_event: threading.Event | None = None,
-                   expected_run_id: int | None = None) -> None:
+                   expected_run_id: int | None = None,
+                   gateway_networks: list[str] | tuple[str, ...] | None = None,
+                   gateway_host_addresses: list[str] | tuple[str, ...] | None = None,
+                   gateway_interface: str | None = None) -> None:
         with self._lifecycle_lock:
             self._check_run_id(expected_run_id)
             self._check_cancel(cancel_event)
             if not self.running:
                 raise RuntimeError("Cannot enable TUN before the engine is running")
             if self.tun_running:
+                if "gateway" in getattr(self, "_tun_leases", set()):
+                    self._gateway_owns_tun = False
                 return
             binary = self.ensure_tun_available()
-            config = build_singbox_tun_config(self._bypass_processes)
+            config = build_singbox_tun_config(
+                self._bypass_processes,
+                getattr(self.fragment, "edge_addresses", ()),
+                gateway_networks,
+                gateway_host_addresses,
+                gateway_interface,
+            )
             SING_BOX_CONFIG.write_text(
                 json.dumps(config, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -1705,6 +1807,10 @@ class Engine:
                     str(SING_BOX_CONFIG.parent),
                 )
                 self.tun_process = process
+                self._tun_gateway_networks = tuple(
+                    config["route"]["rules"][-1].get("source_ip_cidr", ())
+                    if config["route"]["final"] == "direct" else ()
+                )
                 self._tun_run_id += 1
                 run_id = self._tun_run_id
                 self._write_singbox_owner_record(process)
@@ -1740,7 +1846,127 @@ class Engine:
     def disable_tun(self, expected_run_id: int | None = None) -> None:
         with self._lifecycle_lock:
             self._check_run_id(expected_run_id)
+            if "gateway" in getattr(self, "_tun_leases", set()):
+                self._gateway_owns_tun = True
+                return
             self._stop_tun_locked()
+
+    def acquire_tun(self, owner: str,
+                    cancel_event: threading.Event | None = None,
+                    expected_run_id: int | None = None,
+                    gateway_networks: list[str] | tuple[str, ...] | None = None,
+                    gateway_host_addresses: list[str] | tuple[str, ...] | None = None,
+                    gateway_interface: str | None = None) -> None:
+        owner = str(owner or "").strip()
+        if not owner:
+            raise ValueError("TUN lease owner is required")
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+            self._check_cancel(cancel_event)
+            if owner in self._tun_leases:
+                return
+            if not self.running:
+                raise RuntimeError("Cannot acquire TUN before the engine is running")
+            was_running = self.tun_running
+            restore_proxy = (
+                owner == "gateway"
+                and self._proxy_enabled
+                and not gateway_networks
+            )
+            try:
+                if not was_running:
+                    self.enable_tun(
+                        cancel_event,
+                        expected_run_id,
+                        gateway_networks=gateway_networks,
+                        gateway_host_addresses=gateway_host_addresses,
+                        gateway_interface=gateway_interface,
+                    )
+                if restore_proxy:
+                    self.suspend_system_proxy_for_tun(expected_run_id)
+                self._check_cancel(cancel_event)
+            except Exception:
+                if not was_running:
+                    try:
+                        self._stop_tun_locked()
+                    except Exception:
+                        pass
+                if restore_proxy and self.running and not self.tun_running:
+                    try:
+                        self.system_proxy.resume()
+                        self._proxy_enabled = True
+                    except Exception:
+                        pass
+                raise
+            self._tun_leases.add(owner)
+            if owner == "gateway":
+                self._gateway_owns_tun = not was_running
+                self._gateway_restore_proxy = restore_proxy
+
+    def release_tun(self, owner: str,
+                    expected_run_id: int | None = None) -> None:
+        owner = str(owner or "").strip()
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+            if owner not in self._tun_leases:
+                return
+            owns_tun = owner == "gateway" and self._gateway_owns_tun
+            restore_proxy = owner == "gateway" and self._gateway_restore_proxy
+            self._tun_leases.discard(owner)
+            if owner == "gateway":
+                self._gateway_owns_tun = False
+                self._gateway_restore_proxy = False
+            if owns_tun and not self._tun_leases:
+                self._stop_tun_locked()
+            if (restore_proxy and self.running and not self.tun_running
+                    and not self._proxy_enabled):
+                self.system_proxy.resume()
+                self._proxy_enabled = True
+
+    def enable_gateway(self, cancel_event: threading.Event | None = None,
+                       expected_run_id: int | None = None) -> None:
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+            self._check_cancel(cancel_event)
+            if not self.running:
+                raise RuntimeError("Cannot enable Mobile Gateway before the engine is running")
+            run_id = self._run_id
+        self.gateway.start(
+            engine=self,
+            health_check=lambda: self.running and self._run_id == run_id,
+            tun_alias="UAC-Spoofer",
+            cancel_event=cancel_event,
+        )
+        try:
+            with self._lifecycle_lock:
+                self._check_run_id(expected_run_id)
+                self._check_cancel(cancel_event)
+        except Exception:
+            self.gateway.stop("cancelled")
+            raise
+        if isinstance(self.gateway, GatewayManager):
+            def warm_gateway():
+                for url in (
+                        "https://www.gstatic.com/generate_204",
+                        "https://www.youtube.com/generate_204"):
+                    if (
+                            (cancel_event is not None and cancel_event.is_set())
+                            or not self.running
+                            or not self.gateway_running
+                            or self._run_id != run_id):
+                        return
+                    self.warmup(url=url, timeout=2.5, cancel_event=cancel_event)
+            threading.Thread(
+                target=warm_gateway,
+                name="mobile-gateway-warmup",
+                daemon=True,
+            ).start()
+
+    def disable_gateway(self, reason: str = "user",
+                        expected_run_id: int | None = None) -> bool:
+        with self._lifecycle_lock:
+            self._check_run_id(expected_run_id)
+        return bool(self.gateway.stop(str(reason or "user")))
 
     def _stop_tun_locked(self) -> None:
         process = getattr(self, "tun_process", None)
@@ -1787,6 +2013,7 @@ class Engine:
                 self.log(f"sing-box TUN job cleanup pending: {exc}")
             self._tun_job_handle = None
         self.tun_process = None
+        self._tun_gateway_networks = ()
         self._tun_run_id = int(getattr(self, "_tun_run_id", 0)) + 1
         self._remove_singbox_owner_record(process.pid)
         if was_running:
@@ -1898,6 +2125,36 @@ class Engine:
             errors.append(f"{checked_url}: {detail}")
         self.log("CONNECTIVITY CHECK FAILED " + " | ".join(errors))
         return False, " | ".join(errors)
+
+    def measure_proxy_latency(
+            self, timeout: float = 5.0,
+            url: str = "https://www.gstatic.com/generate_204") -> float | None:
+        if not self.running:
+            return None
+        proxies = {
+            "http": f"http://127.0.0.1:{HTTP_PORT}",
+            "https": f"http://127.0.0.1:{HTTP_PORT}",
+        }
+        session = requests.Session()
+        session.trust_env = False
+        response = None
+        started = time.perf_counter()
+        try:
+            response = session.get(
+                url, proxies=proxies, timeout=max(1.0, float(timeout)),
+                headers={"User-Agent": USER_AGENT, "Connection": "close"},
+                stream=True,
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            if 200 <= response.status_code < 500:
+                return max(1.0, elapsed_ms)
+        except Exception:
+            return None
+        finally:
+            if response is not None:
+                response.close()
+            session.close()
+        return None
 
     def probe_download(self, size: int = DOWNLOAD_PROBE_BYTES, timeout: float = 2.0,
                        cancel_event: threading.Event | None = None) -> tuple[bool | None, str]:
@@ -2041,12 +2298,15 @@ class Engine:
                 self.log("XRAY " + clean)
         if suppressed_client_aborts:
             self.log(f"XRAY client-abort noise suppressed {suppressed_client_aborts} lines")
+        should_stop = False
         with self._lifecycle_lock:
             if self.process is not process or self._run_id != run_id:
                 return
             if self._active:
                 self.log("XRAY process stopped unexpectedly")
-                self._stop_locked(notify=True)
+                should_stop = True
+        if should_stop:
+            self.stop(notify=True)
 
     def _read_tun_logs(self, process: subprocess.Popen, run_id: int) -> None:
         if not process or not process.stdout:
@@ -2055,11 +2315,17 @@ class Engine:
             clean = line.strip()
             if clean:
                 self.log("SING-BOX " + clean)
+        should_stop = False
         with self._lifecycle_lock:
             if self.tun_process is not process or self._tun_run_id != run_id:
                 return
             self.log("SING-BOX TUN process stopped unexpectedly")
-            self._stop_locked(notify=True)
+            if "gateway" in getattr(self, "_tun_leases", set()):
+                self._stop_tun_locked()
+            else:
+                should_stop = True
+        if should_stop:
+            self.stop(notify=True)
 
     @staticmethod
     def _is_client_abort_noise(line: str) -> bool:
@@ -2189,49 +2455,72 @@ class Engine:
             session.close()
 
     def stop(self, notify: bool = True) -> None:
+        try:
+            self.gateway.before_engine_stop()
+        except Exception:
+            pass
         with self._lifecycle_lock:
             self._stop_locked(notify)
 
     def _stop_locked(self, notify: bool = True) -> None:
         was_active = self._active
-        self._stop_tun_locked()
+        errors: list[Exception] = []
+        try:
+            gateway = getattr(self, "gateway", None)
+            if gateway is not None:
+                gateway.before_engine_stop()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            if not hasattr(self, "_tun_leases"):
+                self._tun_leases = set()
+            self._tun_leases.discard("gateway")
+            self._gateway_owns_tun = False
+            self._gateway_restore_proxy = False
+        try:
+            self._stop_tun_locked()
+        except Exception as exc:
+            errors.append(exc)
         self._active = False
         self._run_id += 1
         process = self.process
         self.process = None
-        try:
-            if process:
-                try:
-                    if process.poll() is None:
-                        process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        try:
-                            process.wait(timeout=1)
-                        except subprocess.TimeoutExpired:
-                            pass
-                except (OSError, PermissionError):
-                    pass
-                self._remove_owner_record(process.pid)
-        finally:
-
-
-
+        if process:
             try:
-                self.fragment.stop()
-            finally:
-                self._bypass_processes = []
-                if self._proxy_enabled or self.system_proxy.has_pending_restore:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
                     try:
-                        self.system_proxy.disable()
-                    finally:
-                        self._proxy_enabled = self.system_proxy.has_pending_restore
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except Exception as exc:
+                errors.append(exc)
+            try:
+                self._remove_owner_record(process.pid)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            self.fragment.stop()
+        except Exception as exc:
+            errors.append(exc)
+        self._bypass_processes = []
+        if self._proxy_enabled or self.system_proxy.has_pending_restore:
+            try:
+                self.system_proxy.disable()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                self._proxy_enabled = self.system_proxy.has_pending_restore
         if was_active:
             self.log("VPN stopped")
             if notify:
                 self.state(False)
+        if errors:
+            raise errors[0]
 
 
 def format_bytes(value: int) -> str:

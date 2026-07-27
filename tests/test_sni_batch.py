@@ -16,6 +16,17 @@ from uac_desktop.sni_batch import (
 )
 
 
+def test_xray_tls_config_omits_removed_allow_insecure_option():
+    profile = parse_many(
+        "vless://00000000-0000-4000-8000-000000000001@example.com:443"
+        "?security=tls&type=ws&sni=example.com&allowInsecure=1"
+    )[0]
+
+    tls = build_xray_config(profile)["outbounds"][0]["streamSettings"]["tlsSettings"]
+
+    assert "allowInsecure" not in tls
+
+
 VMESS_URI = (
     "vmess://11111111-1111-4111-8111-111111111111@127.0.0.1:40443"
     "?security=tls&sni=edge.example&type=ws&host=edge.example&path=/ws"

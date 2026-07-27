@@ -24,6 +24,7 @@ The desktop profiles are tuned separately for **MCI / Hamrah Aval** and **IranCe
 - Separate MCI, IranCell, and Auto carrier modes
 - Xray-based local SOCKS/HTTP tunnel
 - Optional system-wide sing-box TUN mode for Windows TCP and UDP traffic
+- Mobile Gateway for sharing the active connection with devices on the local network
 - Patterniha SNI and Edge scanner with live results
 - MCI TLS startup optimization
 - YouTube route warmup for faster video startup
@@ -44,6 +45,12 @@ SOCKS, VLESS, and Trojan do not transport ICMP. Ping requests therefore use a de
 
 Disabling TUN while connected removes its interface and routes immediately. If Windows Proxy is enabled, that mode is restored automatically. App Bypass process names are also translated into direct sing-box route rules.
 
+## Mobile Gateway
+
+Enable `Mobile Gateway` on the Home page to automatically discover devices on the same local network and route their traffic through the active UAC Spoofer connection. Mobile phones and other devices can keep their normal DHCP settings without manually configuring a proxy or static IP address.
+
+The badge beside the option shows the number of connected devices. Select it to view each device's IP address and connection state. Disconnecting the VPN, disabling Mobile Gateway, or exiting the application removes the gateway configuration and restores the previous Windows network state.
+
 ## Carrier support
 
 This application is tuned for the following carriers:
@@ -62,7 +69,7 @@ How to run:
 1. Download the following file from GitHub Releases:
 
 ```text
-UAC-Spoofer-Desktop-v1.0.5-Windows-x64-portable.zip
+UAC-Spoofer-Desktop-v1.0.6-Windows-x64-portable.zip
 ```
 
 2. Extract the full ZIP archive.

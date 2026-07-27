@@ -13,7 +13,11 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'kivy', 'kivymd', 'pygame', 'arcade', 'playwright'],
+    excludes=[
+        'tkinter', 'kivy', 'kivymd', 'pygame', 'arcade', 'playwright',
+        'numpy', 'matplotlib', 'IPython', 'pytest', 'PIL', 'cryptography',
+        'bcrypt', 'pygments', 'jedi',
+    ],
     noarchive=False,
     optimize=0,
 )

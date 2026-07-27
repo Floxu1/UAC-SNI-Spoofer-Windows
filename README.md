@@ -29,6 +29,7 @@ target="_blank">
 - حالت‌های جداگانه برای همراه اول، ایرانسل و حالت Auto
 - تونل محلی مبتنی بر Xray با پشتیبانی از SOCKS و HTTP
 - حالت اختیاری TUN سراسری با هسته sing-box برای عبور ترافیک TCP و UDP برنامه‌های ویندوز
+- قابلیت Mobile Gateway برای اشتراک‌گذاری اتصال فعال با دستگاه‌های متصل به شبکه محلی
 - اسکن و رتبه‌بندی SNI و Edge با نمایش نتیجه‌های زنده
 - بهینه‌سازی شروع اتصال TLS برای همراه اول
 - گرم‌سازی مسیر YouTube برای بهبود شروع پخش ویدیو
@@ -49,6 +50,12 @@ target="_blank">
 
 خاموش‌کردن TUN هنگام اتصال، رابط و Routeهای آن را همان لحظه حذف می‌کند و اگر گزینه Windows Proxy روشن باشد، پروکسی ویندوز دوباره فعال می‌شود. App Bypass نیز در کانفیگ sing-box به قانون Direct تبدیل می‌شود.
 
+## درگاه موبایل
+
+با فعال‌کردن `Mobile Gateway` در صفحه Home، برنامه دستگاه‌های متصل به همان شبکه محلی را به‌صورت خودکار شناسایی می‌کند و ترافیک آن‌ها را از اتصال فعال UAC Spoofer عبور می‌دهد. برای استفاده از این حالت نیازی به تغییر دستی Proxy یا تبدیل DHCP به Static در موبایل و دیگر دستگاه‌ها نیست.
+
+نشانگر کنار این گزینه تعداد دستگاه‌های متصل را نمایش می‌دهد و با کلیک روی آن می‌توان فهرست IP و وضعیت اتصال هر دستگاه را مشاهده کرد. با قطع VPN، خاموش‌کردن Mobile Gateway یا خروج از برنامه، تنظیمات شبکه ایجادشده پاک‌سازی و وضعیت قبلی سیستم بازیابی می‌شود.
+
 ## پشتیبانی از اپراتورها
 
 این برنامه برای دو اپراتور زیر تنظیم و بهینه‌سازی شده:
@@ -65,8 +72,8 @@ target="_blank">
 مراحل اجرا:
 
 1. فایل زیر را از بخش GitHub Releases دانلود کنید:
-<a href="https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/download/1.0.5/UAC-Spoofer-Desktop-v1.0.5-Windows-x64-portable.zip" target="_blank">
-UAC-Spoofer-Desktop-v1.0.5-Windows-x64-portable.zip
+<a href="https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/download/1.0.6/UAC-Spoofer-Desktop-v1.0.6-Windows-x64-portable.zip" target="_blank">
+UAC-Spoofer-Desktop-v1.0.6-Windows-x64-portable.zip
 </a>
 
 

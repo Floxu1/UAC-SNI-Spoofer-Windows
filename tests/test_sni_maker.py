@@ -234,6 +234,19 @@ def test_conversion_preserves_credentials_query_path_and_fragment():
     assert converted.id != original.id
 
 
+def test_conversion_rejects_removed_insecure_tls_and_invalid_vless_uuid():
+    insecure = _profile(
+        "vless://00000000-0000-4000-8000-000000000001@example.com:443"
+        "?security=tls&type=ws&sni=example.com&allowInsecure=1"
+    )
+    missing_uuid = _profile(
+        "vless://@example.com:443?security=tls&type=ws&sni=example.com"
+    )
+
+    assert convert_to_sni(insecure).error == "Unsupported insecure TLS option"
+    assert convert_to_sni(missing_uuid).error == "Missing VLESS UUID"
+
+
 def test_existing_sni_config_is_copied_without_rewrite():
     profile = _profile(
         "vless://00000000-0000-0000-0000-000000000001@127.0.0.1:40443"

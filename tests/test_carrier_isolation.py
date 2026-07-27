@@ -186,6 +186,38 @@ def test_proxy_option_remains_clickable_when_visual_state_is_off(qapp):
         option.close()
 
 
+def test_gateway_option_only_toggles_from_switch(qapp):
+    toggle = ToggleSwitch()
+    option = ToggleOptionFrame(toggle, row_click_enabled=False)
+    try:
+        option.resize(240, 50)
+        option.show()
+        toggle.show()
+        qapp.processEvents()
+
+        QTest.mouseClick(option, Qt.LeftButton, Qt.NoModifier, option.rect().center())
+        qapp.processEvents()
+        assert toggle.isChecked() is False
+
+        QTest.mouseClick(toggle, Qt.LeftButton, Qt.NoModifier, toggle.rect().center())
+        qapp.processEvents()
+        assert toggle.isChecked() is True
+    finally:
+        option.close()
+
+
+def test_gateway_programmatic_reset_updates_switch_visual(qapp):
+    toggle = ToggleSwitch()
+    toggle.setChecked(True)
+    toggle._set_thumb_position(1.0)
+    dummy = SimpleNamespace(gateway_mode=toggle)
+
+    MainWindow._set_gateway_toggle(dummy, False)
+
+    assert toggle.isChecked() is False
+    assert toggle.thumbPosition == 0.0
+
+
 def test_home_dashboard_has_no_scroll_and_fits_minimum_window(qapp, tmp_path, monkeypatch):
     _redirect_storage(monkeypatch, tmp_path)
     monkeypatch.setattr(MainWindow, "_setup_tray", lambda self: None)

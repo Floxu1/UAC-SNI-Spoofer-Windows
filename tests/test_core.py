@@ -48,6 +48,18 @@ def test_xray_has_socks_and_http_inbounds():
     assert config["outbounds"][0]["protocol"] == "trojan"
 
 
+def test_xray_routes_quic_instead_of_blackholing_it():
+    config = build_xray_config(default_profiles()[0])
+    assert config["inbounds"][0]["settings"]["udp"] is True
+    assert config["inbounds"][0]["settings"]["ip"] == "127.0.0.1"
+    assert not any(
+        rule.get("network") == "udp"
+        and str(rule.get("port")) == "443"
+        and rule.get("outboundTag") == "block"
+        for rule in config["routing"]["rules"]
+    )
+
+
 def test_xray_hostname_is_resolved_before_tun_without_changing_tls_name(monkeypatch):
     profile = ProxyProfile(
         source_uri=(
@@ -93,7 +105,7 @@ def test_singbox_tun_config_routes_web_to_socks_and_icmp_direct():
     assert config["route"]["rules"][0] == {
         "process_name": ["xray.exe"], "action": "route", "outbound": "direct",
     }
-    assert config["route"]["rules"][1] == {"port": 53, "action": "hijack-dns"}
+    assert {"port": 53, "action": "hijack-dns"} in config["route"]["rules"]
     assert {
         "network": "icmp", "action": "route", "outbound": "direct",
     } in config["route"]["rules"]
@@ -103,7 +115,10 @@ def test_singbox_tun_config_routes_web_to_socks_and_icmp_direct():
         "outbound": "direct",
     } in config["route"]["rules"]
     assert config["outbounds"][0]["server_port"] == SOCKS_PORT
-    assert config["dns"]["servers"][0]["detour"] == "proxy"
+    dns = config["dns"]["servers"][0]
+    assert dns["type"] == "tcp"
+    assert dns["server_port"] == 53
+    assert dns["detour"] == "proxy"
 
 
 def test_singbox_bypass_never_excludes_the_probe_process():
@@ -124,7 +139,12 @@ def test_singbox_bypass_never_excludes_the_probe_process():
 def test_xray_mux_defaults_are_bounded_and_can_be_disabled():
     profile = default_profiles()[0]
     config = build_xray_config(profile, tuning=Tuning(xray_mux_concurrency=999))
-    assert config["outbounds"][0]["mux"] == {"enabled": True, "concurrency": 32}
+    assert config["outbounds"][0]["mux"] == {
+        "enabled": True,
+        "concurrency": 32,
+        "xudpConcurrency": 32,
+        "xudpProxyUDP443": "allow",
+    }
     no_mux = build_xray_config(profile, tuning=Tuning(xray_mux_enabled=False))
     assert "mux" not in no_mux["outbounds"][0]
     assert build_xray_config(profile, tuning=Tuning(log_level="minimal"))["log"]["loglevel"] == "warning"

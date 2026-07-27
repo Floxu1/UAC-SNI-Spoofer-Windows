@@ -6,6 +6,47 @@ import time
 from uac_desktop import network
 
 
+def test_profile_real_delay_stops_after_tls_handshake(monkeypatch):
+    calls = {}
+
+    class RawSocket:
+        def settimeout(self, timeout):
+            calls["timeout"] = timeout
+
+        def close(self):
+            calls["raw_closed"] = True
+
+    class TlsSocket:
+        def close(self):
+            calls["tls_closed"] = True
+
+    class Context:
+        def wrap_socket(self, raw, server_hostname):
+            calls["sni"] = server_hostname
+            return TlsSocket()
+
+    monkeypatch.setattr(
+        network.socket, "create_connection",
+        lambda address, timeout: (
+            calls.update(address=address, connect_timeout=timeout)
+            or RawSocket()
+        ),
+    )
+    monkeypatch.setattr(network.ssl, "create_default_context", Context)
+    ticks = iter((10.0, 10.175))
+    monkeypatch.setattr(network.time, "perf_counter", lambda: next(ticks))
+
+    ok, latency = network.profile_real_delay(
+        "104.19.229.21", 443, "cover.example", 2.5
+    )
+
+    assert ok is True
+    assert round(latency) == 175
+    assert calls["address"] == ("104.19.229.21", 443)
+    assert calls["sni"] == "cover.example"
+    assert calls["tls_closed"] is True
+
+
 def _failed_trace() -> dict:
     return {
         "tls": False,

@@ -289,6 +289,27 @@ def test_applied_sni_is_displayed_and_used_for_verified_profile_without_changing
     )
 
 
+def test_verified_user_config_uses_its_healthy_sni_first_and_respects_limit():
+    profile = ProxyProfile(
+        id="healthy-user-config",
+        origin="sni-maker",
+        verified_spoof=True,
+        spoof_fake_sni="known.good",
+    )
+    dummy = SimpleNamespace(
+        storage=SimpleNamespace(tuning=Tuning(carrier_mode="irancell")),
+        _sni_candidates=lambda *_args: [
+            "global-one.example",
+            "global-two.example",
+            "global-three.example",
+        ],
+    )
+
+    assert MainWindow._profile_sni_candidates(
+        dummy, profile, "irancell", 2,
+    ) == ["known.good", "global-one.example"]
+
+
 def test_forced_profile_overrides_auto_mode_country_order(monkeypatch):
     preferred = ProxyProfile(id="clicked", origin="verified", verified_spoof=True)
     other = ProxyProfile(id="other", origin="verified", verified_spoof=True)
@@ -315,6 +336,12 @@ def test_forced_profile_overrides_auto_mode_country_order(monkeypatch):
     )
 
     assert ordered == [preferred]
+
+
+def test_forced_user_config_keeps_mci_tls_strategy_in_auto_mode():
+    assert MainWindow._initial_connection_strategy("mci", "") == "tls_sni_records"
+    assert MainWindow._initial_connection_strategy("irancell", "") == "wrong_seq"
+    assert MainWindow._initial_connection_strategy("mci", "DE") == "wrong_seq"
 
 
 def test_profile_click_reconnects_only_when_tunnel_is_active():
@@ -455,6 +482,35 @@ def test_latency_card_falls_back_to_direct_8888_ping():
     assert label.text == "62 ms"
     assert secondary[-1] == "8.8.8.8 • Direct fallback"
     assert sparkline == [62.0]
+
+
+def test_latency_card_shows_active_proxy_config_delay():
+    label = SimpleNamespace(text="", setText=lambda value: setattr(label, "text", value))
+    secondary = []
+    sparkline = []
+    dummy = SimpleNamespace(
+        ping_label=label,
+        latency_card=SimpleNamespace(
+            set_secondary=secondary.append,
+            sparkline=SimpleNamespace(add_value=sparkline.append),
+        ),
+        engine=SimpleNamespace(
+            tun_running=False,
+            running=True,
+            _proxy_enabled=True,
+            run_id=12,
+        ),
+        tr=lambda fa, en: en,
+        _target_latency_generation=9,
+        _target_latency_busy=True,
+        _target_latency_pending=False,
+    )
+
+    MainWindow._target_latency_finished(dummy, 143.4, "proxy|12", 9)
+
+    assert label.text == "143 ms"
+    assert secondary[-1] == "Active config • Live delay"
+    assert sparkline == [143.4]
 
 
 @pytest.mark.parametrize(

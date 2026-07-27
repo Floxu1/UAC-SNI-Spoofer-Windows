@@ -6,6 +6,7 @@ import sys
 import ctypes
 
 from uac_desktop.engine import WindowsProxy
+from uac_desktop.gateway import GatewayManager
 
 
 _INSTANCE_MUTEX = None
@@ -62,6 +63,10 @@ def proxy_watchdog_mode(arguments: list[str]) -> int | None:
     return WindowsProxy.run_watchdog(parent_pid, parent_create_time, token)
 
 
+def gateway_watchdog_mode(arguments: list[str]) -> int | None:
+    return GatewayManager.watchdog_mode(arguments)
+
+
 def run_event_loop(app, window) -> int:
     """Guarantee a final in-process restore; the watchdog is the hard-kill fallback."""
     owner = WindowsProxy.process_identity()
@@ -79,6 +84,12 @@ def run_event_loop(app, window) -> int:
         except Exception:
             pass
         try:
+            gateway = getattr(window.engine, "gateway", None)
+            if gateway is not None:
+                gateway.recover(force=True)
+        except Exception:
+            pass
+        try:
             WindowsProxy.recover_stale(expected_pid=int(owner["pid"]),
                                        expected_create_time=float(owner["create_time"]))
         except Exception:
@@ -87,6 +98,9 @@ def run_event_loop(app, window) -> int:
 
 
 def main() -> int:
+    gateway_watchdog_result = gateway_watchdog_mode(sys.argv[1:])
+    if gateway_watchdog_result is not None:
+        return gateway_watchdog_result
     watchdog_result = proxy_watchdog_mode(sys.argv[1:])
     if watchdog_result is not None:
         return watchdog_result
@@ -100,6 +114,10 @@ def main() -> int:
         pass
     if relaunch_as_admin():
         return 0
+    try:
+        GatewayManager().recover()
+    except Exception:
+        pass
 
 
     from PySide6.QtGui import QFont, QFontDatabase, QIcon
@@ -116,6 +134,7 @@ def main() -> int:
         QMessageBox.information(None, "UAC Spoofer Desktop", "UAC Spoofer is already running.")
         return 0
     WindowsProxy.recover_stale()
+    GatewayManager().recover()
     for font_file in ("Vazirmatn-Regular.ttf", "Vazirmatn-Bold.ttf"):
         QFontDatabase.addApplicationFont(str(ASSETS / "fonts" / font_file))
     app.setFont(QFont("Vazirmatn", 10))
