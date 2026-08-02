@@ -5,6 +5,8 @@ import subprocess
 import sys
 import ctypes
 
+os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+
 from uac_desktop.engine import WindowsProxy
 from uac_desktop.gateway import GatewayManager
 
@@ -67,6 +69,29 @@ def gateway_watchdog_mode(arguments: list[str]) -> int | None:
     return GatewayManager.watchdog_mode(arguments)
 
 
+def bootstrap_portable_npcap() -> bool:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return True
+    from uac_desktop.npcap import ensure_npcap
+
+    result = ensure_npcap()
+    if result.available:
+        return True
+    message = (
+        "Npcap setup was not completed.\n\n"
+        "Mobile Gateway needs Npcap. Restart the app and complete the "
+        "official Npcap installer when it opens.\n\n"
+        f"Details: {result.detail}"
+    )
+    ctypes.windll.user32.MessageBoxW(
+        None,
+        message,
+        "UAC Spoofer Desktop",
+        0x30,
+    )
+    return False
+
+
 def run_event_loop(app, window) -> int:
     """Guarantee a final in-process restore; the watchdog is the hard-kill fallback."""
     owner = WindowsProxy.process_identity()
@@ -114,6 +139,7 @@ def main() -> int:
         pass
     if relaunch_as_admin():
         return 0
+    bootstrap_portable_npcap()
     try:
         GatewayManager().recover()
     except Exception:
@@ -125,7 +151,6 @@ def main() -> int:
     from uac_desktop.paths import ASSETS
     from uac_desktop.ui import MainWindow, STYLE
 
-    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
     app = QApplication(sys.argv)
     app.setApplicationName("UAC Spoofer Desktop")
     app.setOrganizationName("UAC")
@@ -134,7 +159,10 @@ def main() -> int:
         QMessageBox.information(None, "UAC Spoofer Desktop", "UAC Spoofer is already running.")
         return 0
     WindowsProxy.recover_stale()
-    GatewayManager().recover()
+    try:
+        GatewayManager().recover()
+    except Exception:
+        pass
     for font_file in ("Vazirmatn-Regular.ttf", "Vazirmatn-Bold.ttf"):
         QFontDatabase.addApplicationFont(str(ASSETS / "fonts" / font_file))
     app.setFont(QFont("Vazirmatn", 10))

@@ -6,6 +6,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import requests
@@ -20,25 +21,22 @@ from uac_desktop.models import (ProxyProfile, Tuning, default_profiles,
                                 parse_many, parse_outbound)
 from uac_desktop.fragment_proxy import FragmentProxy
 from uac_desktop.pattern_core import PatternSniCore
-from uac_desktop.pattern_core.core import Quality
+from uac_desktop.pattern_core.core import PacketInjector, Quality
 from uac_desktop.pattern_core.packet_templates import ClientHelloMaker
 from uac_desktop.tls_tools import find_sni, fragments, make_client_hello
 from uac_desktop.ui import MainWindow
 from uac_desktop.storage import _write
 
 
-def test_all_mobile_and_verified_builtins_parse():
+def test_all_six_original_builtins_parse():
     profiles = default_profiles()
-    assert len(profiles) == 60
+    assert len(profiles) == 6
+    assert [profile.name for profile in profiles] == [
+        f"uacSpoofer {index}" for index in range(1, 7)
+    ]
     assert {x.protocol for x in profiles} == {"vless", "trojan"}
-    verified = [profile for profile in profiles if profile.verified_spoof]
-    assert len(verified) == 54
-    assert {profile.country_code for profile in verified} == {
-        "AT", "DE", "FI", "FR", "JP", "NL", "PL", "SG", "US", "XX",
-    }
-    assert all(profile.address == "104.19.229.21" for profile in verified)
-    assert all(profile.spoof_fake_sni == "static.cloudflare.com" for profile in verified)
-    assert sum(profile.rotating_exit for profile in verified) == 8
+    assert not any(profile.verified_spoof for profile in profiles)
+    assert not any(profile.country_code for profile in profiles)
 
 
 def test_xray_has_socks_and_http_inbounds():
@@ -103,6 +101,12 @@ def test_singbox_tun_config_routes_web_to_socks_and_icmp_direct():
     assert config["route"]["final"] == "proxy"
     assert config["route"]["auto_detect_interface"] is True
     assert config["route"]["rules"][0] == {
+        "process_name": ["xray.exe"],
+        "ip_cidr": ["127.0.0.0/8"],
+        "action": "route",
+        "outbound": "local-direct",
+    }
+    assert config["route"]["rules"][1] == {
         "process_name": ["xray.exe"], "action": "route", "outbound": "direct",
     }
     assert {"port": 53, "action": "hijack-dns"} in config["route"]["rules"]
@@ -155,10 +159,18 @@ def test_mci_pins_http1_alpn_without_changing_irancell():
     profile = default_profiles()[0]
     mci = build_xray_config(profile, tuning=Tuning.carrier_preset("mci"))
     irancell = build_xray_config(profile, tuning=Tuning.carrier_preset("irancell"))
+    user_profile = ProxyProfile(origin="sni-maker", source_uri=profile.source_uri)
+    mci_user = build_xray_config(
+        user_profile, tuning=Tuning.carrier_preset("mci")
+    )
     mci_tls = mci["outbounds"][0]["streamSettings"]["tlsSettings"]
     irancell_tls = irancell["outbounds"][0]["streamSettings"]["tlsSettings"]
+    mci_user_tls = mci_user["outbounds"][0]["streamSettings"]["tlsSettings"]
     assert mci_tls["alpn"] == ["http/1.1"]
+    assert mci_tls["fingerprint"] == "chrome"
     assert "alpn" not in irancell_tls
+    assert "fingerprint" not in irancell_tls
+    assert "fingerprint" not in mci_user_tls
 
 
 def test_tls_fragment_preserves_payload():
@@ -166,6 +178,7 @@ def test_tls_fragment_preserves_payload():
     assert find_sni(hello) == "www.speedtest.net"
     assert b"".join(fragments(hello, "sni_split")) == hello
     assert b"".join(fragments(hello, "multi", 5)) == hello
+    assert fragments(hello, "plain") == [hello]
 
 
 def test_httpupgrade_mapping():
@@ -289,6 +302,23 @@ def test_engine_uses_patterniha_core():
     assert isinstance(engine.fragment, PatternSniCore)
 
 
+def test_engine_running_requires_live_pattern_when_route_uses_it():
+    engine = Engine(lambda _: None, lambda _: None, lambda _up, _down: None)
+    engine._active = True
+    engine.process = RunningProcess()
+    engine._fragment_required = True
+    engine.fragment = SimpleNamespace(running=False)
+
+    assert engine.running is False
+
+    engine.fragment.running = True
+    assert engine.running is True
+
+    engine._fragment_required = False
+    engine.fragment.running = False
+    assert engine.running is True
+
+
 def test_pattern_client_hello_contains_configured_fake_sni():
     hello = ClientHelloMaker.get_client_hello_with(b"r" * 32, b"s" * 32, b"auth.vercel.com", b"k" * 32)
     assert len(hello) == 517
@@ -327,6 +357,66 @@ def test_pattern_active_edge_exposes_selected_route_read_only():
     assert core.active_edge == "104.18.8.83"
     assert isinstance(PatternSniCore.active_edge, property)
     assert PatternSniCore.active_edge.fset is None
+
+
+def test_pattern_retries_cooled_edges_when_every_edge_is_temporarily_failed():
+    core = PatternSniCore(lambda _: None)
+    core._edges = ["104.19.229.21", "104.19.230.21"]
+    core._preferred_edge = None
+    core._failed_until = {
+        "104.19.229.21": time.monotonic() + 5,
+        "104.19.230.21": time.monotonic() + 5,
+    }
+
+    assert core._ordered_edges() == ["104.19.229.21", "104.19.230.21"]
+
+
+def test_pattern_full5_running_does_not_require_packet_injector():
+    core = PatternSniCore(lambda _: None)
+    core._strategy_override = "full5"
+    core._server_sock = object()
+    core._stop.clear()
+
+    assert core.running is True
+    assert core._injector is None
+
+
+def test_pattern_mci_full5_hybrid_requires_packet_injector():
+    core = PatternSniCore(lambda _: None)
+    core._strategy_override = "full5"
+    core._hybrid_fake_fragment = True
+    core._server_sock = object()
+    core._stop.clear()
+
+    assert core.running is False
+    core._injector = object()
+    assert core.running is True
+
+
+def test_pattern_fake_injector_repeats_payload_three_times():
+    injector = PacketInjector.__new__(PacketInjector)
+    injector.inject_delay_ms = 0
+    injector.fake_repeat = 3
+    injector.stop_event = threading.Event()
+    sends = []
+    injector._send = lambda packet, recalculate=False: sends.append(
+        (bytes(packet.tcp.payload), recalculate)
+    )
+    packet = SimpleNamespace(
+        tcp=SimpleNamespace(psh=False, payload=b"", seq_num=100),
+        ip=SimpleNamespace(packet_len=40),
+        ipv4=SimpleNamespace(ident=7),
+    )
+    connection = SimpleNamespace(
+        lock=threading.Lock(), monitor=True, fake_data=b"fake",
+        syn_seq=200, fake_sent=False,
+    )
+
+    injector._fake_send(packet, connection)
+
+    assert sends == [(b"fake", True)] * 3
+    assert connection.fake_sent is True
+    assert packet.ip.packet_len == 44
 
 
 def test_pattern_initial_waiters_parallelize_after_one_edge_discovery():

@@ -31,6 +31,7 @@ from .paths import (BIN, DATA_DIR, SING_BOX_CONFIG, SING_BOX_OWNER_FILE,
 SOCKS_PORT = 20808
 HTTP_PORT = 20809
 FRAGMENT_PORT = 40443
+MCI_FINALMASK_EDGES = {"uacspoofer 3": "104.18.1.1"}
 INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 PROXY_STATE_FILE = DATA_DIR / "windows-proxy-restore.json"
 USER_AGENT = f"UAC-Spoofer-Desktop/{__version__}"
@@ -802,6 +803,12 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
                       upstream_address: str | None = None) -> dict:
     tuning = tuning or Tuning()
     parsed = parse_outbound(profile)
+    mci_builtin_finalmask = (
+        tuning.carrier_mode == "mci"
+        and profile.origin == "builtin"
+        and parsed["security"] == "tls"
+    )
+    outbound_port = int(profile.port) if mci_builtin_finalmask else parsed["port"]
     inbounds = [
         {"listen": "127.0.0.1", "port": SOCKS_PORT, "protocol": "socks", "tag": "socks-in",
          "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"}},
@@ -810,7 +817,7 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
     ]
     if parsed["protocol"] == "trojan":
         settings = {"servers": [{"address": upstream_address or parsed["host"],
-                                  "port": parsed["port"], "password": parsed["user"]}]}
+                                  "port": outbound_port, "password": parsed["user"]}]}
     elif parsed["protocol"] == "vless":
         user = {
             "id": parsed["user"],
@@ -819,7 +826,7 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         if parsed["flow"]:
             user["flow"] = parsed["flow"]
         settings = {"vnext": [{"address": upstream_address or parsed["host"],
-                               "port": parsed["port"],
+                                "port": outbound_port,
                                "users": [user]}]}
     elif parsed["protocol"] == "vmess":
         settings = {"vnext": [{"address": upstream_address or parsed["host"],
@@ -851,7 +858,10 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
             tls["alpn"] = ["http/1.1"]
         elif parsed["alpn"]:
             tls["alpn"] = parsed["alpn"]
-        if parsed["fingerprint"]:
+        if (tuning.carrier_mode == "mci" and profile.origin == "builtin"
+                and parsed["network"] in {"ws", "httpupgrade"}):
+            tls["fingerprint"] = "chrome"
+        elif parsed["fingerprint"]:
             tls["fingerprint"] = parsed["fingerprint"]
         if parsed["pinned"]:
             tls["pinnedPeerCertSha256"] = parsed["pinned"]
@@ -893,6 +903,23 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
         }
     else:
         raise ValueError(f"Unsupported transport: {parsed['network']}")
+    if mci_builtin_finalmask:
+        stream["finalmask"] = {
+            "tcp": [{
+                "type": "fragment",
+                "settings": {
+                    "packets": "tlshello",
+                    "lengths": ["5"],
+                    "delays": ["0"],
+                    "maxSplit": "2",
+                },
+            }]
+        }
+        stream["sockopt"] = {
+            "domainStrategy": "UseIPv4",
+            "tcpKeepAliveInterval": 1,
+            "tcpKeepAliveIdle": 11,
+        }
     rules = []
 
     if bypass_processes:
@@ -937,9 +964,7 @@ def build_singbox_tun_config(
         gateway_networks: list[str] | tuple[str, ...] | None = None,
         gateway_host_addresses: list[str] | tuple[str, ...] | None = None,
         gateway_interface: str | None = None) -> dict:
-    direct_rules = [
-        {"process_name": ["xray.exe"], "action": "route", "outbound": "direct"},
-    ]
+    direct_rules = []
     edges = []
     for value in direct_edge_addresses or []:
         try:
@@ -956,6 +981,15 @@ def build_singbox_tun_config(
             "action": "route",
             "outbound": "direct",
         })
+    direct_rules.extend([
+        {
+            "process_name": ["xray.exe"],
+            "ip_cidr": ["127.0.0.0/8"],
+            "action": "route",
+            "outbound": "local-direct",
+        },
+        {"process_name": ["xray.exe"], "action": "route", "outbound": "direct"},
+    ])
     networks = []
     for value in gateway_networks or []:
         try:
@@ -1004,9 +1038,6 @@ def build_singbox_tun_config(
             "outbound": "direct",
         })
     direct_outbound = {"type": "direct", "tag": "direct"}
-    physical_interface = str(gateway_interface or "").strip()
-    if networks and physical_interface:
-        direct_outbound["bind_interface"] = physical_interface
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -1054,6 +1085,7 @@ def build_singbox_tun_config(
                 "server_port": SOCKS_PORT,
                 "version": "5",
             },
+            {"type": "direct", "tag": "local-direct"},
             direct_outbound,
         ],
         "route": {
@@ -1086,6 +1118,8 @@ class Engine:
         self._gateway_restore_proxy = False
         self._tun_gateway_networks: tuple[str, ...] = ()
         self._bypass_processes: list[str] = []
+        self._fragment_required = False
+        self.active_upstream_address = ""
         self._log_level = "normal"
         self.last_probe_ms: float | None = None
         self.last_probe_url: str = ""
@@ -1106,7 +1140,18 @@ class Engine:
 
     @property
     def running(self) -> bool:
-        return self._active and self.process is not None and self.process.poll() is None
+        xray_running = (
+            self._active
+            and self.process is not None
+            and self.process.poll() is None
+        )
+        return bool(
+            xray_running
+            and (
+                not getattr(self, "_fragment_required", False)
+                or bool(getattr(getattr(self, "fragment", None), "running", False))
+            )
+        )
 
     @property
     def tun_running(self) -> bool:
@@ -1667,9 +1712,30 @@ class Engine:
                 profile.route_mode == "reality-direct"
                 or parsed_outbound["security"] == "reality"
             )
-            upstream_address = resolve_xray_upstream(profile)
+            mci_builtin_finalmask = (
+                tuning.carrier_mode == "mci"
+                and profile.origin == "builtin"
+                and parsed_outbound["security"] == "tls"
+            )
+            self._fragment_required = not direct_reality and not mci_builtin_finalmask
+            if mci_builtin_finalmask:
+                requested_edge = str(tuning.pattern_connect_ip or "").strip()
+                try:
+                    if ipaddress.ip_address(requested_edge).version != 4:
+                        raise ValueError(requested_edge)
+                except ValueError:
+                    requested_edge = MCI_FINALMASK_EDGES.get(
+                        profile.name.casefold(), profile.address
+                    )
+                upstream_address = requested_edge
+            else:
+                upstream_address = resolve_xray_upstream(profile)
+            self.active_upstream_address = (
+                str(upstream_address or "").strip()
+                if mci_builtin_finalmask else ""
+            )
             self._check_cancel(cancel_event)
-            if not direct_reality:
+            if self._fragment_required:
                 self.fragment.start(profile, tuning, strategy_override)
             try:
                 self._check_cancel(cancel_event)
@@ -1687,7 +1753,7 @@ class Engine:
                 self._run_id += 1
                 run_id = self._run_id
                 self._write_owner_record(process)
-                deadline = time.monotonic() + 0.7
+                deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline:
                     self._check_cancel(cancel_event)
                     if process.poll() is not None:
@@ -1773,9 +1839,15 @@ class Engine:
                     self._gateway_owns_tun = False
                 return
             binary = self.ensure_tun_available()
+            direct_edges = tuple(dict.fromkeys(
+                edge for edge in (
+                    *getattr(self.fragment, "edge_addresses", ()),
+                    self.active_upstream_address,
+                ) if edge
+            ))
             config = build_singbox_tun_config(
                 self._bypass_processes,
-                getattr(self.fragment, "edge_addresses", ()),
+                direct_edges,
                 gateway_networks,
                 gateway_host_addresses,
                 gateway_interface,
@@ -1807,10 +1879,12 @@ class Engine:
                     str(SING_BOX_CONFIG.parent),
                 )
                 self.tun_process = process
-                self._tun_gateway_networks = tuple(
-                    config["route"]["rules"][-1].get("source_ip_cidr", ())
-                    if config["route"]["final"] == "direct" else ()
-                )
+                self._tun_gateway_networks = tuple(dict.fromkeys(
+                    address
+                    for rule in config["route"]["rules"]
+                    if rule.get("outbound") == "proxy"
+                    for address in rule.get("source_ip_cidr", ())
+                ))
                 self._tun_run_id += 1
                 run_id = self._tun_run_id
                 self._write_singbox_owner_record(process)
@@ -2157,7 +2231,8 @@ class Engine:
         return None
 
     def probe_download(self, size: int = DOWNLOAD_PROBE_BYTES, timeout: float = 2.0,
-                       cancel_event: threading.Event | None = None) -> tuple[bool | None, str]:
+                       cancel_event: threading.Event | None = None,
+                       strict: bool = False) -> tuple[bool | None, str]:
         """Measure one bounded Cloudflare download through the private proxy.
 
         The sample is capped at 256 KiB and streamed without retaining its
@@ -2188,7 +2263,7 @@ class Engine:
         session.trust_env = False
         response = None
         started = time.perf_counter()
-        budget = max(0.5, min(float(timeout), 2.0))
+        budget = max(0.5, min(float(timeout), 6.0 if strict else 2.0))
         deadline = started + budget
         downloaded = 0
         try:
@@ -2199,7 +2274,8 @@ class Engine:
 
 
 
-                timeout=(min(0.8, budget), min(0.55, budget)),
+                timeout=((min(1.8, budget), min(4.5, budget))
+                         if strict else (min(0.8, budget), min(0.55, budget))),
                 allow_redirects=False,
                 headers={"Accept-Encoding": "identity",
                          "Cache-Control": "no-cache",
@@ -2213,6 +2289,11 @@ class Engine:
                 self.last_download_ms = elapsed * 1000
                 detail = f"HTTP {response.status_code}"
                 self.last_download_reason = detail
+                if strict:
+                    self.last_download_ok = False
+                    self.last_download_state = "failed"
+                    self.log(f"DOWNLOAD CHECK FAILED {detail}")
+                    return False, detail
                 self.log(f"DOWNLOAD CHECK INCONCLUSIVE {detail}")
                 return None, detail
 
@@ -2247,6 +2328,11 @@ class Engine:
 
             detail = f"short read {downloaded}/{requested}B"
             self.last_download_reason = detail
+            if strict:
+                self.last_download_ok = False
+                self.last_download_state = "failed"
+                self.log(f"DOWNLOAD CHECK FAILED {detail}")
+                return False, detail
             self.log(f"DOWNLOAD CHECK INCONCLUSIVE {detail}")
             return None, detail
         except requests.RequestException as exc:
@@ -2265,13 +2351,115 @@ class Engine:
                 return True, detail
             detail = type(exc).__name__
             self.last_download_reason = detail
-            if not self.running:
+            if not self.running or strict:
                 self.last_download_ok = False
                 self.last_download_state = "failed"
                 self.log(f"DOWNLOAD CHECK FAILED {detail}")
                 return False, detail
             self.log(f"DOWNLOAD CHECK INCONCLUSIVE {detail}")
             return None, detail
+        finally:
+            if response is not None:
+                response.close()
+            session.close()
+
+    def probe_web_access(
+            self, timeout: float = 4.5,
+            cancel_event: threading.Event | None = None,
+            connect_timeout: float | None = None) -> tuple[bool, str]:
+        self.last_download_ok = False
+        self.last_download_state = "failed"
+        self.last_download_reason = ""
+        self.last_download_mbps = 0.0
+        self.last_download_speed_valid = False
+        self.last_download_ms = None
+        self.last_download_first_byte_ms = None
+        self.last_download_bytes = 0
+        self._check_cancel(cancel_event)
+        if not self.running:
+            self.last_download_reason = "engine stopped"
+            return False, "engine stopped"
+        proxies = {
+            "http": f"http://127.0.0.1:{HTTP_PORT}",
+            "https": f"http://127.0.0.1:{HTTP_PORT}",
+        }
+        targets = (
+            ("Google", "https://www.google.com/robots.txt"),
+            ("YouTube", "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"),
+        )
+        session = requests.Session()
+        session.trust_env = False
+        started = time.perf_counter()
+        total_bytes = 0
+        first_byte_ms = None
+        details = []
+        response = None
+        try:
+            budget = max(1.0, min(float(timeout), 10.0))
+            if connect_timeout is None:
+                connect_budget = min(4.0, budget)
+            else:
+                connect_budget = max(0.45, min(float(connect_timeout), budget))
+            read_budget = min(7.5, budget)
+            for name, url in targets:
+                self._check_cancel(cancel_event)
+                target_started = time.perf_counter()
+                response = session.get(
+                    url,
+                    proxies=proxies,
+                    stream=True,
+                    timeout=(connect_budget, read_budget),
+                    allow_redirects=True,
+                    headers={
+                        "Accept-Encoding": "identity",
+                        "Cache-Control": "no-cache",
+                        "Connection": "close",
+                        "User-Agent": USER_AGENT,
+                    },
+                )
+                self._check_cancel(cancel_event)
+                if not 200 <= response.status_code < 400:
+                    raise RuntimeError(f"{name} HTTP {response.status_code}")
+                received = 0
+                for chunk in response.iter_content(chunk_size=512):
+                    self._check_cancel(cancel_event)
+                    if not chunk:
+                        continue
+                    if first_byte_ms is None:
+                        first_byte_ms = (time.perf_counter() - started) * 1000
+                    received += len(chunk)
+                    if received >= 512:
+                        break
+                if received < 64:
+                    raise RuntimeError(f"{name} short body {received}B")
+                total_bytes += received
+                details.append(
+                    f"{name} {response.status_code}/{received}B/"
+                    f"{(time.perf_counter() - target_started) * 1000:.0f}ms"
+                )
+                response.close()
+                response = None
+            elapsed = max(0.001, time.perf_counter() - started)
+            self.last_download_ok = True
+            self.last_download_state = "verified"
+            self.last_download_bytes = total_bytes
+            self.last_download_ms = elapsed * 1000
+            self.last_download_first_byte_ms = first_byte_ms
+            self.last_download_mbps = total_bytes * 8 / elapsed / 1_000_000
+            self.last_download_speed_valid = True
+            self.last_download_reason = "; ".join(details)
+            self.log("WEB ACCESS VERIFIED " + self.last_download_reason)
+            return True, self.last_download_reason
+        except EngineCancelled:
+            raise
+        except Exception as exc:
+            elapsed = max(0.001, time.perf_counter() - started)
+            self.last_download_bytes = total_bytes
+            self.last_download_ms = elapsed * 1000
+            self.last_download_first_byte_ms = first_byte_ms
+            self.last_download_reason = str(exc) or type(exc).__name__
+            self.log("WEB ACCESS FAILED " + self.last_download_reason)
+            return False, self.last_download_reason
         finally:
             if response is not None:
                 response.close()
@@ -2482,6 +2670,8 @@ class Engine:
         except Exception as exc:
             errors.append(exc)
         self._active = False
+        self._fragment_required = False
+        self.active_upstream_address = ""
         self._run_id += 1
         process = self.process
         self.process = None

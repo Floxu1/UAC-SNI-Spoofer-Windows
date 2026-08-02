@@ -33,6 +33,8 @@ class LiveConfigResult:
     exit_ip: str = ""
     source: str = ""
     error: str = ""
+    carrier_mode: str = ""
+    strategy: str = ""
 
 
 class _CancelSignal:
@@ -293,6 +295,128 @@ class SniBatchTester:
         if pending:
             raise RuntimeError("SNI Maker Xray listener startup timed out")
 
+    def run_all_modes(
+            self, profiles: list[ProxyProfile], tuning: Tuning,
+            cancel: threading.Event, workers: int = 64,
+            timeout: float = 8.0,
+            progress: Callable[[list[LiveConfigResult], int, int], None] | None = None,
+            carrier_tunings: dict[str, Tuning] | None = None,
+            ) -> list[LiveConfigResult]:
+        plans = (
+            ("irancell", "full5"),
+            ("mci", "tls_sni_records"),
+            ("auto", "wrong_seq"),
+        )
+        pending = list(profiles)
+        total = len(pending)
+        winners: dict[int, LiveConfigResult] = {}
+        errors: dict[int, list[str]] = {id(profile): [] for profile in pending}
+        source_tunings = carrier_tunings or {}
+        last_progress = 0
+        live_emitted: set[int] = set()
+
+        def emit_progress(batch, value, force=False):
+            nonlocal last_progress
+            if not progress or total <= 0:
+                return
+            current = total if force else min(total - 1, max(0, int(value)))
+            if batch or current > last_progress or force:
+                last_progress = max(last_progress, current)
+                progress(list(batch), last_progress, total)
+
+        def prepare_healthy(result, carrier, strategy):
+            result.carrier_mode = carrier
+            result.strategy = strategy
+            if result.profile.route_mode != "reality-direct":
+                result.profile.method = {
+                    "full5": "full5",
+                    "tls_sni_records": "tls_sni_records",
+                    "wrong_seq": "combined",
+                }[strategy]
+            return result
+
+        for plan_index, (carrier, strategy) in enumerate(plans):
+            if cancel.is_set() or not pending:
+                break
+            stored_tuning = source_tunings.get(carrier, tuning)
+            mode_tuning = Tuning.from_dict(stored_tuning.to_dict())
+            mode_tuning.carrier_mode = carrier
+            selected = list(pending)
+
+            def mode_progress(
+                    mode_batch, mode_done, mode_total, index=plan_index,
+                    mode_carrier=carrier, mode_strategy=strategy):
+                phase = min(1.0, max(0.0, mode_done / max(1, mode_total)))
+                overall = ((index + phase) / len(plans)) * total
+                live_healthy = []
+                for result in mode_batch:
+                    profile_id = id(result.profile)
+                    if not result.ok or profile_id in live_emitted:
+                        continue
+                    prepare_healthy(result, mode_carrier, mode_strategy)
+                    live_emitted.add(profile_id)
+                    live_healthy.append(result)
+                emit_progress(live_healthy, overall)
+
+            try:
+                mode_results = self.run(
+                    selected, mode_tuning, cancel,
+                    workers=workers, timeout=timeout, strategy=strategy,
+                    progress=mode_progress,
+                )
+            except Exception as exc:
+                message = f"{carrier}/{strategy}: {exc}"
+                self.log(f"SNI MAKER MODE ERROR {message}")
+                for profile in selected:
+                    errors[id(profile)].append(message)
+                emit_progress([], ((plan_index + 1) / len(plans)) * total)
+                continue
+            by_profile = {id(result.profile): result for result in mode_results}
+            newly_healthy = []
+            unresolved = []
+            for profile in selected:
+                result = by_profile.get(id(profile))
+                if result is not None and result.ok:
+                    prepare_healthy(result, carrier, strategy)
+                    winners[id(profile)] = result
+                    if id(profile) not in live_emitted:
+                        live_emitted.add(id(profile))
+                        newly_healthy.append(result)
+                else:
+                    detail = result.error if result is not None else "no result"
+                    errors[id(profile)].append(
+                        f"{carrier}/{strategy}: {detail or 'route failed'}"
+                    )
+                    unresolved.append(profile)
+            pending = unresolved
+            emit_progress(
+                newly_healthy,
+                ((plan_index + 1) / len(plans)) * total,
+            )
+        if cancel.is_set():
+            final_results = list(winners.values())
+        else:
+            failed = [
+                LiveConfigResult(
+                    profile=profile,
+                    error=" | ".join(errors[id(profile)]) or "All route modes failed",
+                )
+                for profile in pending
+            ]
+            emit_progress(failed, total, force=True)
+            final_results = [*winners.values(), *failed]
+        if not cancel.is_set() and not pending:
+            emit_progress([], total, force=True)
+        return sorted(
+            final_results,
+            key=lambda item: (
+                not item.ok,
+                item.country_code,
+                item.ping_ms if item.ok else float("inf"),
+                item.profile.name.lower(),
+            ),
+        )
+
     def run(
             self, profiles: list[ProxyProfile], tuning: Tuning,
             cancel: threading.Event, workers: int = 64,
@@ -354,12 +478,36 @@ class SniBatchTester:
                 else "wrong_seq"
             )
         ).strip().lower()
-        if selected_strategy not in {"wrong_seq", "tls_sni_records"}:
+        if selected_strategy not in {
+                "wrong_seq", "tls_sni_records", "full5", "full10", "full20"}:
             selected_strategy = (
                 "tls_sni_records"
                 if probe_tuning.carrier_mode == "mci"
                 else "wrong_seq"
             )
+        if (probe_tuning.carrier_mode == "irancell"
+                and selected_strategy == "wrong_seq"):
+            selected_strategy = "full5"
+        source_edges = []
+        for profile in supported:
+            value = _valid_ip(profile.address)
+            if value and not ipaddress.ip_address(value).is_loopback:
+                source_edges.append(value)
+        configured_edges = [
+            _valid_ip(probe_tuning.pattern_connect_ip),
+            *(
+                _valid_ip(value)
+                for value in str(
+                    probe_tuning.pattern_fallback_ips or ""
+                ).replace(";", ",").split(",")
+            ),
+        ]
+        probe_edges = list(dict.fromkeys(
+            value for value in [*source_edges, *configured_edges] if value
+        ))
+        if probe_edges:
+            probe_tuning.pattern_connect_ip = probe_edges[0]
+            probe_tuning.pattern_fallback_ips = ",".join(probe_edges[1:12])
         self.log(
             f"SNI MAKER strategy={selected_strategy} "
             f"carrier={probe_tuning.carrier_mode} workers={workers}"
@@ -440,6 +588,21 @@ class SniBatchTester:
                         progress(list(batch), done, len(supported))
                         batch.clear()
                         last_emit = now
+            active_edges = {
+                int(pattern._profile.port): pattern.active_edge
+                for pattern in self._patterns
+                if getattr(pattern, "active_edge", "")
+                and getattr(pattern, "_profile", None) is not None
+            }
+            for result in results:
+                if result.ok:
+                    active_edge = active_edges.get(int(result.profile.port), "")
+                    if active_edge:
+                        result.profile.address = active_edge
+                        result.profile.fallback_address = ",".join(
+                            edge for edge in probe_edges
+                            if edge != active_edge
+                        )
             return sorted(
                 results,
                 key=lambda item: (

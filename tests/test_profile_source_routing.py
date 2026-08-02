@@ -9,7 +9,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QListWidgetItem
 
 import uac_desktop.ui as ui_module
-from uac_desktop.models import ProxyProfile, Tuning
+from uac_desktop.models import ProxyProfile, Tuning, default_profiles
 from uac_desktop.ui import MainWindow, USER_CONFIG_ORIGIN
 
 
@@ -53,9 +53,13 @@ class IndexStub:
 class LabelStub:
     def __init__(self):
         self.text = ""
+        self.visible = True
 
     def setText(self, text):
         self.text = text
+
+    def setVisible(self, visible):
+        self.visible = bool(visible)
 
 
 class ViewStub:
@@ -81,6 +85,7 @@ class ComboStub:
         self.index = -1
         self.initial = current
         self.enabled = True
+        self.visible = True
         self._view = ViewStub()
 
     def currentData(self):
@@ -115,6 +120,9 @@ class ComboStub:
 
     def setEnabled(self, enabled):
         self.enabled = bool(enabled)
+
+    def setVisible(self, visible):
+        self.visible = bool(visible)
 
 
 class StorageStub:
@@ -539,6 +547,30 @@ def test_dynamic_countries_are_preserved_named_and_sorted_in_selector(monkeypatc
     assert labels["BR"] == "Brazil  (0)"
     assert labels["GB"] == "United Kingdom  (1)"
     assert count.text == "0 verified configs"
+
+
+def test_suggested_selector_shows_only_original_configs(monkeypatch):
+    storage = StorageStub(
+        default_profiles(),
+        settings={"route_source": "suggested", "selected_country": "DE"},
+    )
+    dummy = routing_dummy(storage, source_index=0, country="DE")
+    dummy.country_combo = ComboStub("DE")
+    dummy.original_configs_label = LabelStub()
+    dummy.country_count = LabelStub()
+    dummy.language = "en"
+    dummy.tr = lambda _fa, en=None: en or _fa
+    monkeypatch.setattr(ui_module, "cyber_icon", lambda *_args: QIcon())
+
+    MainWindow._refresh_country_selector(dummy)
+
+    assert dummy.country_combo.visible is False
+    assert dummy.original_configs_label.visible is True
+    assert dummy.country_combo.items[0][1:] == (
+        "UAC Spoof Original Configs", "ALL"
+    )
+    assert dummy.country_count.text == "6 original configs"
+    assert MainWindow._selected_country_code(dummy) == ""
 
 
 def test_user_config_country_groups_sort_by_country_then_real_ping(monkeypatch):

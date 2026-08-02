@@ -354,6 +354,245 @@ def test_batch_tester_starts_one_relay_per_remote_port_and_cleans_up(
     assert list(tmp_path.glob("sni-maker-batch-*.json")) == []
 
 
+def test_irancell_batch_uses_full5_and_source_edges(monkeypatch, tmp_path):
+    profiles = parse_many(VLESS_URI)
+    profiles[0].address = "104.16.1.1"
+    captured = {}
+
+    class Pattern:
+        active_edge = "104.16.1.1"
+
+        def __init__(self, _log):
+            self._profile = None
+
+        def start(self, controller, tuning, strategy):
+            self._profile = controller
+            captured["strategy"] = strategy
+            captured["primary"] = tuning.pattern_connect_ip
+
+        def stop(self):
+            return None
+
+    class Process:
+        returncode = None
+        stdout = None
+
+        def poll(self): return None
+        def terminate(self): self.returncode = 0
+        def wait(self, timeout=None): return 0
+        def kill(self): self.returncode = -9
+
+    process = Process()
+    monkeypatch.setattr("uac_desktop.sni_batch.DATA_DIR", tmp_path)
+    monkeypatch.setattr("uac_desktop.sni_batch.PatternSniCore", Pattern)
+    monkeypatch.setattr(
+        SniBatchTester, "_start_xray",
+        lambda tester, _path, _cancel=None: (
+            setattr(tester, "_process", process) or process
+        ),
+    )
+    monkeypatch.setattr(
+        SniBatchTester, "_wait_ready", staticmethod(lambda *_args, **_kwargs: None)
+    )
+    monkeypatch.setattr(
+        "uac_desktop.sni_batch._probe_proxy",
+        lambda profile, *_args: LiveConfigResult(
+            profile=profile, ok=True, country_code="DE", country="Germany",
+            exit_ip="203.0.113.1", source="test",
+        ),
+    )
+
+    results = SniBatchTester().run(
+        profiles, Tuning(carrier_mode="irancell"), threading.Event(),
+        workers=1, timeout=1, strategy="wrong_seq",
+    )
+
+    assert captured == {"strategy": "full5", "primary": "104.16.1.1"}
+    assert results[0].profile.address == "104.16.1.1"
+
+
+def test_batch_all_modes_tests_only_unresolved_and_preserves_input_tuning(
+        monkeypatch):
+    profiles = parse_many("\n".join([VLESS_URI, TROJAN_URI, VMESS_URI]))
+    original_tuning = Tuning(
+        carrier_mode="irancell",
+        pattern_connect_ip="104.16.1.1",
+        pattern_fallback_ips="104.18.1.1",
+    )
+    original_values = original_tuning.to_dict()
+    calls = []
+
+    def run_one(
+            self, selected, tuning, cancel, workers=64, timeout=8.0,
+            strategy=None, progress=None):
+        calls.append({
+            "carrier": tuning.carrier_mode,
+            "strategy": strategy,
+            "profile_ids": [profile.id for profile in selected],
+            "tuning": tuning,
+        })
+        winning_index = len(calls) - 1
+        return [
+            LiveConfigResult(
+                profile=profile,
+                ok=index == winning_index,
+                ping_ms=100 + winning_index if index == winning_index else 0,
+                country_code="DE" if index == winning_index else "",
+                country="Germany" if index == winning_index else "",
+                exit_ip="203.0.113.10" if index == winning_index else "",
+                source="test" if index == winning_index else "",
+                error="route failed" if index != winning_index else "",
+            )
+            for index, profile in enumerate(profiles)
+            if profile in selected
+        ]
+
+    monkeypatch.setattr(SniBatchTester, "run", run_one)
+
+    results = SniBatchTester().run_all_modes(
+        profiles,
+        original_tuning,
+        threading.Event(),
+        workers=3,
+        timeout=1.0,
+    )
+
+    assert [
+        (call["carrier"], call["strategy"])
+        for call in calls
+    ] == [
+        ("irancell", "full5"),
+        ("mci", "tls_sni_records"),
+        ("auto", "wrong_seq"),
+    ]
+    assert [call["profile_ids"] for call in calls] == [
+        [profiles[0].id, profiles[1].id, profiles[2].id],
+        [profiles[1].id, profiles[2].id],
+        [profiles[2].id],
+    ]
+    assert all(call["tuning"] is not original_tuning for call in calls)
+    assert original_tuning.to_dict() == original_values
+    assert {result.profile.id for result in results if result.ok} == {
+        profile.id for profile in profiles
+    }
+    assert [profile.method for profile in profiles] == [
+        "full5", "tls_sni_records", "combined",
+    ]
+    assert {
+        result.profile.id: (result.carrier_mode, result.strategy)
+        for result in results
+    } == {
+        profiles[0].id: ("irancell", "full5"),
+        profiles[1].id: ("mci", "tls_sni_records"),
+        profiles[2].id: ("auto", "wrong_seq"),
+    }
+
+
+def test_batch_all_modes_continues_after_one_mode_startup_error(monkeypatch):
+    profile = parse_many(VLESS_URI)[0]
+    calls = []
+
+    def run_one(
+            self, selected, tuning, cancel, workers=64, timeout=8.0,
+            strategy=None, progress=None):
+        calls.append((tuning.carrier_mode, strategy))
+        if len(calls) == 1:
+            raise RuntimeError("first mode failed to start")
+        return [LiveConfigResult(
+            profile=selected[0], ok=True, ping_ms=87,
+            country_code="CH", country="Switzerland",
+            exit_ip="203.0.113.11", source="test",
+        )]
+
+    monkeypatch.setattr(SniBatchTester, "run", run_one)
+
+    results = SniBatchTester().run_all_modes(
+        [profile], Tuning(carrier_mode="auto"), threading.Event(),
+        workers=1, timeout=1.0,
+    )
+
+    assert calls == [
+        ("irancell", "full5"),
+        ("mci", "tls_sni_records"),
+    ]
+    assert len(results) == 1
+    assert results[0].ok is True
+    assert results[0].ping_ms == 87
+
+
+def test_batch_all_modes_reports_incremental_progress_during_each_mode(
+        monkeypatch):
+    profiles = parse_many("\n".join(
+        VLESS_URI.replace(
+            "22222222-2222-4222-8222-222222222222",
+            f"22222222-2222-4222-8222-{index:012d}",
+        )
+        for index in range(1, 13)
+    ))
+    updates = []
+
+    def run_one(
+            self, selected, tuning, cancel, workers=64, timeout=8.0,
+            strategy=None, progress=None):
+        results = []
+        for done, profile in enumerate(selected, 1):
+            result = LiveConfigResult(profile=profile, error="route failed")
+            results.append(result)
+            if progress:
+                progress([result], done, len(selected))
+        return results
+
+    monkeypatch.setattr(SniBatchTester, "run", run_one)
+
+    SniBatchTester().run_all_modes(
+        profiles,
+        Tuning(),
+        threading.Event(),
+        progress=lambda batch, done, total: updates.append(
+            (len(batch), done, total)
+        ),
+    )
+
+    values = [done for _batch, done, _total in updates]
+    assert values == sorted(values)
+    assert values[-1] == len(profiles)
+    assert any(0 < done < len(profiles) for done in values)
+    assert any(not batch for batch, done, _total in updates if done < len(profiles))
+
+
+def test_batch_all_modes_forwards_healthy_results_before_mode_returns(
+        monkeypatch):
+    profile = parse_many(VLESS_URI)[0]
+    emitted = []
+    seen_inside_run = []
+
+    def on_progress(batch, _done, _total):
+        emitted.extend(batch)
+
+    def run_one(
+            self, selected, tuning, cancel, workers=64, timeout=8.0,
+            strategy=None, progress=None):
+        result = LiveConfigResult(
+            profile=selected[0], ok=True, ping_ms=42,
+            country_code="DE", country="Germany",
+            exit_ip="203.0.113.12", source="test",
+        )
+        assert progress is not None
+        progress([result], 1, len(selected))
+        seen_inside_run.append([
+            item.profile.id for item in emitted if item.ok
+        ])
+        return [result]
+
+    monkeypatch.setattr(SniBatchTester, "run", run_one)
+
+    SniBatchTester().run_all_modes(
+        [profile], Tuning(), threading.Event(), progress=on_progress,
+    )
+
+    assert seen_inside_run == [[profile.id]]
+
+
 def test_batch_cancel_during_relay_start_stops_started_relays(
         monkeypatch, tmp_path):
     profiles = parse_many("\n".join([VLESS_URI, TROJAN_URI]))

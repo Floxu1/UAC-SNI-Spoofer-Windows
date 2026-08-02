@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 import psutil
 
+from .device_names import decode_dhcp_fqdn, normalize_device_name
 from .paths import DATA_DIR
 
 
@@ -459,9 +460,18 @@ class ScapyArpBackend:
 
     def _load(self) -> dict[str, Any]:
         if self._api is None:
+            from .npcap import npcap_available
+
+            if not npcap_available():
+                raise GatewayError(
+                    "Npcap is required for Mobile Gateway; restart UAC Spoofer "
+                    "and complete the automatic Npcap setup"
+                )
             try:
                 from scapy.arch.windows import get_windows_if_list
                 from scapy.config import conf
+                from scapy.layers.dhcp import BOOTP, DHCP
+                from scapy.layers.inet import IP
                 from scapy.layers.l2 import ARP, Ether
                 from scapy.sendrecv import AsyncSniffer, sendp, srp
             except (ImportError, OSError) as exc:
@@ -470,7 +480,10 @@ class ScapyArpBackend:
             self._api = {
                 "interfaces": get_windows_if_list,
                 "ARP": ARP,
+                "BOOTP": BOOTP,
+                "DHCP": DHCP,
                 "Ether": Ether,
+                "IP": IP,
                 "AsyncSniffer": AsyncSniffer,
                 "sendp": sendp,
                 "srp": srp,
@@ -557,10 +570,96 @@ class ScapyArpBackend:
                 result[address] = mac
         return result
 
+    @staticmethod
+    def _dhcp_identity(
+        packet: Any,
+        api: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        dhcp_type = api.get("DHCP")
+        if dhcp_type is None:
+            return "", "", ""
+        try:
+            dhcp = packet.getlayer(dhcp_type)
+        except (AttributeError, TypeError):
+            return "", "", ""
+        if dhcp is None:
+            return "", "", ""
+        name = ""
+        requested_address = ""
+        for option in getattr(dhcp, "options", ()) or ():
+            if not isinstance(option, tuple) or len(option) < 2:
+                continue
+            key = str(option[0]).strip().casefold().replace("-", "_")
+            value = option[1]
+            if key in {"hostname", "host_name"}:
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", "replace")
+                name = normalize_device_name(value)
+            elif key in {"client_fqdn", "fqdn"}:
+                name = decode_dhcp_fqdn(value) or name
+            elif key in {"requested_addr", "requested_address"}:
+                if isinstance(value, bytes):
+                    try:
+                        value = socket.inet_ntoa(value[:4])
+                    except OSError:
+                        value = ""
+                requested_address = str(value or "")
+        if not name:
+            return "", "", ""
+        bootp = None
+        bootp_type = api.get("BOOTP")
+        if bootp_type is not None:
+            try:
+                bootp = packet.getlayer(bootp_type)
+            except (AttributeError, TypeError):
+                bootp = None
+        mac = ""
+        ether_type = api.get("Ether")
+        if ether_type is not None:
+            try:
+                ether = packet.getlayer(ether_type)
+            except (AttributeError, TypeError):
+                ether = None
+            mac = _normalize_mac(getattr(ether, "src", ""))
+        if not mac and bootp is not None:
+            chaddr = getattr(bootp, "chaddr", b"")
+            if isinstance(chaddr, (bytes, bytearray, memoryview)):
+                raw = bytes(chaddr)[:6]
+                if len(raw) == 6:
+                    mac = ":".join(f"{part:02x}" for part in raw)
+            else:
+                mac = _normalize_mac(chaddr)
+        candidates = []
+        if bootp is not None:
+            candidates.extend([
+                getattr(bootp, "ciaddr", ""),
+                getattr(bootp, "yiaddr", ""),
+            ])
+        candidates.append(requested_address)
+        ip_type = api.get("IP")
+        if ip_type is not None:
+            try:
+                ip_layer = packet.getlayer(ip_type)
+            except (AttributeError, TypeError):
+                ip_layer = None
+            candidates.append(getattr(ip_layer, "src", ""))
+        address = ""
+        for candidate in candidates:
+            try:
+                parsed = ipaddress.IPv4Address(str(candidate or ""))
+            except ipaddress.AddressValueError:
+                continue
+            if parsed.is_unspecified or parsed.is_multicast or int(parsed) == 0xFFFFFFFF:
+                continue
+            address = str(parsed)
+            break
+        return address, mac, name
+
     def start_responder(
         self,
         state: dict[str, Any],
         device_seen: Callable[[str, str], Any] | None = None,
+        device_named: Callable[[str, str, str], Any] | None = None,
     ) -> None:
         self.stop_responder()
         api = self._load()
@@ -575,9 +674,21 @@ class ScapyArpBackend:
         pc_mac = _normalize_mac(capture.get("mac", ""))
         if not pc_mac:
             raise GatewayError("LAN capture MAC is missing")
+        dhcp_names: dict[str, str] = {}
 
         def answer(packet: Any) -> None:
             try:
+                dhcp_address, dhcp_mac, dhcp_name = self._dhcp_identity(
+                    packet,
+                    api,
+                )
+                if dhcp_name and dhcp_mac:
+                    dhcp_names[dhcp_mac] = dhcp_name
+                    if dhcp_address:
+                        if callable(device_seen):
+                            device_seen(dhcp_address, dhcp_mac)
+                        if callable(device_named):
+                            device_named(dhcp_address, dhcp_mac, dhcp_name)
                 arp = packet.getlayer(api["ARP"])
                 if arp is None:
                     return
@@ -589,6 +700,9 @@ class ScapyArpBackend:
                     return
                 if callable(device_seen):
                     device_seen(str(source), source_mac)
+                known_name = dhcp_names.get(source_mac, "")
+                if known_name and callable(device_named):
+                    device_named(str(source), source_mac, known_name)
                 if int(arp.op) != 1 or str(arp.pdst) != gateway:
                     return
                 response = (
@@ -611,7 +725,7 @@ class ScapyArpBackend:
 
         responder = api["AsyncSniffer"](
             iface=str(capture["name"]),
-            filter="arp",
+            filter="arp or (udp and (port 67 or port 68))",
             prn=answer,
             store=False,
         )
@@ -1129,17 +1243,19 @@ class GatewayManager:
         failure_limit: int = 2,
         process_alive: Callable[[int, float], bool] | None = None,
         watchdog_launcher: Callable[[dict[str, Any]], None] | None = None,
+        device_names_changed: Callable[[dict[str, str]], None] | None = None,
     ) -> None:
         self.engine = engine
         self.log = log or (lambda _message: None)
         self.state_changed = state_changed or (lambda _state, _count, _detail: None)
         self.devices_changed = devices_changed or (lambda _devices: None)
+        self.device_names_changed = device_names_changed or (lambda _names: None)
         self.state_file = Path(state_file)
         self.windows = windows or WindowsGatewayBackend()
         self.arp = arp or ScapyArpBackend()
         self.forwarder = forwarder or ForwardPathHelper(
             log=self.log,
-            rewrite_dns=True,
+            rewrite_dns=False,
         )
         self.poll_interval = max(0.05, float(poll_interval))
         self.discovery_interval = max(self.poll_interval, float(discovery_interval))
@@ -1156,6 +1272,7 @@ class GatewayManager:
         self._stopping = False
         self._token = ""
         self._devices: dict[str, str] = {}
+        self._device_names: dict[str, str] = {}
         self._device_last_seen: dict[str, float] = {}
         self._health_check: Callable[[], bool] | None = None
         self._last_socks_health_at = 0.0
@@ -1169,6 +1286,19 @@ class GatewayManager:
     def devices(self) -> dict[str, str]:
         with self._lock:
             return dict(self._devices)
+
+    @property
+    def device_names(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._device_names)
+
+    @property
+    def gateway_address(self) -> str:
+        with self._lock:
+            state = self._read_state()
+            if not state:
+                return ""
+            return str(dict(state.get("lan", {})).get("gateway", ""))
 
     def _read_state(self) -> dict[str, Any] | None:
         try:
@@ -1452,6 +1582,7 @@ class GatewayManager:
                     "capture": dict(capture),
                     "gateway_mac": gateway_mac,
                     "devices": devices,
+                    "device_names": {},
                     "firewall_rule": firewall_rule,
                     "forward_path": {
                         "resolver": self.forwarder.resolver,
@@ -1483,6 +1614,7 @@ class GatewayManager:
                         start_responder,
                         state,
                         device_seen=self._record_device,
+                        device_named=self._record_device_name,
                     )
                 check_cancelled()
                 self._call(self.arp.redirect, state, devices, repeat=3)
@@ -1491,6 +1623,7 @@ class GatewayManager:
                 self._write_state(state)
                 self._token = token
                 self._devices = devices
+                self._device_names = {}
                 now = time.monotonic()
                 self._device_last_seen = {
                     address: now for address in devices
@@ -1506,6 +1639,7 @@ class GatewayManager:
                 )
                 self._worker.start()
                 self.devices_changed(dict(devices))
+                self.device_names_changed({})
                 self._emit_state("active")
                 self.log(f"MOBILE GATEWAY active lan={lan.alias} devices={len(devices)}")
                 self._start_device_refresh()
@@ -1523,6 +1657,7 @@ class GatewayManager:
                         self.log(f"MOBILE GATEWAY TUN rollback pending: {release_error}")
                 self._active = False
                 self._devices = {}
+                self._device_names = {}
                 self._device_last_seen = {}
                 self._token = ""
                 self._emit_state("error")
@@ -1653,6 +1788,47 @@ class GatewayManager:
             self._emit_state("active")
         return changed
 
+    def _record_device_name(
+        self,
+        raw_address: str,
+        raw_mac: str,
+        raw_name: str,
+    ) -> bool:
+        name = normalize_device_name(raw_name)
+        mac = _normalize_mac(raw_mac)
+        if not name or not mac:
+            return False
+        self._record_device(raw_address, mac)
+        try:
+            address = str(ipaddress.IPv4Address(str(raw_address)))
+        except ipaddress.AddressValueError:
+            return False
+        with self._lock:
+            state = self._read_state()
+            if (
+                not self._active
+                or self._stopping
+                or self._stop_event.is_set()
+                or not state
+                or str(state.get("token", "")) != self._token
+                or self._devices.get(address) != mac
+            ):
+                return False
+            changed = self._device_names.get(address) != name
+            if not changed:
+                return False
+            self._device_names[address] = name
+            self._device_names = {
+                key: value
+                for key, value in self._device_names.items()
+                if key in self._devices
+            }
+            names = dict(self._device_names)
+            state["device_names"] = names
+            self._write_state(state)
+        self.device_names_changed(names)
+        return True
+
     def _refresh_devices(self) -> bool:
         with self._lock:
             state = self._read_state()
@@ -1709,12 +1885,22 @@ class GatewayManager:
             changed = devices != self._devices
             self._devices = devices
             self._device_last_seen = last_seen
+            names = {
+                address: name
+                for address, name in self._device_names.items()
+                if address in devices
+            }
+            names_changed = names != self._device_names
+            self._device_names = names
             current["devices"] = devices
+            current["device_names"] = names
             self._write_state(current)
         self.forwarder.set_devices(devices)
         if changed:
             self.devices_changed(dict(devices))
             self._emit_state("active")
+        if names_changed:
+            self.device_names_changed(dict(names))
         with self._lock:
             if (
                 not self._active
@@ -1804,7 +1990,7 @@ class GatewayManager:
             try:
                 self.arp.restore(state)
             except Exception as exc:
-                errors.append(f"ARP restore: {exc}")
+                self.log(f"MOBILE GATEWAY ARP restore skipped: {exc}")
         try:
             self.windows.restore(state)
         except Exception as exc:
@@ -1850,8 +2036,10 @@ class GatewayManager:
                 self._health_check = None
                 self._token = ""
                 self._devices = {}
+                self._device_names = {}
                 self._device_last_seen = {}
                 self.devices_changed({})
+                self.device_names_changed({})
                 self._emit_state("inactive" if not errors else "restore-pending", reason)
                 self.log(
                     f"MOBILE GATEWAY stopped reason={reason}"
@@ -1890,6 +2078,9 @@ class GatewayManager:
                 self._active = False
                 self._token = ""
                 self._devices = {}
+                self._device_names = {}
+                self.devices_changed({})
+                self.device_names_changed({})
                 self.log("MOBILE GATEWAY stale state restored")
                 return True
 

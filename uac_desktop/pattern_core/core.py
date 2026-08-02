@@ -33,6 +33,9 @@ from ..tls_tools import fragments
 LogFn = Callable[[str], None]
 TrafficFn = Callable[[int, int], None]
 IP_UNICAST_IF = 31
+TLS_FRAGMENT_STRATEGIES = frozenset({
+    "plain", "tls_sni_records", "full5", "full10", "full20",
+})
 
 
 def default_interface_ipv4(destination: str) -> str:
@@ -139,11 +142,12 @@ class PacketInjector:
     """Stoppable WinDivert implementation of upstream's FakeTcpInjector."""
 
     def __init__(self, packet_filter: str, connections: dict, registry_lock: threading.Lock,
-                 inject_delay_ms: int, log: LogFn) -> None:
+                 inject_delay_ms: int, fake_repeat: int, log: LogFn) -> None:
         self.packet_filter = packet_filter
         self.connections = connections
         self.registry_lock = registry_lock
         self.inject_delay_ms = inject_delay_ms
+        self.fake_repeat = max(1, int(fake_repeat))
         self.log = log
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
@@ -233,8 +237,13 @@ class PacketInjector:
             if packet.ipv4:
                 packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xFFFF
             packet.tcp.seq_num = (connection.syn_seq + 1 - len(connection.fake_data)) & 0xFFFFFFFF
+            for index in range(self.fake_repeat):
+                if not connection.monitor or self.stop_event.is_set():
+                    return
+                self._send(packet, True)
+                if index + 1 < self.fake_repeat and self.inject_delay_ms:
+                    time.sleep(self.inject_delay_ms / 1000)
             connection.fake_sent = True
-            self._send(packet, True)
 
     def _inbound(self, packet: Packet, connection: InjectiveConnection) -> None:
         tcp = packet.tcp
@@ -344,12 +353,23 @@ class PatternSniCore:
         self._failed_until: dict[str, float] = {}
         self._fake_sni = "chatgpt.com"
         self._strategy_override = "wrong_seq"
+        self._handshake_failover = False
+        self._hybrid_fake_fragment = False
+        self._fragment_delay_s = 0.0
+        self._post_fake_delay_s = 0.0
         self._session_sem: asyncio.Semaphore | None = None
         self._edge_lock: asyncio.Lock | None = None
 
     @property
     def running(self) -> bool:
-        return bool(self._server_sock) and not self._stop.is_set() and bool(self._injector)
+        injection_required = (
+            self._strategy_override == "wrong_seq" or self._hybrid_fake_fragment
+        )
+        transport_ready = (
+            bool(self._injector) if injection_required
+            else self._strategy_override in TLS_FRAGMENT_STRATEGIES
+        )
+        return bool(self._server_sock) and not self._stop.is_set() and transport_ready
 
     @property
     def active_edge(self) -> str:
@@ -396,7 +416,29 @@ class PatternSniCore:
             raise RuntimeError("Pattern core currently requires Windows/WinDivert")
         self._profile = profile
         self._strategy_override = str(forced_strategy or "wrong_seq").strip().lower()
+        if self._strategy_override not in ({"wrong_seq"} | TLS_FRAGMENT_STRATEGIES):
+            self._strategy_override = "wrong_seq"
         self._quality = Quality.from_tuning(tuning)
+        self._handshake_failover = (
+            getattr(profile, "origin", "") == "builtin"
+            and str(getattr(tuning, "carrier_mode", "")).lower() == "mci"
+        )
+        self._hybrid_fake_fragment = (
+            self._handshake_failover and self._strategy_override == "full5"
+        )
+        if self._handshake_failover:
+            self._fragment_delay_s = {
+                "full20": 0.003,
+                "full5": 0.015,
+                "tls_sni_records": 0.010,
+            }.get(self._strategy_override, 0.0)
+        else:
+            self._fragment_delay_s = 0.0
+        self._post_fake_delay_s = (
+            max(0, min(20, int(getattr(tuning, "pattern_inject_delay_ms", 0))))
+            / 1000
+            if self._hybrid_fake_fragment else 0.0
+        )
         self._fake_sni = str(getattr(tuning, "pattern_fake_sni", "chatgpt.com") or profile.sni)
         self._fake_sni_bytes(self._fake_sni)
         self._edges = self._build_edges(profile, tuning)
@@ -411,10 +453,16 @@ class PatternSniCore:
         self._preferred_edge = None
         self._failed_until.clear()
 
-        self._injector = PacketInjector(self._packet_filter(), self._connections, self._registry_lock,
-                                        self._quality.inject_delay_ms, self.log)
+        self._injector = None
         try:
-            self._injector.start()
+            if self._strategy_override == "wrong_seq" or self._hybrid_fake_fragment:
+                self._injector = PacketInjector(
+                    self._packet_filter(), self._connections,
+                    self._registry_lock, self._quality.inject_delay_ms,
+                    getattr(tuning, "pattern_fake_repeat", 1),
+                    self.log,
+                )
+                self._injector.start()
             self._server_thread = threading.Thread(target=self._server_runner, name="pattern-core", daemon=True)
             self._server_thread.start()
             if not self._ready.wait(4):
@@ -455,8 +503,12 @@ class PatternSniCore:
             while not self._stop.is_set():
                 try:
                     incoming, _address = await loop.sock_accept(server)
-                except (OSError, asyncio.CancelledError):
+                except asyncio.CancelledError:
                     break
+                except OSError:
+                    if self._stop.is_set():
+                        break
+                    raise
                 incoming.setblocking(False)
                 self._tune_socket(incoming)
                 asyncio.create_task(self._handle(incoming))
@@ -473,6 +525,8 @@ class PatternSniCore:
 
 
         healthy = [edge for edge in self._edges if self._failed_until.get(edge, 0) <= now]
+        if not healthy:
+            healthy = list(self._edges)
         healthy.sort(key=lambda edge: (edge != self._preferred_edge, self._edges.index(edge)))
         return healthy
 
@@ -560,7 +614,8 @@ class PatternSniCore:
 
 
 
-        if self._strategy_override == "tls_sni_records":
+        if (self._strategy_override in TLS_FRAGMENT_STRATEGIES
+                and not self._hybrid_fake_fragment):
             for edge in candidates:
                 outgoing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 outgoing.setblocking(False)
@@ -581,6 +636,8 @@ class PatternSniCore:
                     self._failed_until[edge] = (
                         time.monotonic() + self._quality.edge_failure_cooldown_s
                     )
+                    if self._preferred_edge == edge:
+                        self._preferred_edge = None
                     try:
                         outgoing.close()
                     except OSError:
@@ -633,32 +690,84 @@ class PatternSniCore:
             assert self._session_sem is not None
             async with self._session_sem:
                 outgoing = await self._connect_edge(incoming)
-            if not outgoing:
-                return
-            if self._strategy_override == "tls_sni_records":
-                loop = asyncio.get_running_loop()
-                try:
-                    first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
-                    if not first:
-                        return
-                    expected = (5 + int.from_bytes(first[3:5], "big")
-                                if len(first) >= 5 and first[0] == 0x16 else len(first))
-                    while len(first) < expected:
-                        chunk = await asyncio.wait_for(
-                            loop.sock_recv(incoming, expected - len(first)), 1.0
-                        )
-                        if not chunk:
-                            break
-                        first += chunk
-                    pieces = fragments(first, "tls_sni_records")
-                    for index, piece in enumerate(pieces):
-                        await loop.sock_sendall(outgoing, piece)
-                        self.upload += len(piece)
-                        if index + 1 < len(pieces):
-                            await asyncio.sleep(0.001)
-                    self._emit_traffic()
-                except (OSError, asyncio.TimeoutError):
+                if not outgoing:
                     return
+                if self._strategy_override in TLS_FRAGMENT_STRATEGIES:
+                    loop = asyncio.get_running_loop()
+                    try:
+                        if self._post_fake_delay_s:
+                            await asyncio.sleep(self._post_fake_delay_s)
+                        first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
+                        if not first:
+                            return
+                        expected = (5 + int.from_bytes(first[3:5], "big")
+                                    if len(first) >= 5 and first[0] == 0x16 else len(first))
+                        while len(first) < expected:
+                            chunk = await asyncio.wait_for(
+                                loop.sock_recv(incoming, expected - len(first)), 1.0
+                            )
+                            if not chunk:
+                                break
+                            first += chunk
+                        pieces = fragments(first, self._strategy_override)
+                        attempts = 3 if self._handshake_failover else 1
+                        for attempt in range(attempts):
+                            if outgoing is None:
+                                outgoing = await self._connect_edge(incoming)
+                                if outgoing is None:
+                                    return
+                            for index, piece in enumerate(pieces):
+                                await loop.sock_sendall(outgoing, piece)
+                                self.upload += len(piece)
+                                if index + 1 < len(pieces):
+                                    delay = (
+                                        self._fragment_delay_s
+                                        if self._fragment_delay_s > 0
+                                        else 0.001
+                                        if self._strategy_override == "tls_sni_records"
+                                        else 0.0
+                                    )
+                                    if delay:
+                                        await asyncio.sleep(delay)
+                            self._emit_traffic()
+                            if not self._handshake_failover:
+                                break
+                            try:
+                                response = await asyncio.wait_for(
+                                    loop.sock_recv(outgoing, 65535),
+                                    max(
+                                        1.8,
+                                        min(
+                                            6.0 if self._handshake_failover else 3.2,
+                                            self._quality.ack_timeout_ms / 1000,
+                                        ),
+                                    ),
+                                )
+                                if not response:
+                                    raise ConnectionError("empty TLS response")
+                                await loop.sock_sendall(incoming, response)
+                                self.download += len(response)
+                                self._emit_traffic()
+                                break
+                            except (OSError, asyncio.TimeoutError, ConnectionError):
+                                try:
+                                    edge = str(outgoing.getpeername()[0])
+                                except OSError:
+                                    edge = self._preferred_edge or ""
+                                if edge:
+                                    self._failed_until[edge] = time.monotonic() + 1.5
+                                    if self._preferred_edge == edge:
+                                        self._preferred_edge = None
+                                    self.log(
+                                        f"PATTERN TLS retry {edge} "
+                                        f"{attempt + 1}/{attempts}"
+                                    )
+                                outgoing.close()
+                                outgoing = None
+                                if attempt + 1 >= attempts:
+                                    return
+                    except (OSError, asyncio.TimeoutError):
+                        return
             await self._relay_pair(incoming, outgoing)
         except (OSError, ConnectionError, asyncio.TimeoutError, RuntimeError):
             return
@@ -683,8 +792,6 @@ class PatternSniCore:
                 except OSError:
                     pass
                 return
-
-
             await loop.sock_sendall(destination, data)
             if upload:
                 self.upload += len(data)
@@ -705,7 +812,7 @@ class PatternSniCore:
 
 
             if pending:
-                done2, pending = await asyncio.wait(pending, timeout=0.35)
+                done2, pending = await asyncio.wait(pending, timeout=3.0)
                 for task in done2:
                     try:
                         await task

@@ -46,6 +46,19 @@ from PySide6.QtWidgets import (
 from .sni_maker import ISO2_CODES
 
 
+HIGH_QUALITY_RENDER_HINTS = (
+    QPainter.RenderHint.Antialiasing
+    | QPainter.RenderHint.TextAntialiasing
+    | QPainter.RenderHint.SmoothPixmapTransform
+    | QPainter.RenderHint.LosslessImageRendering
+    | QPainter.RenderHint.VerticalSubpixelPositioning
+)
+
+
+def _set_high_quality_rendering(painter):
+    painter.setRenderHints(HIGH_QUALITY_RENDER_HINTS, True)
+
+
 def normalize_country_code(value: object) -> str:
     code = str(value or "").strip().upper()
     return code if code in ISO2_CODES else "XX"
@@ -57,7 +70,7 @@ def _country_badge_icon_cached(code: str, width: int, height: int) -> QIcon:
     pixmap = QPixmap(max(18, width), max(14, height))
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    _set_high_quality_rendering(painter)
     rect = QRectF(0.75, 0.75, pixmap.width() - 1.5, pixmap.height() - 1.5)
     path = QPainterPath()
     radius = max(3.0, min(rect.width(), rect.height()) * 0.22)
@@ -162,7 +175,7 @@ def _status_icon(status: str, size: int = 14) -> QIcon:
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    _set_high_quality_rendering(painter)
     painter.setPen(Qt.PenStyle.NoPen)
     halo = QColor(color)
     halo.setAlpha(48)

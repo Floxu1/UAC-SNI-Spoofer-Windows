@@ -9,7 +9,7 @@ import pytest
 from uac_desktop import __version__
 import uac_desktop.ui as ui_module
 from uac_desktop.engine import EngineCancelled
-from uac_desktop.models import ProxyProfile, Tuning
+from uac_desktop.models import ProxyProfile, Tuning, default_profiles
 from uac_desktop.network import ScanResult
 from uac_desktop.ui import DEFAULT_UPDATE_REPO_URL, MainWindow
 
@@ -237,6 +237,30 @@ def test_connect_button_cancels_an_in_progress_attempt():
     assert calls.index(("visual", "disconnecting")) < calls.index(("cancel", {"notify": True}))
 
 
+def test_retry_waits_for_previous_connection_worker(monkeypatch):
+    scheduled = []
+    cancelled = []
+    dummy = SimpleNamespace(
+        connecting=False,
+        engine=SimpleNamespace(running=False),
+        _maker_running=False,
+        _connect_thread=SimpleNamespace(is_alive=lambda: True),
+        _connection_retry_pending=False,
+        _cancel_connect_attempt=lambda **kwargs: cancelled.append(kwargs),
+        _resume_pending_connection=lambda: None,
+    )
+    monkeypatch.setattr(
+        ui_module.QTimer, "singleShot",
+        lambda delay, callback: scheduled.append((delay, callback)),
+    )
+
+    MainWindow.toggle_connection(dummy)
+
+    assert dummy._connection_retry_pending is True
+    assert cancelled == [{"notify": False}]
+    assert scheduled == [(75, dummy._resume_pending_connection)]
+
+
 def test_applied_sni_is_displayed_and_used_for_verified_profile_without_changing_server_sni():
     profile = ProxyProfile(
         id="verified-route", sni="server.example",
@@ -310,6 +334,67 @@ def test_verified_user_config_uses_its_healthy_sni_first_and_respects_limit():
     ) == ["known.good", "global-one.example"]
 
 
+def test_irancell_builtin_uses_profile_hint_before_global_candidates():
+    profile = ProxyProfile(
+        id="builtin-two",
+        origin="builtin",
+        sni="www.ignitelimit.com",
+        source_uri="trojan://humanity@127.0.0.1:40443?type=ws&sni=www.ignitelimit.com",
+    )
+    dummy = SimpleNamespace(
+        storage=SimpleNamespace(
+            settings={}, tuning=Tuning(carrier_mode="irancell")
+        ),
+        _sni_candidates=lambda *_args: [
+            "chatgpt.com",
+            "developers.cloudflare.com",
+            "use.fontawesome.com",
+        ],
+    )
+
+    assert MainWindow._profile_sni_candidates(
+        dummy, profile, "irancell", 3,
+    ) == [
+        "support.cloudflare.com",
+        "chatgpt.com",
+        "developers.cloudflare.com",
+        "use.fontawesome.com",
+    ]
+
+
+def test_builtin_route_cache_is_scoped_away_from_user_config():
+    builtin = ProxyProfile(
+        id="builtin-route", origin="builtin", source_uri="trojan://builtin"
+    )
+    user_config = ProxyProfile(
+        id="user-route", origin="sni-maker", source_uri="trojan://user"
+    )
+    settings = {
+        "builtin_profile_routes_by_carrier": {
+            "irancell": {
+                builtin.id: {
+                    "fake_sni": "cached.example",
+                    "strategy": "tls_sni_records",
+                    "signature": builtin.source_uri,
+                    "tested_at": time.time(),
+                }
+            }
+        }
+    }
+    dummy = SimpleNamespace(
+        storage=SimpleNamespace(
+            settings=settings, tuning=Tuning(carrier_mode="irancell")
+        )
+    )
+
+    assert MainWindow._builtin_route_entry(
+        dummy, builtin, "irancell"
+    )["fake_sni"] == "cached.example"
+    assert MainWindow._builtin_route_entry(
+        dummy, user_config, "irancell"
+    ) == {}
+
+
 def test_forced_profile_overrides_auto_mode_country_order(monkeypatch):
     preferred = ProxyProfile(id="clicked", origin="verified", verified_spoof=True)
     other = ProxyProfile(id="other", origin="verified", verified_spoof=True)
@@ -338,10 +423,256 @@ def test_forced_profile_overrides_auto_mode_country_order(monkeypatch):
     assert ordered == [preferred]
 
 
+def test_mci_suggested_auto_skips_only_builtin_404_paths(monkeypatch):
+    profiles = default_profiles()
+
+    class OrderedStorage:
+        def __init__(self, carrier):
+            self.profiles = list(profiles)
+            self.settings = {}
+            self.tuning = Tuning(carrier_mode=carrier)
+
+        def save_profiles(self):
+            return None
+
+    monkeypatch.setattr(ui_module, "profile_ping", lambda *_args: (True, 25.0))
+
+    def ordered(carrier, source="suggested", forced_profile=None,
+                source_profiles=None):
+        storage = OrderedStorage(carrier)
+        candidates = list(source_profiles if source_profiles is not None else profiles)
+        dummy = SimpleNamespace(
+            storage=storage,
+            bridge=SimpleNamespace(
+                latency=SimpleNamespace(emit=lambda *_args: None),
+                log=SimpleNamespace(emit=lambda *_args: None),
+            ),
+            _selected_route_source=lambda: source,
+            _route_source_profiles=lambda: candidates,
+        )
+        return MainWindow._ordered_profiles(
+            dummy, "community.cloudflare.com", threading.Event(),
+            auto_enabled=True, forced_profile=forced_profile,
+        ), storage
+
+    mci_profiles, mci_storage = ordered("mci")
+    assert [profile.name for profile in mci_profiles] == [
+        "uacSpoofer 3", "uacSpoofer 1", "uacSpoofer 2", "uacSpoofer 6",
+    ]
+    assert [profile.name for profile in mci_storage.profiles] == [
+        f"uacSpoofer {index}" for index in range(1, 7)
+    ]
+
+    forced, _storage = ordered("mci", forced_profile=profiles[3])
+    assert forced == [profiles[3]]
+
+    user_profiles = [
+        ProxyProfile(
+            name="uacSpoofer 4", origin="sni-maker",
+            source_uri=profiles[3].source_uri, verified_route=True,
+        ),
+        ProxyProfile(
+            name="uacSpoofer 5", origin="sni-maker",
+            source_uri=profiles[4].source_uri, verified_route=True,
+        ),
+    ]
+    user_ordered, _storage = ordered(
+        "mci", source="user-config", source_profiles=user_profiles,
+    )
+    assert user_ordered == user_profiles
+
+    irancell_profiles, _storage = ordered("irancell")
+    assert irancell_profiles == profiles
+
+
 def test_forced_user_config_keeps_mci_tls_strategy_in_auto_mode():
     assert MainWindow._initial_connection_strategy("mci", "") == "tls_sni_records"
     assert MainWindow._initial_connection_strategy("irancell", "") == "wrong_seq"
     assert MainWindow._initial_connection_strategy("mci", "DE") == "wrong_seq"
+
+
+def test_mci_builtin_uses_isolated_live_route_without_mutating_user_tuning():
+    base = Tuning.carrier_preset("mci")
+    base.pattern_connect_ip = "188.114.97.4"
+    base.pattern_fallback_ips = "188.114.99.160"
+    base.pattern_relay_buffer_kb = 256
+    base.pattern_socket_buffer_kb = 512
+    base.pattern_upload_optimized = False
+    base.xray_mux_enabled = True
+    profile = ProxyProfile(origin="builtin")
+
+    attempt = MainWindow._attempt_tuning_for_profile(
+        profile, base, "chatgpt.com", True,
+    )
+
+    assert attempt.pattern_connect_ip == ui_module.MCI_BUILTIN_PRIMARY_EDGE
+    assert attempt.pattern_fallback_ips == ui_module.MCI_BUILTIN_FALLBACK_EDGES
+    assert attempt.pattern_fake_sni == "chatgpt.com"
+    assert attempt.pattern_fake_repeat == ui_module.MCI_BUILTIN_FAKE_REPEAT == 1
+    assert attempt.pattern_inject_delay_ms == ui_module.MCI_BUILTIN_INJECT_DELAY_MS == 0
+    assert attempt.pattern_ack_timeout_ms == 8000
+    assert attempt.pattern_use_profile_edges is False
+    assert attempt.pattern_max_sessions == 4
+    assert attempt.pattern_relay_buffer_kb == 256
+    assert attempt.pattern_socket_buffer_kb == 512
+    assert attempt.pattern_upload_optimized is False
+    assert attempt.xray_mux_enabled is False
+    assert base.pattern_connect_ip == "188.114.97.4"
+    assert base.pattern_fallback_ips == "188.114.99.160"
+    assert base.pattern_max_sessions == 4
+    assert base.pattern_relay_buffer_kb == 256
+    assert base.pattern_socket_buffer_kb == 512
+    assert base.pattern_upload_optimized is False
+    assert base.xray_mux_enabled is True
+
+
+def test_mci_builtin_uses_live_primary_plan_but_user_config_keeps_existing_strategy():
+    builtin = ProxyProfile(origin="builtin")
+    user = ProxyProfile(origin="sni-maker", method="combined")
+
+    assert MainWindow._profile_connection_strategy(
+        builtin, "mci", "tls_sni_records", {"strategy": "wrong_seq"},
+    ) == ui_module.MCI_BUILTIN_ROUTE_PLANS[0][0]
+    assert MainWindow._profile_connection_strategy(
+        user, "mci", "tls_sni_records", {},
+    ) == "tls_sni_records"
+
+
+def test_mci_builtin_starts_with_live_verified_web_route():
+    profile = ProxyProfile(
+        id="builtin-two",
+        origin="builtin",
+        sni="www.ignitelimit.com",
+        source_uri="trojan://humanity@127.0.0.1:40443?type=ws&sni=www.ignitelimit.com",
+    )
+    dummy = SimpleNamespace(
+        storage=SimpleNamespace(
+            settings={}, tuning=Tuning(carrier_mode="mci")
+        ),
+        _sni_candidates=lambda *_args: [
+            "chatgpt.com", "community.cloudflare.com"
+        ],
+    )
+
+    assert MainWindow._profile_sni_candidates(
+        dummy, profile, "mci", 3,
+    ) == ["www.ignitelimit.com"] * len(ui_module.MCI_BUILTIN_ROUTE_PLANS)
+    assert ui_module.MCI_BUILTIN_ROUTE_PLANS[0] == (
+        "plain", "104.18.1.1"
+    )
+
+
+def test_mci_builtin_rotates_explicit_routes_without_touching_user_config():
+    builtin = ProxyProfile(origin="builtin")
+    user = ProxyProfile(origin="sni-maker")
+    base = Tuning.carrier_preset("mci")
+
+    plans = [
+        MainWindow._mci_builtin_route_plan(builtin, "mci", index)
+        for index in range(len(ui_module.MCI_BUILTIN_ROUTE_PLANS))
+    ]
+
+    assert plans == list(ui_module.MCI_BUILTIN_ROUTE_PLANS)
+    assert MainWindow._mci_builtin_route_plan(user, "mci", 0) is None
+    assert MainWindow._mci_builtin_route_plan(builtin, "irancell", 0) is None
+    for plan in plans:
+        attempt = MainWindow._attempt_tuning_for_profile(
+            builtin, base, "www.speedtest.net", True, plan,
+        )
+        assert attempt.pattern_connect_ip == plan[1]
+        assert attempt.pattern_fallback_ips == ui_module.MCI_BUILTIN_FALLBACK_EDGES
+        assert attempt.pattern_fake_repeat == 1
+        assert attempt.pattern_inject_delay_ms == 0
+        assert MainWindow._profile_connection_strategy(
+            builtin, "mci", "wrong_seq", {}, plan,
+        ) == plan[0]
+
+
+def test_mci_builtin_payload_gate_requires_real_body_and_skips_user_config():
+    calls = []
+
+    class EngineStub:
+        running = True
+        last_download_state = "failed"
+        last_download_bytes = 0
+
+        def probe_web_access(self, **kwargs):
+            calls.append(kwargs)
+            return False, "ReadTimeout"
+
+    dummy = SimpleNamespace(engine=EngineStub())
+    builtin = ProxyProfile(origin="builtin")
+    user = ProxyProfile(origin="sni-maker")
+
+    assert MainWindow._verify_mci_builtin_payload(
+        dummy, builtin, "mci", threading.Event(),
+    ) == (False, "ReadTimeout")
+    assert calls == [{
+        "timeout": 10.0,
+        "connect_timeout": 4.0,
+        "cancel_event": calls[0]["cancel_event"],
+    }]
+    assert MainWindow._verify_mci_builtin_payload(
+        dummy, user, "mci", threading.Event(),
+    ) == (True, "not required")
+    assert len(calls) == 1
+
+
+def test_mci_builtin_payload_gate_accepts_one_verified_pass():
+    calls = []
+
+    class EngineStub:
+        running = True
+        last_download_state = "verified"
+        last_download_bytes = ui_module.MCI_BUILTIN_WEB_GATE_MIN_BYTES
+
+        def probe_web_access(self, **kwargs):
+            calls.append(kwargs)
+            return True, f"pass {len(calls)}"
+
+    dummy = SimpleNamespace(engine=EngineStub())
+    builtin = ProxyProfile(origin="builtin")
+
+    assert MainWindow._verify_mci_builtin_payload(
+        dummy, builtin, "mci", threading.Event(),
+    ) == (True, "pass 1")
+    assert len(calls) == 1
+
+
+def test_mci_user_config_keeps_its_existing_edge_and_mux_setting():
+    base = Tuning.carrier_preset("mci")
+    base.pattern_connect_ip = "188.114.97.4"
+    base.pattern_fallback_ips = "188.114.99.160"
+    base.pattern_fake_repeat = 1
+    base.pattern_inject_delay_ms = 4
+    base.pattern_ack_timeout_ms = 3100
+    profile = ProxyProfile(origin="sni-maker")
+
+    attempt = MainWindow._attempt_tuning_for_profile(
+        profile, base, "chatgpt.com", True,
+    )
+
+    assert attempt.pattern_connect_ip == "188.114.97.4"
+    assert attempt.pattern_fallback_ips == "188.114.99.160"
+    assert attempt.pattern_fake_repeat == 1
+    assert attempt.pattern_inject_delay_ms == 4
+    assert attempt.pattern_ack_timeout_ms == 3100
+    assert attempt.xray_mux_enabled is True
+
+
+def test_irancell_builtin_does_not_receive_mci_hybrid_tuning():
+    base = Tuning.carrier_preset("irancell")
+    profile = ProxyProfile(origin="builtin")
+
+    attempt = MainWindow._attempt_tuning_for_profile(
+        profile, base, "chatgpt.com", True,
+    )
+
+    assert attempt.pattern_connect_ip == base.pattern_connect_ip
+    assert attempt.pattern_fallback_ips == base.pattern_fallback_ips
+    assert attempt.pattern_fake_repeat == base.pattern_fake_repeat == 1
+    assert attempt.pattern_inject_delay_ms == base.pattern_inject_delay_ms
+    assert attempt.pattern_ack_timeout_ms == base.pattern_ack_timeout_ms
 
 
 def test_profile_click_reconnects_only_when_tunnel_is_active():

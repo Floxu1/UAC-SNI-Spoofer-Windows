@@ -27,7 +27,7 @@ def _redirect_storage(monkeypatch, tmp_path):
     return paths
 
 
-def test_existing_install_receives_verified_snapshot_once(tmp_path, monkeypatch):
+def test_existing_install_keeps_only_six_original_suggested_configs(tmp_path, monkeypatch):
     paths = _redirect_storage(monkeypatch, tmp_path)
     legacy = parse_many(BUILTIN_CONFIGS, suggested=True)
     paths["PROFILES_FILE"].write_text(
@@ -35,16 +35,19 @@ def test_existing_install_receives_verified_snapshot_once(tmp_path, monkeypatch)
     )
 
     storage = Storage()
-    assert len(storage.profiles) == 60
-    assert len([profile for profile in storage.profiles if profile.verified_spoof]) == 54
-    assert storage.settings["verified_configs_version"] == 5
+    assert len(storage.profiles) == 6
+    assert [profile.name for profile in storage.profiles] == [
+        f"uacSpoofer {index}" for index in range(1, 7)
+    ]
+    assert len([profile for profile in storage.profiles if profile.verified_spoof]) == 0
+    assert storage.settings["verified_configs_version"] == 6
     assert storage.settings["proxy_mode"] is True
     assert storage.settings["tun_mode"] is False
     assert "close_to_tray" not in storage.settings
 
     first_profiles = paths["PROFILES_FILE"].read_bytes()
     reloaded = Storage()
-    assert len(reloaded.profiles) == 60
+    assert len(reloaded.profiles) == 6
     assert paths["PROFILES_FILE"].read_bytes() == first_profiles
 
 
@@ -60,16 +63,14 @@ def test_verified_snapshot_has_no_hand_entered_ping_suffix():
     assert all(profile.country_latency_ms == 0 for profile in verified)
 
 
-def test_v4_latency_labels_are_migrated_in_place(tmp_path, monkeypatch):
+def test_v4_country_snapshot_is_removed_from_suggested(tmp_path, monkeypatch):
     paths = _redirect_storage(monkeypatch, tmp_path)
     legacy = parse_many(BUILTIN_CONFIGS, suggested=True)
     old_verified = storage_module.verified_profiles()
-    old_ids = set()
     for index, profile in enumerate(old_verified, 1):
         profile.source_uri += f"-{900 + index}ms"
         profile.name += f" · {900 + index} ms"
         profile.country_latency_ms = 900 + index
-        old_ids.add(profile.id)
     paths["PROFILES_FILE"].write_text(
         json.dumps([profile.to_dict() for profile in [*legacy, *old_verified]]),
         encoding="utf-8",
@@ -79,20 +80,17 @@ def test_v4_latency_labels_are_migrated_in_place(tmp_path, monkeypatch):
     )
 
     storage = Storage()
-    verified = [profile for profile in storage.profiles if profile.verified_spoof]
-
-    assert len(storage.profiles) == 60
-    assert len(verified) == 54
-    assert old_ids == {profile.id for profile in verified}
-    assert all(not re.search(r"-\d+ms$", profile.source_uri, re.I)
-               for profile in verified)
-    assert all(not re.search(r"\b\d+\s*ms$", profile.name, re.I)
-               for profile in verified)
-    assert all(profile.country_latency_ms == 0 for profile in verified)
-    assert storage.settings["verified_configs_version"] == 5
+    assert len(storage.profiles) == 6
+    assert [profile.name for profile in storage.profiles] == [
+        f"uacSpoofer {index}" for index in range(1, 7)
+    ]
+    assert not any(profile.verified_spoof for profile in storage.profiles)
+    assert all(not profile.source_uri.rsplit("#", 1)[-1].upper().startswith("SPOOF-")
+               for profile in storage.profiles)
+    assert storage.settings["verified_configs_version"] == 6
 
 
-def test_v1_manual_imports_are_adopted_for_country_picker(tmp_path, monkeypatch):
+def test_manual_imports_survive_original_suggested_cleanup(tmp_path, monkeypatch):
     paths = _redirect_storage(monkeypatch, tmp_path)
     legacy = parse_many(BUILTIN_CONFIGS, suggested=True)
     imported = storage_module.verified_profiles()[:46]
@@ -115,13 +113,13 @@ def test_v1_manual_imports_are_adopted_for_country_picker(tmp_path, monkeypatch)
     )
 
     storage = Storage()
-    verified = [profile for profile in storage.profiles if profile.verified_spoof]
+    imported_after = [profile for profile in storage.profiles if profile.id in imported_ids]
 
-    assert len(verified) == 54
-    assert len(storage.profiles) == 60
-    assert imported_ids.issubset({profile.id for profile in verified})
-    assert all(profile.origin == "verified" for profile in verified)
-    assert storage.settings["verified_configs_version"] == 5
+    assert len(storage.profiles) == 52
+    assert len(imported_after) == 46
+    assert all(profile.origin == "user" for profile in imported_after)
+    assert len([profile for profile in storage.profiles if profile.origin == "builtin"]) == 6
+    assert storage.settings["verified_configs_version"] == 6
 
 
 def test_country_mode_orders_only_the_selected_verified_profiles(monkeypatch):

@@ -235,14 +235,14 @@ def configured_forwarder(**kwargs):
     return helper
 
 
-def test_gateway_default_forwarder_forces_router_dns_through_remote_path(
+def test_gateway_default_forwarder_leaves_dns_to_singbox(
         tmp_path):
     manager = GatewayManager(
         state_file=tmp_path / "gateway.json",
         watchdog_launcher=lambda _state: None,
     )
 
-    assert manager.forwarder.rewrite_dns is True
+    assert manager.forwarder.rewrite_dns is False
 
 
 def test_start_stop_round_trip_is_idempotent(tmp_path):
@@ -391,6 +391,28 @@ def test_failed_recovery_keeps_atomic_restore_record(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_recovery_treats_arp_refresh_as_best_effort(tmp_path):
+    class MissingNpcapArp(ArpStub):
+        def restore(self, state):
+            raise RuntimeError("Npcap unavailable")
+
+    windows = WindowsStub()
+    manager = make_manager(
+        tmp_path,
+        windows=windows,
+        arp=MissingNpcapArp(),
+        process_alive=lambda _pid, _created: False,
+    )
+    manager.state_file.write_text(
+        json.dumps(fixture_state(windows)),
+        encoding="utf-8",
+    )
+
+    assert manager.recover() is True
+    assert len(windows.restore_calls) == 1
+    assert not manager.state_file.exists()
+
+
 def test_watchdog_recovers_after_owner_exits(tmp_path):
     windows = WindowsStub()
     arp = ArpStub()
@@ -422,6 +444,62 @@ def test_watchdog_recovers_after_owner_exits(tmp_path):
 def test_scapy_backend_remains_lazy_until_network_action():
     backend = ScapyArpBackend()
     assert backend._api is None
+
+
+def test_scapy_backend_extracts_dhcp_hostname_identity():
+    class FakeDhcp:
+        pass
+
+    class FakeBootp:
+        pass
+
+    class FakeIp:
+        pass
+
+    class FakeEther:
+        pass
+
+    dhcp = FakeDhcp()
+    dhcp.options = [
+        ("message-type", 3),
+        ("hostname", b"Rayane-Phone"),
+        ("requested_addr", "192.168.70.136"),
+        "end",
+    ]
+    bootp = FakeBootp()
+    bootp.ciaddr = "0.0.0.0"
+    bootp.yiaddr = "0.0.0.0"
+    bootp.chaddr = bytes.fromhex("9c9ed5936383") + (b"\x00" * 10)
+    ip_layer = FakeIp()
+    ip_layer.src = "0.0.0.0"
+    ethernet = FakeEther()
+    ethernet.src = "9c:9e:d5:93:63:83"
+    layers = {
+        FakeDhcp: dhcp,
+        FakeBootp: bootp,
+        FakeIp: ip_layer,
+        FakeEther: ethernet,
+    }
+
+    class FakePacket:
+        def getlayer(self, layer):
+            return layers.get(layer)
+
+    identity = ScapyArpBackend._dhcp_identity(
+        FakePacket(),
+        {
+            "DHCP": FakeDhcp,
+            "BOOTP": FakeBootp,
+            "IP": FakeIp,
+            "Ether": FakeEther,
+        },
+    )
+
+    assert identity == (
+        "192.168.70.136",
+        "9c:9e:d5:93:63:83",
+        "Rayane-Phone",
+    )
 
 
 def test_scapy_responder_reports_valid_lan_device_immediately():

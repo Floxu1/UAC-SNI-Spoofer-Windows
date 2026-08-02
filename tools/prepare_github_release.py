@@ -23,6 +23,11 @@ PORTABLE_RUNTIME_FILES = (
     Path("_internal/bin/libcronet.dll"),
     Path("_internal/bin/sing-box-LICENSE"),
 )
+ASSISTANT_ASSET_FILES = tuple(
+    Path("_internal/wizard guider") / f"wizard_{index:02d}_{state}.png" for index, state in enumerate((
+        "normal", "thinking", "waiting", "happy", "sad", "guiding_right", "confused", "surprised"
+    ), start=1)
+)
 
 
 def copy_file(source: Path, destination: Path) -> str:
@@ -121,7 +126,7 @@ def clear_output_files() -> None:
 
 def main() -> None:
     require_file_paths(
-        (DIST / path for path in PORTABLE_RUNTIME_FILES),
+        (DIST / path for path in (*PORTABLE_RUNTIME_FILES, *ASSISTANT_ASSET_FILES)),
         "Portable build is missing required files; run PyInstaller first",
     )
     reset_tree(STAGE)
@@ -141,7 +146,7 @@ def main() -> None:
         "UAC-Spoofer-Desktop.spec",
     ):
         copy_item(ROOT / name, stage_source / name)
-    for name in ("uac_desktop", "assets", "third_party", "docs"):
+    for name in ("uac_desktop", "assets", "third_party", "docs", "wizard guider"):
         copy_item(ROOT / name, stage_source / name)
     (stage_source / "tools").mkdir()
     copy_item(Path(__file__), stage_source / "tools" / Path(__file__).name)
@@ -200,9 +205,12 @@ def main() -> None:
             copy_item(path, OUT / path.name)
 
     required = [
-        *(PORTABLE / path for path in PORTABLE_RUNTIME_FILES),
+        *(PORTABLE / path for path in (*PORTABLE_RUNTIME_FILES, *ASSISTANT_ASSET_FILES)),
         SOURCE / "main.py",
         SOURCE / "uac_desktop" / "app_config.py",
+        *(SOURCE / "wizard guider" / f"wizard_{index:02d}_{state}.png" for index, state in enumerate((
+            "normal", "thinking", "waiting", "happy", "sad", "guiding_right", "confused", "surprised"
+        ), start=1)),
         OUT / "README.md",
         OUT / "LICENSES" / "sing-box-LICENSE.txt",
         portable_zip,

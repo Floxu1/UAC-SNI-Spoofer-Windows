@@ -12,9 +12,9 @@ from .paths import BOOKMARKS_FILE, PROFILES_FILE, SETTINGS_FILE, SNI_RESULTS_FIL
 
 _IO_LOCK = threading.RLock()
 _SPEED_CORE_VERSION = 3
-_CARRIER_TUNING_VERSION = 2
+_CARRIER_TUNING_VERSION = 3
 _UPDATE_REPOSITORY_VERSION = 1
-_VERIFIED_CONFIGS_VERSION = 5
+_VERIFIED_CONFIGS_VERSION = 6
 _CARRIERS = ("auto", "mci", "irancell")
 _LEGACY_UPDATE_REPOSITORIES = {
     f"https://github.com/floxu1/uac-sni-spoofer-{platform}"
@@ -43,6 +43,7 @@ def _read(path: Path, fallback):
 
 def _write(path: Path, value) -> None:
     with _IO_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
         try:
             temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -66,6 +67,14 @@ class Storage:
         if "tun_mode" not in self.settings:
             self.settings["tun_mode"] = False
             preferences_changed = True
+        for key, value in (
+                ("assistant_enabled", False),
+                ("assistant_guides_enabled", True),
+                ("assistant_warnings_enabled", True),
+                ("assistant_seen_guides", [])):
+            if key not in self.settings:
+                self.settings[key] = value
+                preferences_changed = True
 
 
         if "close_to_tray" in self.settings:
@@ -214,6 +223,10 @@ class Storage:
         value = str(value or "auto").strip().lower()
         return value if value in _CARRIERS else "auto"
 
+    @classmethod
+    def _enforced_carrier_tuning(cls, carrier: str, tuning: Tuning) -> Tuning:
+        return Tuning.enforce_carrier(tuning, cls._carrier_name(carrier))
+
     def _best_saved_edge(self, carrier: str, domain: str = "") -> str:
         candidates = []
         for raw in self.scan_results:
@@ -357,19 +370,46 @@ class Storage:
             if active.is_legacy_mci_compatibility():
                 self.settings["tuning"] = self._upgrade_mci_turbo(active).to_dict()
 
+    def _migrate_mci_protected_v3(self) -> bool:
+        changed = False
+        raw_map = self.settings.get("carrier_tunings")
+        stored = dict(raw_map) if isinstance(raw_map, dict) else {}
+        raw_mci = stored.get("mci")
+        source = Tuning.from_dict(raw_mci) if isinstance(raw_mci, dict) else Tuning.carrier_preset("mci")
+        protected = self._enforced_carrier_tuning("mci", source).to_dict()
+        if raw_mci != protected:
+            stored["mci"] = protected
+            self.settings["carrier_tunings"] = stored
+            changed = True
+        raw_active = self.settings.get("tuning")
+        if isinstance(raw_active, dict):
+            active = Tuning.from_dict(raw_active)
+            if self._carrier_name(active.carrier_mode) == "mci":
+                protected_active = self._enforced_carrier_tuning("mci", active).to_dict()
+                if raw_active != protected_active:
+                    self.settings["tuning"] = protected_active
+                    changed = True
+        return changed
+
     def _migrate_carrier_tunings(self) -> None:
         """Run carrier isolation v1, then the narrow idempotent MCI v2 repair."""
         try:
             previous_version = int(self.settings.get("carrier_tuning_version", 0) or 0)
         except (TypeError, ValueError):
             previous_version = 0
-        if previous_version >= _CARRIER_TUNING_VERSION:
-            return
+        changed = False
         if previous_version < 1:
             self._initialize_carrier_tunings_v1()
-        self._migrate_mci_turbo_v2()
-        self.settings["carrier_tuning_version"] = _CARRIER_TUNING_VERSION
-        self.save_settings()
+            changed = True
+        if previous_version < 2:
+            self._migrate_mci_turbo_v2()
+            changed = True
+        changed = self._migrate_mci_protected_v3() or changed
+        if self.settings.get("carrier_tuning_version") != _CARRIER_TUNING_VERSION:
+            self.settings["carrier_tuning_version"] = _CARRIER_TUNING_VERSION
+            changed = True
+        if changed:
+            self.save_settings()
 
     def _load_profiles(self) -> list[ProxyProfile]:
         raw = _read(PROFILES_FILE, [])
@@ -379,81 +419,57 @@ class Storage:
             _write(PROFILES_FILE, [x.to_dict() for x in profiles])
         return profiles
 
-    def _migrate_verified_configs(self) -> None:
-        """Add or adopt this release's measured spoof snapshot without duplicates.
+    def restore_original_suggested_profiles(self) -> int:
+        direct = [
+            profile for profile in self.profiles
+            if profile.origin in {"user", "sni-maker"}
+        ]
+        previous_suggested = [
+            profile for profile in self.profiles
+            if profile.origin not in {"user", "sni-maker"}
+        ]
+        by_name = {
+            str(profile.name or "").strip().casefold(): profile
+            for profile in previous_suggested
+        }
+        by_route = {
+            str(profile.source_uri or "").strip().rsplit("#", 1)[0]: profile
+            for profile in previous_suggested
+            if str(profile.source_uri or "").strip()
+        }
+        originals = default_profiles()
+        for profile in originals:
+            existing = by_name.get(profile.name.casefold())
+            if existing is None:
+                existing = by_route.get(profile.source_uri.rsplit("#", 1)[0])
+            if existing is None:
+                continue
+            profile.id = existing.id
+            profile.last_ping_ok = existing.last_ping_ok
+            profile.last_ping_ms = existing.last_ping_ms
+            profile.verified_route = existing.verified_route
+            profile.spoof_fake_sni = existing.spoof_fake_sni
+        self.profiles = [*originals, *direct]
+        retained_ids = {profile.id for profile in self.profiles}
+        if str(self.settings.get("selected_id", "")) not in retained_ids:
+            self.settings["selected_id"] = originals[0].id if originals else ""
+        self.settings["selected_country_suggested"] = "ALL"
+        for key in tuple(self.settings):
+            if (key.startswith("working_profile_")
+                    and str(self.settings.get(key, "")) not in retained_ids):
+                self.settings.pop(key, None)
+        self.save_profiles()
+        self.save_settings()
+        return len(originals)
 
-        Version 1 only compared URI signatures.  Users who had already imported
-        the tested list kept those rows as ordinary manual profiles, so the
-        country picker saw zero routes.  Version 2 upgrades the matching rows in
-        place (preserving their IDs/benchmarks) and appends only missing routes.
-        Versions 3-4 tag historically rotating exits and move them out of a
-        fixed country until a fresh in-tunnel location measurement exists.
-        """
+    def _migrate_verified_configs(self) -> None:
         try:
             previous_version = int(self.settings.get("verified_configs_version", 0) or 0)
         except (TypeError, ValueError):
             previous_version = 0
         if previous_version >= _VERIFIED_CONFIGS_VERSION:
             return
-
-        known_ids = {profile.id for profile in self.profiles}
-        by_source = {
-            str(profile.source_uri or "").strip(): profile
-            for profile in self.profiles if str(profile.source_uri or "").strip()
-        }
-
-
-
-        by_route = {
-            str(profile.source_uri or "").strip().rsplit("#", 1)[0]: profile
-            for profile in self.profiles
-            if (str(profile.source_uri or "").strip()
-                and (profile.verified_spoof
-                     or str(profile.source_uri or "").rsplit("#", 1)[-1]
-                     .upper().startswith("SPOOF-")))
-        }
-        changed = False
-        for profile in verified_profiles():
-            existing = by_source.get(profile.source_uri)
-            if existing is None:
-                existing = by_route.get(profile.source_uri.rsplit("#", 1)[0])
-            if existing is not None:
-                preserve_live_country = (
-                    float(existing.country_verified_at or 0) > 0
-                    and len(str(existing.observed_country_code or "")) == 2
-                )
-                for field in (
-                    "name", "address", "fallback_address", "port", "sni",
-                    "method", "source_uri", "protocol", "config_host",
-                    "config_port", "origin", "country_code",
-                    "country_latency_ms", "verified_spoof", "spoof_fake_sni",
-                    "rotating_exit",
-                ):
-                    if preserve_live_country and field in {"name", "country_code"}:
-                        continue
-                    value = getattr(profile, field)
-                    if getattr(existing, field) != value:
-                        setattr(existing, field, value)
-                        changed = True
-
-
-                if preserve_live_country:
-                    name_parts = existing.name.rsplit(" · ", 1)
-                    tail = name_parts[-1].strip().lower()
-                    if (len(name_parts) == 2 and tail.endswith(" ms")
-                            and tail[:-3].strip().isdigit()):
-                        existing.name = name_parts[0]
-                        changed = True
-                continue
-            if profile.id in known_ids:
-                continue
-            self.profiles.append(profile)
-            known_ids.add(profile.id)
-            by_source[profile.source_uri] = profile
-            by_route[profile.source_uri.rsplit("#", 1)[0]] = profile
-            changed = True
-        if changed:
-            self.save_profiles()
+        self.restore_original_suggested_profiles()
         self.settings["verified_configs_version"] = _VERIFIED_CONFIGS_VERSION
         self.save_settings()
 
@@ -471,11 +487,12 @@ class Storage:
 
     @property
     def tuning(self) -> Tuning:
-        return Tuning.from_dict(self.settings.get("tuning", {}))
+        value = Tuning.from_dict(self.settings.get("tuning", {}))
+        return self._enforced_carrier_tuning(value.carrier_mode, value)
 
     def set_tuning(self, tuning: Tuning) -> None:
         carrier = self._carrier_name(tuning.carrier_mode)
-        tuning.carrier_mode = carrier
+        tuning = self._enforced_carrier_tuning(carrier, tuning)
         values = self.settings.get("carrier_tunings", {})
         values = dict(values) if isinstance(values, dict) else {}
         values[carrier] = tuning.to_dict()
@@ -488,7 +505,15 @@ class Storage:
         values = self.settings.get("carrier_tunings", {})
         raw = values.get(carrier) if isinstance(values, dict) else None
         tuning = Tuning.from_dict(raw) if isinstance(raw, dict) else Tuning.carrier_preset(carrier)
-        tuning.carrier_mode = carrier
+        tuning = self._enforced_carrier_tuning(carrier, tuning)
+        if carrier == "mci" and raw != tuning.to_dict():
+            stored = dict(values) if isinstance(values, dict) else {}
+            stored[carrier] = tuning.to_dict()
+            self.settings["carrier_tunings"] = stored
+            active = Tuning.from_dict(self.settings.get("tuning", {}))
+            if self._carrier_name(active.carrier_mode) == "mci":
+                self.settings["tuning"] = tuning.to_dict()
+            self.save_settings()
         return tuning
 
     def all_carrier_tunings(self) -> dict[str, Tuning]:
@@ -500,6 +525,7 @@ class Storage:
         values = self.settings.get("carrier_tunings", {})
         values = dict(values) if isinstance(values, dict) else {}
         current_carrier = self._carrier_name(current.carrier_mode)
+        current = self._enforced_carrier_tuning(current_carrier, current)
         values[current_carrier] = current.to_dict()
         target = self.tuning_for_carrier(carrier)
         values[carrier] = target.to_dict()
@@ -513,11 +539,14 @@ class Storage:
         stored = dict(stored) if isinstance(stored, dict) else {}
         for carrier, tuning in values.items():
             carrier = self._carrier_name(carrier)
-            tuning.carrier_mode = carrier
+            tuning = self._enforced_carrier_tuning(carrier, tuning)
             stored[carrier] = tuning.to_dict()
+        stored_mci = stored.get("mci")
+        mci = Tuning.from_dict(stored_mci) if isinstance(stored_mci, dict) else Tuning.carrier_preset("mci")
+        stored["mci"] = self._enforced_carrier_tuning("mci", mci).to_dict()
         active_carrier = self._carrier_name(active_carrier)
         active = Tuning.from_dict(stored.get(active_carrier, Tuning.carrier_preset(active_carrier).to_dict()))
-        active.carrier_mode = active_carrier
+        active = self._enforced_carrier_tuning(active_carrier, active)
         stored[active_carrier] = active.to_dict()
         self.settings["carrier_tunings"] = stored
         self.settings["tuning"] = active.to_dict()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -57,7 +58,9 @@ def test_storage_keeps_mci_and_irancell_tuning_fully_isolated(tmp_path, monkeypa
 
     assert initial_irancell.pattern_fake_sni == "irancell-only.example"
     assert initial_irancell.pattern_socket_buffer_kb == 3584
-    assert initial_mci.pattern_connect_ip == "188.114.98.0"
+    assert initial_mci.pattern_connect_ip == "104.18.1.1"
+    assert initial_mci.pattern_fallback_ips == "172.66.0.1"
+    assert initial_mci.pattern_fake_sni == "www.speedtest.net"
     assert initial_mci.pattern_fake_sni != initial_irancell.pattern_fake_sni
 
     mci = storage.activate_carrier("mci")
@@ -79,16 +82,33 @@ def test_storage_keeps_mci_and_irancell_tuning_fully_isolated(tmp_path, monkeypa
     storage.set_tuning(restored_irancell)
 
     restored_mci = storage.activate_carrier("mci")
-    assert restored_mci.pattern_fake_sni == "mci-only.example"
-    assert restored_mci.pattern_ack_timeout_ms == 2711
+    assert restored_mci.pattern_fake_sni == "www.speedtest.net"
+    assert restored_mci.pattern_ack_timeout_ms == 8000
     assert restored_mci.pattern_connect_timeout_ms != 1777
 
     reloaded = Storage()
     assert reloaded.tuning.carrier_mode == "mci"
-    assert reloaded.tuning_for_carrier("mci").pattern_fake_sni == "mci-only.example"
-    assert reloaded.tuning_for_carrier("mci").pattern_ack_timeout_ms == 2711
+    assert reloaded.tuning_for_carrier("mci").pattern_fake_sni == "www.speedtest.net"
+    assert reloaded.tuning_for_carrier("mci").pattern_ack_timeout_ms == 8000
     assert reloaded.tuning_for_carrier("irancell").pattern_fake_sni == "irancell-edited.example"
     assert reloaded.tuning_for_carrier("irancell").pattern_connect_timeout_ms == 1777
+
+
+def test_storage_rebuilds_protected_mci_after_data_directory_is_deleted(tmp_path, monkeypatch):
+    paths = _redirect_storage(monkeypatch, tmp_path)
+    storage = Storage()
+    shutil.rmtree(tmp_path)
+    tampered = Tuning.carrier_preset("mci")
+    tampered.pattern_connect_ip = "203.0.113.7"
+    tampered.pattern_fake_sni = "tampered.example"
+    tampered.pattern_max_sessions = 31
+
+    storage.set_tuning(tampered)
+
+    assert paths["SETTINGS_FILE"].is_file()
+    saved = json.loads(paths["SETTINGS_FILE"].read_text(encoding="utf-8"))
+    assert saved["tuning"] == Tuning.carrier_preset("mci").to_dict()
+    assert saved["carrier_tunings"]["mci"] == Tuning.carrier_preset("mci").to_dict()
 
 
 def test_advanced_carrier_switch_preserves_each_draft_without_field_leak(qapp):
@@ -122,11 +142,15 @@ def test_advanced_carrier_switch_preserves_each_draft_without_field_leak(qapp):
 
         dialog.carrier.setCurrentText("mci")
         qapp.processEvents()
-        assert dialog.connect_ip.text() == "188.114.98.0"
-        assert dialog.fallback_ips.text() == "188.114.99.0"
-        assert dialog.fake_sni.text() == "mci.example"
-        assert dialog.max_sessions.value() == 9
+        assert dialog.connect_ip.text() == "104.18.1.1"
+        assert dialog.fallback_ips.text() == "172.66.0.1"
+        assert dialog.fake_sni.text() == "www.speedtest.net"
+        assert dialog.max_sessions.value() == 4
         assert dialog.mux_enabled.isChecked() is False
+        assert all(not widget.isEnabled() for widget in dialog._mci_locked_controls)
+        assert dialog.carrier.isEnabled()
+        assert dialog.log_level.isEnabled()
+        assert dialog.update_repo.isEnabled()
 
         dialog.connect_ip.setText("188.114.98.77")
         dialog.fake_sni.setText("mci-edited.example")
@@ -135,6 +159,7 @@ def test_advanced_carrier_switch_preserves_each_draft_without_field_leak(qapp):
 
         dialog.carrier.setCurrentText("irancell")
         qapp.processEvents()
+        assert all(widget.isEnabled() for widget in dialog._mci_locked_controls)
         assert dialog.connect_ip.text() == "104.19.229.99"
         assert dialog.fake_sni.text() == "irancell-edited.example"
         assert dialog.max_sessions.value() == 15
@@ -144,9 +169,9 @@ def test_advanced_carrier_switch_preserves_each_draft_without_field_leak(qapp):
         assert values["irancell"].pattern_connect_ip == "104.19.229.99"
         assert values["irancell"].pattern_fake_sni == "irancell-edited.example"
         assert values["irancell"].pattern_max_sessions == 15
-        assert values["mci"].pattern_connect_ip == "188.114.98.77"
-        assert values["mci"].pattern_fake_sni == "mci-edited.example"
-        assert values["mci"].pattern_max_sessions == 11
+        assert values["mci"].pattern_connect_ip == "104.18.1.1"
+        assert values["mci"].pattern_fake_sni == "www.speedtest.net"
+        assert values["mci"].pattern_max_sessions == 4
         assert values["mci"].xray_mux_enabled is False
     finally:
         dialog.close()

@@ -20,6 +20,19 @@ except (ImportError, ModuleNotFoundError):
     QSvgRenderer = None
 
 
+HIGH_QUALITY_RENDER_HINTS = (
+    QPainter.RenderHint.Antialiasing
+    | QPainter.RenderHint.TextAntialiasing
+    | QPainter.RenderHint.SmoothPixmapTransform
+    | QPainter.RenderHint.LosslessImageRendering
+    | QPainter.RenderHint.VerticalSubpixelPositioning
+)
+
+
+def _set_high_quality_rendering(painter):
+    painter.setRenderHints(HIGH_QUALITY_RENDER_HINTS, True)
+
+
 
 
 _ICONS: Final[dict[str, str]] = {
@@ -217,7 +230,7 @@ def _fallback_pixmap(name: str, colour: QColor, size: int) -> QPixmap:
     result = QPixmap(size, size)
     result.fill(Qt.GlobalColor.transparent)
     painter = QPainter(result)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    _set_high_quality_rendering(painter)
     pen = QPen(colour, max(1.25, size / 13.0))
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
@@ -250,7 +263,7 @@ def pixmap(name: str, color: str = "#9fb4d8", size: int = 22) -> QPixmap:
     if not renderer.isValid():
         return _fallback_pixmap(key, colour, icon_size)
     painter = QPainter(result)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    _set_high_quality_rendering(painter)
     renderer.render(painter, QRectF(0, 0, icon_size, icon_size))
     painter.end()
     return result

@@ -342,10 +342,25 @@ def _compatibility_error(profile: ProxyProfile) -> str:
             for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         }
         credential = urllib.parse.unquote(parsed.username or "").strip()
-        if protocol == "vless" and not credential:
-            return "Missing VLESS UUID"
+        if protocol == "vless":
+            if not credential:
+                return "Missing VLESS UUID"
+            try:
+                uuid.UUID(credential)
+            except (ValueError, AttributeError):
+                return "Invalid VLESS UUID"
         elif protocol == "trojan" and not credential:
             return "Missing Trojan password"
+        encryption = query.get("encryption", "none").strip()
+        if (
+                protocol == "vless"
+                and encryption.lower() not in {"", "none"}
+                and not re.fullmatch(
+                    r"mlkem\d+x25519plus(?:\.[A-Za-z0-9_-]+)+",
+                    encryption,
+                    re.IGNORECASE,
+                )):
+            return "Unsupported VLESS encryption"
         security = query.get("security", "").strip().lower()
         if security not in {"", "tls"}:
             return f"Unsupported security: {security}"
@@ -434,12 +449,20 @@ def convert_to_sni(
     converted.protocol = parsed.scheme.lower()
     converted.config_host = local_host
     converted.config_port = int(local_port)
-    converted.address = str(edge).strip() or VERIFIED_SPOOF_EDGE
+    source_edge = ""
+    try:
+        parsed_edge = ipaddress.ip_address(str(parsed.hostname or "").strip())
+        if parsed_edge.version == 4 and not parsed_edge.is_loopback:
+            source_edge = str(parsed_edge)
+    except ValueError:
+        pass
+    converted.address = source_edge or str(edge).strip() or VERIFIED_SPOOF_EDGE
     converted.fallback_address = str(fallback_edge).strip()
     converted.port = parsed.port or 443
     converted.sni = server_name
     converted.origin = "sni-maker"
     converted.route_mode = "sni"
+    converted.method = "full5"
     converted.verified_route = False
     converted.last_ping_ok = False
     converted.last_ping_ms = 0.0

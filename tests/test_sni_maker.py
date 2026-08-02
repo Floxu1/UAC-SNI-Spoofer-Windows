@@ -232,6 +232,20 @@ def test_conversion_preserves_credentials_query_path_and_fragment():
     assert converted.spoof_fake_sni == "static.cloudflare.com"
     assert converted.verified_spoof is False
     assert converted.id != original.id
+    assert converted.method == "full5"
+
+
+def test_conversion_preserves_an_ipv4_source_edge():
+    profile = _profile(
+        "vless://00000000-0000-4000-8000-000000000001@104.16.1.1:443"
+        "?security=tls&type=ws&sni=edge.example&host=edge.example&path=%2Fws"
+    )
+
+    result = convert_to_sni(profile, edge="104.19.229.21")
+
+    assert result.profile is not None
+    assert result.profile.address == "104.16.1.1"
+    assert result.profile.method == "full5"
 
 
 def test_conversion_rejects_removed_insecure_tls_and_invalid_vless_uuid():
@@ -242,9 +256,19 @@ def test_conversion_rejects_removed_insecure_tls_and_invalid_vless_uuid():
     missing_uuid = _profile(
         "vless://@example.com:443?security=tls&type=ws&sni=example.com"
     )
+    invalid_uuid = _profile(
+        "vless://Telegram-NUFiLTER@example.com:443"
+        "?security=tls&type=ws&sni=example.com"
+    )
+    invalid_encryption = _profile(
+        "vless://00000000-0000-4000-8000-000000000001@example.com:443"
+        "?security=tls&type=ws&sni=example.com&encryption=none%3D%40channel"
+    )
 
     assert convert_to_sni(insecure).error == "Unsupported insecure TLS option"
     assert convert_to_sni(missing_uuid).error == "Missing VLESS UUID"
+    assert convert_to_sni(invalid_uuid).error == "Invalid VLESS UUID"
+    assert convert_to_sni(invalid_encryption).error == "Unsupported VLESS encryption"
 
 
 def test_existing_sni_config_is_copied_without_rewrite():

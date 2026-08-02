@@ -14,6 +14,22 @@ from .verified_configs import (COUNTRIES, VERIFIED_SPOOF_CONFIGS,
 DEFAULT_ADDRESS = "104.18.8.83"
 DEFAULT_FALLBACK = "104.18.9.83"
 DEFAULT_SNI = "www.speedtest.net"
+MCI_PROTECTED_PRIMARY_EDGE = "104.18.1.1"
+MCI_PROTECTED_FALLBACK_EDGE_LIST = (
+    "172.66.0.1",
+)
+MCI_PROTECTED_FALLBACK_EDGES = ",".join(MCI_PROTECTED_FALLBACK_EDGE_LIST)
+MCI_PROTECTED_FAKE_SNI = "www.speedtest.net"
+MCI_PROTECTED_FAKE_REPEAT = 1
+MCI_PROTECTED_INJECT_DELAY_MS = 0
+MCI_PROTECTED_ROUTE_STRATEGY = "plain"
+MCI_PROTECTED_ROUTE_PLANS = tuple(
+    (MCI_PROTECTED_ROUTE_STRATEGY, edge)
+    for edge in (
+        MCI_PROTECTED_PRIMARY_EDGE,
+        *MCI_PROTECTED_FALLBACK_EDGE_LIST,
+    )
+)
 
 
 
@@ -131,6 +147,7 @@ class Tuning:
     pattern_fallback_ips: str = "172.64.155.209"
     pattern_use_profile_edges: bool = False
     pattern_fake_sni: str = "chatgpt.com"
+    pattern_fake_repeat: int = 1
     pattern_inject_delay_ms: int = 1
     pattern_ack_timeout_ms: int = 3000
     pattern_connect_timeout_ms: int = 2500
@@ -203,31 +220,27 @@ class Tuning:
         """Return an isolated, modem-safe baseline for one mobile carrier."""
         normalized = (carrier or "auto").strip().lower()
         if normalized == "mci":
-            tuning = cls.preset("maximum")
+            tuning = cls.preset("compatibility")
             tuning.carrier_mode = "mci"
-
-
-
-
             tuning.xray_mux_enabled = False
             tuning.xray_mux_concurrency = 4
-            tuning.pattern_connect_ip = "188.114.98.0"
-            tuning.pattern_fallback_ips = "188.114.99.0"
-            tuning.pattern_fake_sni = "chatgpt.com"
-            tuning.pattern_quality_preset = "maximum"
-            tuning.pattern_inject_delay_ms = 0
-            tuning.pattern_ack_timeout_ms = 3000
-            tuning.pattern_connect_timeout_ms = 2000
-            tuning.pattern_relay_buffer_kb = 512
-            tuning.pattern_socket_buffer_kb = 4096
-            tuning.pattern_max_sessions = 10
-            tuning.pattern_edge_failure_cooldown_s = 8
-            tuning.pattern_keepalive_idle_s = 10
-            tuning.pattern_keepalive_interval_s = 2
-            tuning.pattern_keepalive_count = 4
-            tuning.pattern_upload_optimized = True
+            tuning.pattern_connect_ip = MCI_PROTECTED_PRIMARY_EDGE
+            tuning.pattern_fallback_ips = MCI_PROTECTED_FALLBACK_EDGES
+            tuning.pattern_fake_sni = MCI_PROTECTED_FAKE_SNI
+            tuning.pattern_quality_preset = "compatibility"
+            tuning.pattern_inject_delay_ms = 2
+            tuning.pattern_ack_timeout_ms = 8000
+            tuning.pattern_connect_timeout_ms = 5000
+            tuning.pattern_relay_buffer_kb = 256
+            tuning.pattern_socket_buffer_kb = 512
+            tuning.pattern_max_sessions = 4
+            tuning.pattern_edge_failure_cooldown_s = 12
+            tuning.pattern_keepalive_idle_s = 15
+            tuning.pattern_keepalive_interval_s = 5
+            tuning.pattern_keepalive_count = 3
+            tuning.pattern_upload_optimized = False
             tuning.background_quality_probe_enabled = False
-            tuning.log_level = "minimal"
+            tuning.log_level = "normal"
             return tuning
         if normalized == "irancell":
             tuning = cls.preset("maximum")
@@ -242,6 +255,20 @@ class Tuning:
         tuning = cls.preset("balanced")
         tuning.carrier_mode = "auto"
         return tuning
+
+    @classmethod
+    def enforce_carrier(cls, value: "Tuning", carrier: str | None = None) -> "Tuning":
+        candidate = cls.from_dict(value.to_dict())
+        normalized = (carrier or candidate.carrier_mode or "auto").strip().lower()
+        if normalized not in {"auto", "mci", "irancell"}:
+            normalized = "auto"
+        candidate.carrier_mode = normalized
+        if normalized != "mci":
+            return candidate
+        protected = cls.carrier_preset("mci")
+        log_level = str(candidate.log_level or "minimal").strip().lower()
+        protected.log_level = log_level if log_level in {"minimal", "normal"} else "minimal"
+        return protected
 
     def is_legacy_mci_compatibility(self) -> bool:
         """Match only the persisted low-throughput MCI compatibility shape.
@@ -360,7 +387,8 @@ def default_profiles() -> list[ProxyProfile]:
     legacy_profiles = parse_many(BUILTIN_CONFIGS, suggested=True)
     for index, profile in enumerate(legacy_profiles, 1):
         profile.name = f"uacSpoofer {index}"
-    return [*legacy_profiles, *verified_profiles()]
+        profile.id = str(uuid.uuid5(uuid.NAMESPACE_URL, profile.source_uri))
+    return legacy_profiles
 
 
 def verified_profiles() -> list[ProxyProfile]:

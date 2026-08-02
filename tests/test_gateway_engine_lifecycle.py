@@ -148,7 +148,7 @@ def test_singbox_gateway_mode_only_proxies_gateway_source_network():
         outbound for outbound in config["outbounds"]
         if outbound["tag"] == "direct"
     )
-    assert direct["bind_interface"] == "Wi-Fi"
+    assert direct == {"type": "direct", "tag": "direct"}
 
 
 def test_gateway_lease_restores_runtime_tun_and_proxy_without_stopping_engine():

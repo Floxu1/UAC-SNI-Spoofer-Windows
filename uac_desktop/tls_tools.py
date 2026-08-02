@@ -59,6 +59,8 @@ def tls_record(version: bytes, payload: bytes) -> bytes:
 def fragments(data: bytes, strategy: str, chunk_size: int = 5) -> list[bytes]:
     if len(data) < 2:
         return [data]
+    if strategy == "plain":
+        return [data]
     location = locate_sni(data)
     if strategy == "half":
         cut = max(1, len(data) // 2)

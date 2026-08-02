@@ -94,11 +94,7 @@ def test_carrier_v2_upgrades_only_slow_mci_and_preserves_route_sni_irancell(tmp_
     migrated = json.loads(paths["SETTINGS_FILE"].read_text(encoding="utf-8"))
 
     expected_mci = Tuning.carrier_preset("mci").to_dict()
-    expected_mci["pattern_connect_ip"] = "203.0.113.10"
-    expected_mci["pattern_fallback_ips"] = "198.51.100.20,198.51.100.21"
-    expected_mci["pattern_fake_sni"] = "measured.mci.example"
-    expected_mci["pattern_use_profile_edges"] = True
-    assert migrated["carrier_tuning_version"] == 2
+    assert migrated["carrier_tuning_version"] == 3
     assert migrated["carrier_tunings"]["mci"] == expected_mci
     assert migrated["carrier_tunings"]["irancell"] == original_irancell
     assert migrated["tuning"] == active_auto
@@ -132,13 +128,13 @@ def test_carrier_v2_upgrades_active_mci_copy_and_repairs_all_duplicate_fallbacks
     migrated = json.loads(paths["SETTINGS_FILE"].read_text(encoding="utf-8"))
     active = migrated["tuning"]
 
-    assert active["mode"] == "maximum"
-    assert active["pattern_max_sessions"] == 10
-    assert active["pattern_socket_buffer_kb"] == 4096
-    assert active["pattern_connect_ip"] == "188.114.99.0"
-    assert active["pattern_fallback_ips"] == "188.114.98.0"
-    assert active["pattern_fake_sni"] == "active-route.example"
-    assert active["pattern_use_profile_edges"] is True
+    assert active["mode"] == "compatibility"
+    assert active["pattern_max_sessions"] == 4
+    assert active["pattern_socket_buffer_kb"] == 512
+    assert active["pattern_connect_ip"] == "104.18.1.1"
+    assert active["pattern_fallback_ips"] == "172.66.0.1"
+    assert active["pattern_fake_sni"] == "www.speedtest.net"
+    assert active["pattern_use_profile_edges"] is False
     assert migrated["carrier_tunings"]["mci"] == stored_mci
     assert migrated["carrier_tunings"]["irancell"] == original_irancell
 
@@ -169,7 +165,45 @@ def test_carrier_v2_leaves_near_match_custom_mci_and_irancell_exactly_unchanged(
     Storage()
     migrated = json.loads(paths["SETTINGS_FILE"].read_text(encoding="utf-8"))
 
-    assert migrated["carrier_tuning_version"] == 2
-    assert migrated["carrier_tunings"]["mci"] == original_mci
-    assert migrated["tuning"] == original_mci
+    expected_mci = Tuning.carrier_preset("mci").to_dict()
+    expected_mci["log_level"] = original_mci["log_level"]
+    assert migrated["carrier_tuning_version"] == 3
+    assert migrated["carrier_tunings"]["mci"] == expected_mci
+    assert migrated["tuning"] == expected_mci
     assert migrated["carrier_tunings"]["irancell"] == original_irancell
+
+
+def test_carrier_v3_repairs_tampered_mci_and_is_idempotent(tmp_path, monkeypatch):
+    paths = _redirect_storage(monkeypatch, tmp_path)
+    tampered = Tuning.carrier_preset("mci").to_dict()
+    tampered.update({
+        "pattern_connect_ip": "203.0.113.17",
+        "pattern_fake_sni": "tampered.example",
+        "pattern_max_sessions": 63,
+        "log_level": "minimal",
+    })
+    irancell = Tuning.carrier_preset("irancell").to_dict()
+    irancell["future_irancell_field"] = {"keep": True}
+    paths["SETTINGS_FILE"].write_text(json.dumps({
+        "tuning": copy.deepcopy(tampered),
+        "carrier_tunings": {
+            "auto": Tuning.carrier_preset("auto").to_dict(),
+            "mci": copy.deepcopy(tampered),
+            "irancell": copy.deepcopy(irancell),
+        },
+        "speed_core_version": 3,
+        "pattern_core_version": 1,
+        "carrier_tuning_version": 3,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    Storage()
+    migrated = json.loads(paths["SETTINGS_FILE"].read_text(encoding="utf-8"))
+    expected = Tuning.carrier_preset("mci").to_dict()
+    expected["log_level"] = "minimal"
+    assert migrated["tuning"] == expected
+    assert migrated["carrier_tunings"]["mci"] == expected
+    assert migrated["carrier_tunings"]["irancell"] == irancell
+
+    first_pass = paths["SETTINGS_FILE"].read_bytes()
+    Storage()
+    assert paths["SETTINGS_FILE"].read_bytes() == first_pass

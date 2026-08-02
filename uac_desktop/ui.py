@@ -4,6 +4,7 @@ import os
 import concurrent.futures
 import ctypes
 import html
+import ipaddress
 import math
 import re
 import socket
@@ -39,9 +40,29 @@ from PySide6.QtWidgets import (
 )
 
 from . import __version__
-from .app_config import PROJECT_URL, SUGGESTED_CONFIGS_URL, UPDATE_REPOSITORY_URL
+from .app_config import PROJECT_URL, UPDATE_REPOSITORY_URL
+ASSISTANT_FEATURE_ENABLED = False
+if ASSISTANT_FEATURE_ENABLED:
+    try:
+        from .assistant import AssistantController
+        _ASSISTANT_IMPORT_ERROR = ""
+    except Exception as exc:
+        AssistantController = None
+        _ASSISTANT_IMPORT_ERROR = str(exc)
+else:
+    AssistantController = None
+    _ASSISTANT_IMPORT_ERROR = ""
+from .device_names import DeviceNameResolver, DeviceNameResult
 from .engine import Engine, EngineCancelled, format_bytes, mci_quality_score
-from .models import ProxyProfile, Tuning, parse_many
+from .models import (
+    MCI_PROTECTED_FAKE_REPEAT as MCI_BUILTIN_FAKE_REPEAT,
+    MCI_PROTECTED_FAKE_SNI as MCI_BUILTIN_FAKE_SNI,
+    MCI_PROTECTED_FALLBACK_EDGES as MCI_BUILTIN_FALLBACK_EDGES,
+    MCI_PROTECTED_INJECT_DELAY_MS as MCI_BUILTIN_INJECT_DELAY_MS,
+    MCI_PROTECTED_PRIMARY_EDGE as MCI_BUILTIN_PRIMARY_EDGE,
+    MCI_PROTECTED_ROUTE_PLANS as MCI_BUILTIN_ROUTE_PLANS,
+    ProxyProfile, Tuning, parse_many, parse_outbound,
+)
 from .network import (GeoLocation, ScanResult, current_ip, current_location,
                       profile_ping, profile_real_delay, scan_domains, tcp_ping)
 from .paths import ASSETS, DATA_DIR, LOG_FILE
@@ -59,7 +80,6 @@ from .update_checker import SemVersion, UpdateInfo, check_latest_release, parse_
 from .verified_configs import COUNTRIES, VERIFIED_SPOOF_EDGE, VERIFIED_SPOOF_FAKE_SNI
 
 
-REMOTE_CONFIGS_URL = SUGGESTED_CONFIGS_URL
 DEFAULT_UPDATE_REPO_URL = UPDATE_REPOSITORY_URL
 DEFAULT_SNI_MAKER_URL = "https://mifa.world/vless"
 LEGACY_SNI_MAKER_URLS = frozenset({
@@ -69,6 +89,29 @@ USER_CONFIG_ORIGIN = "sni-maker"
 MANUAL_PROFILE_ORIGINS = frozenset({"user"})
 USER_CONFIG_ORIGINS = frozenset({USER_CONFIG_ORIGIN})
 DIRECT_PROFILE_ORIGINS = MANUAL_PROFILE_ORIGINS | USER_CONFIG_ORIGINS
+BUILTIN_PROFILE_SNI_HINTS = {
+    "www.calmlunch.com": ("chatgpt.com", "support.cloudflare.com"),
+    "www.ignitelimit.com": ("support.cloudflare.com", "chatgpt.com"),
+    "www.gossipglove.com": ("support.cloudflare.com", "chatgpt.com"),
+    "www.multiplydose.com": ("support.cloudflare.com", "chatgpt.com"),
+    "cdn.veilvpn.fans": ("chatgpt.com", "support.cloudflare.com"),
+}
+BUILTIN_ROUTE_CACHE_TTL_S = 7 * 24 * 3600
+MCI_BUILTIN_WEB_GATE = "Google + YouTube web check v2"
+MCI_BUILTIN_WEB_GATE_MIN_BYTES = 1024
+
+
+HIGH_QUALITY_RENDER_HINTS = (
+    QPainter.RenderHint.Antialiasing
+    | QPainter.RenderHint.TextAntialiasing
+    | QPainter.RenderHint.SmoothPixmapTransform
+    | QPainter.RenderHint.LosslessImageRendering
+    | QPainter.RenderHint.VerticalSubpixelPositioning
+)
+
+
+def _set_high_quality_rendering(painter):
+    painter.setRenderHints(HIGH_QUALITY_RENDER_HINTS, True)
 
 
 def _parse_ping_latency(output: str) -> float | None:
@@ -123,7 +166,7 @@ def country_flag_icon(code: str, width: int = 30, height: int = 20) -> QIcon:
     pixmap = QPixmap(width, height)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.Antialiasing, True)
+    _set_high_quality_rendering(painter)
     rect = QRectF(0.75, 0.75, width - 1.5, height - 1.5)
     clip = QPainterPath(); clip.addRoundedRect(rect, 3.0, 3.0)
     painter.setClipPath(clip)
@@ -242,6 +285,7 @@ class Bridge(QObject):
     gateway_mode_applied = Signal(bool, bool, str, int, int)
     gateway_runtime_state = Signal(str, int, str)
     gateway_devices_changed = Signal(object)
+    gateway_device_names_changed = Signal(object)
     profile_pings_done = Signal(object, str, int)
 
 
@@ -323,7 +367,7 @@ class MotionFrame(QFrame):
         if self._glow <= .001:
             return
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         radius = max(90.0, self.width() * .42)
         anchor_x = self.width() * (.82 if self.layoutDirection() == Qt.LeftToRight else .18)
         glow = QRadialGradient(QPointF(anchor_x, self.height() * .08), radius)
@@ -381,7 +425,7 @@ class GlowButton(QPushButton):
         if self._hover <= .001 or not self.isEnabled():
             return
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         sweep_x = (-.18 + self._hover * 1.36) * self.width()
         sweep = QLinearGradient(sweep_x - 45, 0, sweep_x + 45, self.height())
         sweep.setColorAt(0, QColor(255, 255, 255, 0))
@@ -413,7 +457,7 @@ class LuminousPageHeader(MotionFrame):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         y = self.height() - 2.0
         base = QLinearGradient(20, y, self.width() - 20, y)
         base.setColorAt(0, QColor(35, 245, 224, 0))
@@ -469,7 +513,7 @@ class CyberRoot(QWidget):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         width, height = self.width(), self.height()
 
         cyan = QRadialGradient(QPointF(width * .72, height * .12), max(280, width * .42))
@@ -511,7 +555,7 @@ class HeroCard(MotionFrame):
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         width, height = self.width(), self.height()
 
         glow = QRadialGradient(QPointF(width * .74, height * .47), max(130, height * .92))
@@ -564,7 +608,7 @@ class NavButton(QPushButton):
     def paintEvent(self, event):
         if self.layoutDirection() == Qt.RightToLeft:
             painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
+            _set_high_quality_rendering(painter)
             option = QStyleOptionButton()
             self.initStyleOption(option)
             option.text = ""
@@ -583,7 +627,7 @@ class NavButton(QPushButton):
         if self.isChecked():
             if self.layoutDirection() != Qt.RightToLeft:
                 painter = QPainter(self)
-                painter.setRenderHint(QPainter.Antialiasing)
+                _set_high_quality_rendering(painter)
             trailing_x = 10 if self.layoutDirection() == Qt.LayoutDirection.RightToLeft else self.width() - 18
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor(35, 245, 224, 45))
@@ -656,7 +700,7 @@ class ToggleSwitch(QCheckBox):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         enabled = self.isEnabled()
         checked = self.isChecked()
         track = QColor("#0d6f76" if checked else "#12243c")
@@ -692,6 +736,7 @@ class GatewayDevicesPopup(QFrame):
         self.setFixedWidth(340)
         self.language = language
         self.devices = {}
+        self.names = {}
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 13, 14, 13)
         root.setSpacing(9)
@@ -747,10 +792,21 @@ class GatewayDevicesPopup(QFrame):
         )
         self._render()
 
-    def update_devices(self, devices):
+    def update_devices(self, devices, names=None):
         self.devices = {
             str(address): str(mac or "")
             for address, mac in dict(devices or {}).items()
+        }
+        if names is not None:
+            self.names = {
+                str(address): str(name or "")
+                for address, name in dict(names or {}).items()
+                if str(name or "").strip()
+            }
+        self.names = {
+            address: name
+            for address, name in self.names.items()
+            if address in self.devices
         }
         self._render()
 
@@ -811,6 +867,19 @@ class GatewayDevicesPopup(QFrame):
                 details = QVBoxLayout()
                 details.setContentsMargins(0, 0, 0, 0)
                 details.setSpacing(1)
+                name = self.names.get(address, "")
+                if name:
+                    name_label = QLabel()
+                    name_label.setObjectName("gatewayDeviceName")
+                    name_label.setToolTip(name)
+                    name_label.setText(
+                        name_label.fontMetrics().elidedText(
+                            name,
+                            Qt.ElideRight,
+                            185,
+                        )
+                    )
+                    details.addWidget(name_label)
                 ip_label = QLabel(address)
                 ip_label.setObjectName("gatewayDeviceIp")
                 ip_label.setProperty("technical", True)
@@ -833,7 +902,7 @@ class GatewayDevicesPopup(QFrame):
                 row_layout.addLayout(details, 1)
                 row_layout.addWidget(state)
                 self.list_layout.addWidget(row)
-            body_height = min(270, count * 56)
+            body_height = min(300, count * 68)
         self.list_layout.addStretch()
         self.scroll.setFixedHeight(body_height)
         self.setFixedHeight(81 + body_height)
@@ -871,7 +940,7 @@ class PulseDot(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         color = QColor(self.COLORS.get(self.state, self.COLORS["idle"]))
         pulse = .5 + .5 * math.sin(self._phase) if MOTION_ENABLED else .4
         glow = QColor(color)
@@ -940,7 +1009,7 @@ class ActivityIndicator(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         color = QColor({"error": "#ff5c7c", "warning": "#ffd166", "success": "#23f5a6"}.get(self.state, "#23f5e0"))
         if self.busy:
             for index in range(12):
@@ -985,7 +1054,7 @@ class ActivityRail(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         painter.fillRect(self.rect(), QColor(44, 199, 255, 16))
         if not self.busy:
             return
@@ -1007,6 +1076,8 @@ class ActivityBar(QFrame):
         self.language = language
         self.state = "idle"
         self.busy = False
+        self.updated_at = 0.0
+        self.revision = 0
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -1033,6 +1104,8 @@ class ActivityBar(QFrame):
 
     def set_activity(self, message, state="running", busy=True):
         self.state, self.busy = state, busy
+        self.updated_at = time.time()
+        self.revision += 1
         if message:
             self.message.setText(message)
         elif state == "idle":
@@ -1060,7 +1133,7 @@ class MiniSparkline(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         baseline = self.height() - 5
         painter.setPen(QPen(QColor(44, 199, 255, 50), 1))
         painter.drawLine(0, baseline, self.width(), baseline)
@@ -1277,7 +1350,7 @@ class EmptyListWidget(QListWidget):
         if self.count():
             return
         painter = QPainter(self.viewport())
-        painter.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(painter)
         area = self.viewport().rect()
         pix = cyber_pixmap(self.empty_icon, "#3a7690", 38)
         painter.drawPixmap(int(area.center().x() - pix.width() / 2), int(area.center().y() - 66), pix)
@@ -1345,21 +1418,22 @@ class NumericInput(QFrame):
 
 class CyberProgressBar(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent); self._value = 0; self._maximum = 100; self._phase = 0
+        super().__init__(parent); self._value = 0; self._maximum = 100; self._phase = 0; self._busy = False
         self.setMinimumHeight(14)
         self.timer = QTimer(self); self.timer.timeout.connect(self._animate)
         if _animations_enabled(): self.timer.start(45)
 
     def _animate(self):
-        if 0 < self._value < self._maximum:
+        if self._busy or 0 < self._value < self._maximum:
             self._phase = (self._phase + 2) % 100; self.update()
 
     def setMaximum(self, value): self._maximum = max(1, int(value)); self.update()
     def setValue(self, value): self._value = max(0, min(int(value), self._maximum)); self.update()
+    def setBusy(self, busy): self._busy = bool(busy); self.update()
     def value(self): return self._value
 
     def paintEvent(self, event):
-        painter = QPainter(self); painter.setRenderHint(QPainter.Antialiasing)
+        painter = QPainter(self); _set_high_quality_rendering(painter)
         area = QRectF(0, 1, self.width(), self.height() - 2)
         painter.setPen(QPen(QColor("#23405f"), 1)); painter.setBrush(QColor("#071423")); painter.drawRoundedRect(area, 8, 8)
         ratio = self._value / self._maximum if self._maximum else 0
@@ -1370,6 +1444,14 @@ class CyberProgressBar(QWidget):
             gradient.setColorAt(0, QColor("#0ea5a8")); gradient.setColorAt(max(0.05, shimmer - .12), QColor("#14b8a6"))
             gradient.setColorAt(min(.95, shimmer), QColor("#67e8f9")); gradient.setColorAt(min(1, shimmer + .16), QColor("#22d3ee")); gradient.setColorAt(1, QColor("#0891b2"))
             painter.setPen(Qt.NoPen); painter.setBrush(gradient); painter.drawRoundedRect(fill, 7, 7)
+        elif self._busy:
+            track = max(1.0, self.width() - 2.0)
+            chunk = max(28.0, track * 0.18)
+            x = 1.0 + (track + chunk) * (self._phase / 100.0) - chunk
+            fill = QRectF(x, 2, chunk, self.height() - 4).intersected(
+                QRectF(1, 2, track, self.height() - 4)
+            )
+            painter.setPen(Qt.NoPen); painter.setBrush(QColor("#4deee2")); painter.drawRoundedRect(fill, 7, 7)
 
 
 class ScanProgressPanel(QFrame):
@@ -1398,7 +1480,7 @@ class ScanProgressPanel(QFrame):
     def setFormat(self, text):
         self.domain.setText(text); self.domain.setToolTip(text)
     def set_status(self, text, state="idle"):
-        self.status.setText(text); self.status.setProperty("state", state); self.status.style().unpolish(self.status); self.status.style().polish(self.status)
+        self.status.setText(text); self.status.setProperty("state", state); self.bar.setBusy(state == "running"); self.status.style().unpolish(self.status); self.status.style().polish(self.status)
 
 
 def badge(text, kind="neutral"):
@@ -1483,7 +1565,7 @@ class ConnectionOrb(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        _set_high_quality_rendering(p)
         scale = min(self.width(), self.height()) / 224.0
         p.scale(scale, scale)
         center = QPointF(self.width() / (2 * scale), self.height() / (2 * scale))
@@ -1664,7 +1746,7 @@ class ProfileDialog(QDialog):
         self.fake_sni = QLineEdit(fake_sni or (profile.spoof_fake_sni if profile else ""))
         self.fake_sni.setReadOnly(True)
         self.fake_sni.setPlaceholderText(t("خودکار از SNI Lab", "Automatic from SNI Lab"))
-        self.method = QComboBox(); self.method.addItems(["combined", "fragment", "half", "multi", "sni_split"])
+        self.method = QComboBox(); self.method.addItems(["combined", "fragment", "half", "multi", "sni_split", "full5", "tls_sni_records"])
         self.method.setCurrentText(profile.method if profile else "combined")
         for technical in (self.uri, self.address, self.fallback, self.port, self.sni, self.fake_sni, self.method): technical.setLayoutDirection(Qt.LeftToRight)
         self.validation = QLabel(t("یک لینک معتبر VLESS یا Trojan وارد کنید.", "Enter a valid VLESS or Trojan URI.")); self.validation.setObjectName("validationError"); self.validation.setVisible(False)
@@ -1882,9 +1964,33 @@ class TuningDialog(QDialog):
         fl.addStretch(); cancel = QPushButton(self.t("لغو", "Cancel")); cancel.setObjectName("modalSecondary"); cancel.setIcon(cyber_icon("x-circle", "#b7cce0", 18)); cancel.clicked.connect(self.reject)
         save = QPushButton(self.t("ذخیره تنظیمات", "Save Settings")); save.setObjectName("modalPrimary"); save.setIcon(cyber_icon("check-circle", "#031422", 18)); save.setDefault(True); save.clicked.connect(self.accept)
         fl.addWidget(cancel); fl.addWidget(save); root.addWidget(footer)
+        self._mci_locked_controls = (
+            self.preset,
+            self.mux_enabled,
+            self.mux_concurrency,
+            self.background_probe,
+            self.probe_delay,
+            self.core_preset,
+            self.connect_ip,
+            self.fallback_ips,
+            self.profile_edges,
+            self.fake_sni,
+            self.inject_delay,
+            self.ack_timeout,
+            self.connect_timeout,
+            self.edge_cooldown,
+            self.relay_buffer,
+            self.socket_buffer,
+            self.max_sessions,
+            self.keepalive,
+            self.keepalive_interval,
+            self.keepalive_count,
+            self.upload_optimized,
+        )
         self.preset.currentTextChanged.connect(self._apply_preset)
         self.core_preset.currentTextChanged.connect(self._apply_core_preset)
         self.carrier.currentTextChanged.connect(self._switch_carrier_profile)
+        self._sync_carrier_lock()
 
     def _section(self, title_text, subtitle_text, rows, section_help=""):
         frame = QFrame(); frame.setObjectName("settingsSection"); layout = QVBoxLayout(frame); layout.setContentsMargins(18, 16, 18, 17); layout.setSpacing(12)
@@ -1909,8 +2015,18 @@ class TuningDialog(QDialog):
         if self._animated or not _animations_enabled(): return
         self._animated = True; self.setWindowOpacity(0.0); animation = QPropertyAnimation(self, b"windowOpacity", self); animation.setDuration(220); animation.setStartValue(0.0); animation.setEndValue(1.0); animation.setEasingCurve(QEasingCurve.OutCubic); self._show_animation = animation; animation.start()
 
+    def _sync_carrier_lock(self):
+        locked = self.carrier.currentText() == "mci"
+        if locked:
+            source = self._carrier_drafts.get("mci", Tuning.carrier_preset("mci"))
+            protected = Tuning.enforce_carrier(source, "mci")
+            self._carrier_drafts["mci"] = protected
+            self._load_tuning(protected)
+        for widget in self._mci_locked_controls:
+            widget.setEnabled(not locked)
+
     def _apply_preset(self, mode):
-        if self._loading_tuning or mode == "custom": return
+        if self._loading_tuning or mode == "custom" or self.carrier.currentText() == "mci": return
 
         route = (self.carrier.currentText(), self.connect_ip.text(), self.fallback_ips.text(),
                  self.profile_edges.isChecked(), self.fake_sni.text())
@@ -1938,9 +2054,10 @@ class TuningDialog(QDialog):
         carrier = self.carrier.currentText()
         recommended = Tuning.carrier_preset(carrier)
         self._load_tuning(recommended)
+        self._sync_carrier_lock()
 
     def _apply_core_preset(self, mode):
-        if self._loading_tuning:
+        if self._loading_tuning or self.carrier.currentText() == "mci":
             return
         values = {
             "maximum": (0, 1800, 1600, 512, 4096, 12, 10),
@@ -1968,14 +2085,20 @@ class TuningDialog(QDialog):
         t.pattern_max_sessions = self.max_sessions.value(); t.pattern_keepalive_idle_s = self.keepalive.value()
         t.pattern_upload_optimized = self.upload_optimized.isChecked(); t.xray_mux_enabled = self.mux_enabled.isChecked(); t.xray_mux_concurrency = self.mux_concurrency.value()
         t.background_quality_probe_enabled = self.background_probe.isChecked(); t.background_quality_probe_delay_s = self.probe_delay.value(); t.log_level = self.log_level.currentText()
-        t.pattern_edge_failure_cooldown_s = self.edge_cooldown.value(); t.pattern_keepalive_interval_s = self.keepalive_interval.value(); t.pattern_keepalive_count = self.keepalive_count.value(); return t
+        t.pattern_edge_failure_cooldown_s = self.edge_cooldown.value(); t.pattern_keepalive_interval_s = self.keepalive_interval.value(); t.pattern_keepalive_count = self.keepalive_count.value()
+        return Tuning.enforce_carrier(t, carrier)
 
     def _switch_carrier_profile(self, carrier):
         if self._loading_tuning or carrier == self._active_carrier:
             return
         self._carrier_drafts[self._active_carrier] = self._form_value(self._active_carrier)
         self._active_carrier = carrier
-        self._load_tuning(self._carrier_drafts.get(carrier, Tuning.carrier_preset(carrier)))
+        target = Tuning.enforce_carrier(
+            self._carrier_drafts.get(carrier, Tuning.carrier_preset(carrier)), carrier
+        )
+        self._carrier_drafts[carrier] = target
+        self._load_tuning(target)
+        self._sync_carrier_lock()
 
     def values(self) -> dict[str, Tuning]:
         self._carrier_drafts[self._active_carrier] = self._form_value(self._active_carrier)
@@ -1995,6 +2118,9 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("UAC Spoofer Desktop"); self.resize(1440, 900); self.setMinimumSize(1080, 700)
         self.setAccessibleName("UAC Spoofer Desktop")
         self.storage = Storage(); self.language = self.storage.settings.get("language", "fa"); self.bridge = Bridge(); self.scan_cancelled = False; self.scanning = False; self.connecting = False; self.connection_error = ""; self.last_results: list[ScanResult] = []; self.sni_undo_snapshot = None; self._toast_timer = None
+        if not ASSISTANT_FEATURE_ENABLED and self.storage.settings.get("assistant_enabled", False):
+            self.storage.settings["assistant_enabled"] = False
+            self.storage.save_settings()
         self._scan_generation = 0; self._scan_cancel_event = threading.Event(); self._scan_results_by_domain: dict[str, ScanResult] = {}; self._scan_context = {}
         self._update_generation = 0; self._update_in_progress = False; self._latest_update: UpdateInfo | None = None
         self._update_notification = None; self._update_notification_timer = None; self._update_notification_animation = None; self._pending_update_notification = None
@@ -2015,9 +2141,15 @@ class MainWindow(QMainWindow):
         self._gateway_apply_target = None
         self._gateway_apply_reasons = {}
         self._gateway_devices = {}
+        self._gateway_device_names = {}
+        self._gateway_device_name_priorities = {}
+        self._gateway_device_name_pending = set()
+        self._gateway_device_name_generation = 0
+        self._gateway_device_name_resolver = DeviceNameResolver()
         self._gateway_runtime_state = "inactive"
         self._connect_cancel = threading.Event()
         self._connect_thread: threading.Thread | None = None
+        self._connection_retry_pending = False
         self._forced_profile_id = ""
         self._pending_profile_switch_id = ""
         self._profile_switch_waiting = False
@@ -2054,12 +2186,15 @@ class MainWindow(QMainWindow):
         self._maker_guide_button = None
         self._maker_guide_effect = None
         self._maker_guide_animation = None
+        self._assistant_maker_test_completed_at = 0.0
+        self._assistant_maker_next_action = ""
         self._profile_ping_generation = 0
         self._profile_ping_busy = False
         self._profile_ping_cancel = threading.Event()
         self._maker = SniConfigMaker(
             fake_sni=self.storage.tuning.pattern_fake_sni,
         )
+        self.assistant_controller = None
         self.engine = Engine(self.bridge.log.emit, self.bridge.state.emit, self.bridge.traffic.emit)
         gateway = getattr(self.engine, "gateway", None)
         if gateway is not None:
@@ -2073,12 +2208,32 @@ class MainWindow(QMainWindow):
                 lambda devices:
                 self.bridge.gateway_devices_changed.emit(dict(devices))
             )
+            gateway.device_names_changed = self._gateway_runtime_names_received
         try:
             self.engine.recover_stale_tun()
         except Exception as exc:
             self._pending_file_log_lines.append(f"sing-box recovery pending: {exc}")
         self._build(); self._setup_tray(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
         self.activity_bar.set_activity("", "idle", False)
+        if ASSISTANT_FEATURE_ENABLED and AssistantController is not None:
+            try:
+                self.assistant_controller = AssistantController(
+                    self, reduced_motion=not _animations_enabled()
+                )
+            except Exception as exc:
+                self.bridge.log.emit(f"Assistant initialization failed: {exc}")
+        if self.assistant_controller is None:
+            self.assistant_toggle.blockSignals(True)
+            self.assistant_toggle.setChecked(False)
+            self.assistant_toggle.blockSignals(False)
+            self.assistant_toggle.setEnabled(False)
+            self.assistant_replay_button.setEnabled(False)
+            self.assistant_guides_toggle.setEnabled(False)
+            self.assistant_warnings_toggle.setEnabled(False)
+            if _ASSISTANT_IMPORT_ERROR:
+                self.bridge.log.emit(f"Assistant module unavailable: {_ASSISTANT_IMPORT_ERROR}")
+        elif self.assistant_toggle.isChecked():
+            QTimer.singleShot(0, self.assistant_controller.enable)
         self._target_latency_timer = QTimer(self); self._target_latency_timer.setInterval(10000); self._target_latency_timer.timeout.connect(self._queue_target_latency_probe); self._target_latency_timer.start()
         QTimer.singleShot(300, self._queue_target_latency_probe)
         QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
@@ -2166,6 +2321,8 @@ class MainWindow(QMainWindow):
         self.rating_button = self._action_button("ستاره در گیت‌هاب", "Star on GitHub", "external-link", "ratingButton"); self.rating_button.setMinimumHeight(40); self.rating_button.clicked.connect(lambda: webbrowser.open(PROJECT_URL))
         rating_layout.addWidget(self.rating_title); rating_layout.addWidget(self.rating_text); rating_layout.addWidget(self.rating_button); side.addWidget(self.rating_card); side.addSpacing(10)
         footer = QFrame(); self.sidebar_footer = footer; footer.setObjectName("sidebarFooter"); footer_layout = QVBoxLayout(footer); footer_layout.setContentsMargins(7, 7, 7, 7); footer_layout.setSpacing(4)
+        self.assistant_toggle = ToggleSwitch(); self.assistant_toggle.setObjectName("assistantToggle"); self.assistant_toggle.setChecked(False); self.assistant_toggle.setEnabled(False)
+        self.assistant_option = self._toggle_option(self.assistant_toggle, "فعال‌سازی دستیار کمکی", "Enable Assistant Guide", row_click_enabled=False); self.assistant_option.setObjectName("assistantToggleOption"); self.assistant_option.setMinimumHeight(44); footer_layout.addWidget(self.assistant_option)
         self.language_button = QPushButton("English"); self.language_button.setObjectName("footerAction"); self.language_button.setMinimumHeight(44); self.language_button.setIcon(cyber_icon("globe", "#9fb4d8", 19)); self.language_button.setIconSize(QSize(19, 19)); self.language_button.clicked.connect(self.toggle_language); footer_layout.addWidget(self.language_button)
         self.data_button = QPushButton("باز کردن پوشه داده‌ها"); self.data_button.setObjectName("footerAction"); self.data_button.setMinimumHeight(44); self.data_button.setIcon(cyber_icon("folder", "#9fb4d8", 19)); self.data_button.setIconSize(QSize(19, 19)); self.data_button.clicked.connect(lambda: os.startfile(DATA_DIR)); footer_layout.addWidget(self.data_button); side.addWidget(footer)
         layout.addWidget(sidebar)
@@ -2176,9 +2333,29 @@ class MainWindow(QMainWindow):
         layout.addWidget(content_shell, 1)
         pages = [self._home_page(), self._configs_page(), self._sni_maker_page(), self._scanner_page(), self._logs_page(),
                  self._apps_page(), self._tools_page(), self._support_page()]
-        for page in pages:
-            page.setObjectName("page")
+        for page, object_name in zip(pages, (
+                "homePage", "configsPage", "sniMakerPage", "sniLabPage",
+                "liveLogsPage", "appBypassPage", "toolsPage", "supportPage")):
+            page.setObjectName(object_name)
             self.stack.addWidget(page)
+        for widget, object_name in (
+                (self.add_btn, "addConfigButton"),
+                (self.clip_btn, "importClipboardButton"),
+                (self.sync_btn, "restoreOriginalsButton"),
+                (self.clear_user_btn, "deleteAllUserConfigsButton"),
+                (self.profile_ping_all_btn, "pingAllConfigsButton"),
+                (self.maker_repo_btn, "makerLoadButton"),
+                (self.maker_repo_reset_btn, "makerDefaultButton"),
+                (self.maker_file_btn, "makerFileButton"),
+                (self.maker_clip_btn, "makerClipboardButton"),
+                (self.maker_text_btn, "makerConvertButton"),
+                (self.maker_clear_btn, "makerClearButton"),
+                (self.maker_start_btn, "makerTestAllButton"),
+                (self.maker_stop_btn, "makerStopButton"),
+                (self.maker_add_selected_btn, "makerAddSelectedButton"),
+                (self.maker_add_country_btn, "makerAddCountryButton"),
+                (self.maker_add_all_btn, "makerAddAllButton")):
+            widget.setObjectName(object_name)
         self.show_page(0)
 
     def _home_page(self):
@@ -2216,7 +2393,8 @@ class MainWindow(QMainWindow):
         self.route_source_tabs.setAccessibleName("Connection config source")
         source_row = QHBoxLayout(); source_row.setSpacing(7); source_row.addWidget(self.route_source_tabs, 1); source_row.addWidget(self.country_count)
         self.country_combo = QComboBox(); self.country_combo.setObjectName("countryCombo"); self.country_combo.setMinimumWidth(300); self.country_combo.setMinimumHeight(48); self.country_combo.setAccessibleName("Exit country"); self.country_combo.setCursor(Qt.PointingHandCursor); self.country_combo.setIconSize(QSize(30, 20))
-        country_actions.addLayout(source_row); country_actions.addWidget(self.country_combo); country_layout.addLayout(country_actions)
+        self.original_configs_label = QLabel("UAC Spoof Original Configs"); self.original_configs_label.setObjectName("originalConfigsLabel"); self.original_configs_label.setMinimumWidth(300); self.original_configs_label.setMinimumHeight(48); self.original_configs_label.setAlignment(Qt.AlignCenter); self.original_configs_label.setLayoutDirection(Qt.LeftToRight)
+        country_actions.addLayout(source_row); country_actions.addWidget(self.country_combo); country_actions.addWidget(self.original_configs_label); country_layout.addLayout(country_actions)
         self._refresh_country_selector()
         root.addWidget(self.country_card)
 
@@ -2470,7 +2648,7 @@ class MainWindow(QMainWindow):
         toolbar = QFrame(); toolbar.setObjectName("pageToolbar"); bar = QHBoxLayout(toolbar); bar.setContentsMargins(12, 10, 12, 10); bar.setSpacing(9)
         self.add_btn = self._action_button("افزودن کانفیگ", "Add Config", "plus", "primaryAction")
         self.clip_btn = self._action_button("ورود از Clipboard", "Import Clipboard", "copy", "secondaryAction")
-        self.sync_btn = self._action_button("دریافت پیشنهادی‌ها", "Sync Suggested", "refresh", "secondaryAction")
+        self.sync_btn = self._action_button("بازیابی کانفیگ‌های اصلی", "Restore Originals", "refresh", "secondaryAction")
         self.clear_user_btn = self._action_button("حذف همه", "Delete All", "trash", "dangerButton")
         self.clear_user_btn.setMaximumWidth(108)
         self.clear_user_btn.setToolTip(self.tr("حذف همه کانفیگ‌های User Config", "Delete every User Config entry"))
@@ -2484,7 +2662,7 @@ class MainWindow(QMainWindow):
         self.user_config_list.setSpacing(2); self.suggested_list.setSpacing(2)
         self.manual_list.set_empty_text(self.tr("هنوز کانفیگ دستی ندارید", "No manual configs yet"), self.tr("یک لینک VLESS یا Trojan اضافه یا از Clipboard وارد کنید.", "Add a VLESS or Trojan link, or import one from the clipboard."))
         self.user_config_list.set_empty_text(self.tr("هنوز User Config ندارید", "No User Configs yet"), self.tr("کانفیگ‌های سالم را از SNI Config Maker به این بخش اضافه کنید.", "Add healthy routes from SNI Config Maker to this library."))
-        self.suggested_list.set_empty_text(self.tr("هنوز پیشنهادی دریافت نشده", "No suggestions downloaded"), self.tr("برای دریافت فهرست پیشنهادی، همگام‌سازی را اجرا کنید.", "Sync the suggested repository to populate this list."))
+        self.suggested_list.set_empty_text(self.tr("کانفیگ اصلی موجود نیست", "No original configs found"), self.tr("برای بازیابی uacSpoofer 1 تا 6، بازیابی کانفیگ‌های اصلی را اجرا کنید.", "Restore the six original uacSpoofer configs."))
         self.profile_pages = []
         self.profile_page_layouts = []
         for widget in (
@@ -2599,6 +2777,7 @@ class MainWindow(QMainWindow):
         import_row = QHBoxLayout(); import_row.setSpacing(6)
         self.maker_import_badge = QLabel(self.tr("آماده دریافت", "Ready")); self.maker_import_badge.setObjectName("selectionText"); self.maker_import_badge.setMinimumWidth(105); self.maker_import_badge.setMaximumWidth(155)
         self.maker_source_editor = ConfigDropEdit()
+        self.maker_source_editor.setObjectName("makerSourceEditor")
         self.maker_source_editor.textChanged.connect(self._sync_maker_editor_direction)
         self.maker_source_editor.setPlaceholderText(self.tr(
             "لینک‌ها را اینجا وارد کنید یا فایل را رها کنید",
@@ -2817,6 +2996,23 @@ class MainWindow(QMainWindow):
         copy_box = QVBoxLayout(); support_title = self._bind_text(QLabel(), "پشتیبانی رسمی UAC Spoofer", "Official UAC Spoofer Support"); support_title.setObjectName("supportTitle"); support_desc = self._bind_text(QLabel(), "برای خبرهای نسخه، راهنما و ارتباط با جامعه از کانال‌های رسمی استفاده کنید.", "Use the official channels for release news, help and community updates."); support_desc.setObjectName("supportDescription"); support_desc.setWordWrap(True); support_desc.setTextInteractionFlags(Qt.TextSelectableByMouse); copy_box.addWidget(support_title); copy_box.addWidget(support_desc); hero_layout.addLayout(copy_box, 1)
         actions = QVBoxLayout(); github = self._action_button("پروژه GitHub", "GitHub Project", "external-link", "primaryAction"); github.clicked.connect(lambda: webbrowser.open(self.storage.settings.get("update_repo_url", DEFAULT_UPDATE_REPO_URL))); telegram = self._action_button("کانال تلگرام", "Telegram Channel", "external-link", "secondaryAction"); telegram.clicked.connect(lambda: webbrowser.open("https://t.me/UacSniSpoofer")); actions.addWidget(github); actions.addWidget(telegram); hero_layout.addLayout(actions); root.addWidget(hero)
 
+        self.assistant_help_card = MotionFrame(); self.assistant_help_card.setObjectName("assistantHelpCard")
+        assistant_layout = QHBoxLayout(self.assistant_help_card); assistant_layout.setContentsMargins(20, 16, 20, 16); assistant_layout.setSpacing(14)
+        assistant_icon = QLabel(); assistant_icon.setFixedSize(46, 46); assistant_icon.setAlignment(Qt.AlignCenter); assistant_icon.setPixmap(cyber_pixmap("sparkles", "#23f5e0", 25)); assistant_layout.addWidget(assistant_icon)
+        assistant_copy = QVBoxLayout(); assistant_copy.setSpacing(3)
+        assistant_title = self._bind_text(QLabel(), "دستیار کمکی برنامه", "Assistant Guide"); assistant_title.setObjectName("supportTitle")
+        assistant_description = self._bind_text(QLabel(), "راهنمای مرحله‌به‌مرحله را دوباره اجرا کن؛ دستیار از وضعیت فعلی برنامه باخبر می‌ماند.", "Replay the step-by-step guide; the assistant remains aware of the current app state."); assistant_description.setObjectName("supportDescription"); assistant_description.setWordWrap(True)
+        assistant_copy.addWidget(assistant_title); assistant_copy.addWidget(assistant_description)
+        assistant_preferences = QHBoxLayout(); assistant_preferences.setSpacing(8)
+        self.assistant_guides_toggle = ToggleSwitch(); self.assistant_guides_toggle.setChecked(bool(self.storage.settings.get("assistant_guides_enabled", True)))
+        self.assistant_guides_option = self._toggle_option(self.assistant_guides_toggle, "راهنماهای آموزشی", "Educational Guides"); self.assistant_guides_option.setObjectName("assistantPreferenceOption")
+        self.assistant_warnings_toggle = ToggleSwitch(); self.assistant_warnings_toggle.setChecked(bool(self.storage.settings.get("assistant_warnings_enabled", True)))
+        self.assistant_warnings_option = self._toggle_option(self.assistant_warnings_toggle, "هشدارهای دستیار", "Assistant Alerts"); self.assistant_warnings_option.setObjectName("assistantPreferenceOption")
+        assistant_preferences.addWidget(self.assistant_guides_option); assistant_preferences.addWidget(self.assistant_warnings_option); assistant_copy.addLayout(assistant_preferences)
+        assistant_layout.addLayout(assistant_copy, 1)
+        self.assistant_replay_button = self._action_button("اجرای دوباره راهنمای برنامه", "Replay App Guide", "refresh", "secondaryAction"); self.assistant_replay_button.setObjectName("assistantReplayButton"); self.assistant_replay_button.setMinimumWidth(210); assistant_layout.addWidget(self.assistant_replay_button)
+        root.addWidget(self.assistant_help_card)
+
         self.update_card = MotionFrame(); self.update_card.setObjectName("updateCard"); self.update_card.setProperty("state", "idle")
         update_layout = QHBoxLayout(self.update_card); update_layout.setContentsMargins(20, 17, 20, 17); update_layout.setSpacing(16)
         update_icon = QLabel(); update_icon.setObjectName("updateIcon"); update_icon.setFixedSize(48, 48); update_icon.setPixmap(cyber_pixmap("refresh", "#23f5e0", 25)); update_layout.addWidget(update_icon)
@@ -2840,7 +3036,11 @@ class MainWindow(QMainWindow):
         root.addLayout(info_grid); credits = QLabel(f"UAC Spoofer Desktop {__version__}  •  Credits to behroozuac"); credits.setObjectName("credits"); credits.setAlignment(Qt.AlignCenter); credits.setLayoutDirection(Qt.LeftToRight); root.addWidget(credits); root.addStretch(); return page
 
     def _wire(self):
-        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.profile_pings_done.connect(self._profile_pings_finished); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished); self.bridge.gateway_mode_applied.connect(self._gateway_mode_apply_finished); self.bridge.gateway_runtime_state.connect(self._gateway_runtime_state_changed); self.bridge.gateway_devices_changed.connect(self._gateway_devices_updated)
+        self.assistant_toggle.toggled.connect(self._assistant_enabled_changed)
+        self.assistant_guides_toggle.toggled.connect(self._assistant_guides_changed)
+        self.assistant_warnings_toggle.toggled.connect(self._assistant_warnings_changed)
+        self.assistant_replay_button.clicked.connect(self._replay_assistant_guide)
+        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.profile_pings_done.connect(self._profile_pings_finished); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished); self.bridge.gateway_mode_applied.connect(self._gateway_mode_apply_finished); self.bridge.gateway_runtime_state.connect(self._gateway_runtime_state_changed); self.bridge.gateway_devices_changed.connect(self._gateway_devices_updated); self.bridge.gateway_device_names_changed.connect(self._gateway_device_names_updated)
         self.connect_button.clicked.connect(self.toggle_connection); self.add_btn.clicked.connect(self.add_profile); self.clear_user_btn.clicked.connect(self.delete_all_user_configs); self.clip_btn.clicked.connect(self.import_clipboard); self.sync_btn.clicked.connect(self.sync_profiles); self.scan_button.clicked.connect(self.toggle_scan); self.bookmark_btn.clicked.connect(self.bookmark_selected); self.apply_sni_btn.clicked.connect(self.apply_selected_sni); self.apply_all_sni_btn.clicked.connect(self.apply_sni_to_all_suggested); self.undo_apply_btn.clicked.connect(self.undo_sni_apply); self.copy_result_btn.clicked.connect(self.copy_selected_result); self.carrier.currentTextChanged.connect(self._carrier_changed); self.country_combo.activated.connect(self._country_activated); self.auto_mode.toggled.connect(self._auto_mode_changed); self.pick_best.toggled.connect(lambda v: self._save_flag("pick_best", v)); self.proxy_mode.toggled.connect(self._proxy_mode_changed); self.tun_mode.toggled.connect(self._tun_mode_changed); self.gateway_mode.toggled.connect(self._gateway_mode_changed)
         self.scan_tabs.currentChanged.connect(self._update_scan_selection)
         self.route_source_tabs.currentChanged.connect(self._route_source_changed)
@@ -3011,6 +3211,8 @@ class MainWindow(QMainWindow):
             self._animated_page = page
             self._page_animation = group
             group.start()
+        if self.assistant_controller is not None:
+            self.assistant_controller.on_navigation(index)
 
     def _update_config_actions(self, *_):
         if not hasattr(self, "profile_tabs"):
@@ -3214,7 +3416,7 @@ class MainWindow(QMainWindow):
             self.update_versions.setText(self.tr(f"نصب‌شده: {ltr_isolate(__version__)}  •  آخرین نسخه: —", f"Installed: {__version__}  •  Latest: —"))
         self.manual_list.set_empty_text(self.tr("هنوز کانفیگ دستی ندارید", "No manual configs yet"), self.tr("یک لینک VLESS یا Trojan اضافه یا از Clipboard وارد کنید.", "Add a VLESS or Trojan link, or import one from the clipboard."))
         self.user_config_list.set_empty_text(self.tr("هنوز User Config ندارید", "No User Configs yet"), self.tr("کانفیگ‌های سالم را از SNI Config Maker به این بخش اضافه کنید.", "Add healthy routes from SNI Config Maker to this library."))
-        self.suggested_list.set_empty_text(self.tr("هنوز پیشنهادی دریافت نشده", "No suggestions downloaded"), self.tr("برای دریافت فهرست پیشنهادی، همگام‌سازی را اجرا کنید.", "Sync the suggested repository to populate this list."))
+        self.suggested_list.set_empty_text(self.tr("کانفیگ اصلی موجود نیست", "No original configs found"), self.tr("برای بازیابی uacSpoofer 1 تا 6، بازیابی کانفیگ‌های اصلی را اجرا کنید.", "Restore the six original uacSpoofer configs."))
         self.log_filter.setPlaceholderText(self.tr("فیلتر لاگ‌ها…", "Filter logs…")); self.process_search.setPlaceholderText(self.tr("جستجوی پردازه…", "Search processes…"))
         self._update_process_count()
         self._set_log_count(len(self._all_log_lines))
@@ -3258,6 +3460,47 @@ class MainWindow(QMainWindow):
         self._maker_repo_url_changed()
 
     def _save_flag(self, key, value): self.storage.settings[key] = value; self.storage.save_settings()
+
+    def _assistant_enabled_changed(self, enabled):
+        if not ASSISTANT_FEATURE_ENABLED:
+            self.assistant_toggle.blockSignals(True)
+            self.assistant_toggle.setChecked(False)
+            self.assistant_toggle.blockSignals(False)
+            self._save_flag("assistant_enabled", False)
+            return
+        enabled = bool(enabled)
+        self._save_flag("assistant_enabled", enabled)
+        controller = self.assistant_controller
+        if controller is None:
+            return
+        if enabled:
+            controller.enable()
+        else:
+            controller.disable(persist=False)
+
+    def _replay_assistant_guide(self):
+        if not ASSISTANT_FEATURE_ENABLED:
+            return
+        if not self.assistant_guides_toggle.isChecked():
+            self.assistant_guides_toggle.setChecked(True)
+        if not self.assistant_toggle.isChecked():
+            self.assistant_toggle.setChecked(True)
+        if self.assistant_controller is not None:
+            self.assistant_controller.start_tour()
+
+    def _assistant_guides_changed(self, enabled):
+        self._save_flag("assistant_guides_enabled", bool(enabled))
+        controller = self.assistant_controller
+        if controller is not None and controller.enabled:
+            if not enabled and controller._tour:
+                controller.skip_tour()
+            controller.evaluate(force=True)
+
+    def _assistant_warnings_changed(self, enabled):
+        self._save_flag("assistant_warnings_enabled", bool(enabled))
+        controller = self.assistant_controller
+        if controller is not None and controller.enabled:
+            controller.evaluate(force=True)
 
     def _proxy_mode_enabled(self) -> bool:
         return bool(self.storage.settings.get("proxy_mode", True))
@@ -3940,13 +4183,124 @@ class MainWindow(QMainWindow):
             popup.hide()
             return
         popup.set_language(self.language)
-        popup.update_devices(self._gateway_devices)
+        popup.update_devices(
+            self._gateway_devices,
+            self._gateway_device_names,
+        )
         popup.show()
         self._position_gateway_devices_popup()
         popup.raise_()
 
+    def _gateway_runtime_names_received(self, names):
+        results = {
+            str(address): DeviceNameResult(str(name), "dhcp", 100)
+            for address, name in dict(names or {}).items()
+            if str(name or "").strip()
+        }
+        self.bridge.gateway_device_names_changed.emit({
+            "generation": self._gateway_device_name_generation,
+            "results": results,
+            "pending": [],
+        })
+
+    def _queue_gateway_device_name_resolution(self):
+        devices = {
+            address: mac
+            for address, mac in self._gateway_devices.items()
+            if (
+                address not in self._gateway_device_names
+                and address not in self._gateway_device_name_pending
+            )
+        }
+        if not devices:
+            return
+        gateway = getattr(self.engine, "gateway", None)
+        gateway_address = (
+            str(getattr(gateway, "gateway_address", "") or "")
+            if gateway is not None else ""
+        )
+        generation = self._gateway_device_name_generation
+        self._gateway_device_name_pending.update(devices)
+
+        def work():
+            results = self._gateway_device_name_resolver.resolve_many(
+                devices,
+                gateway_address,
+            )
+            self.bridge.gateway_device_names_changed.emit({
+                "generation": generation,
+                "devices": devices,
+                "results": results,
+                "pending": list(devices),
+            })
+
+        threading.Thread(
+            target=work,
+            name="gateway-device-names",
+            daemon=True,
+        ).start()
+
+    def _gateway_device_names_updated(self, payload):
+        values = dict(payload or {})
+        generation = values.get("generation")
+        if (
+            generation is not None
+            and int(generation) != self._gateway_device_name_generation
+        ):
+            return
+        for address in values.get("pending", ()):
+            self._gateway_device_name_pending.discard(str(address))
+        snapshot = dict(values.get("devices", {}) or {})
+        results = dict(values.get("results", values) or {})
+        changed = False
+        for address, result in results.items():
+            address = str(address)
+            if address not in self._gateway_devices:
+                continue
+            if snapshot and snapshot.get(address) != self._gateway_devices.get(address):
+                continue
+            if isinstance(result, DeviceNameResult):
+                name = str(result.name or "").strip()
+                priority = int(result.priority)
+            else:
+                name = str(result or "").strip()
+                priority = 100
+            if not name:
+                continue
+            previous_priority = self._gateway_device_name_priorities.get(
+                address,
+                -1,
+            )
+            if priority < previous_priority:
+                continue
+            if self._gateway_device_names.get(address) != name:
+                self._gateway_device_names[address] = name
+                changed = True
+            self._gateway_device_name_priorities[address] = priority
+        if changed:
+            popup = getattr(self, "gateway_devices_popup", None)
+            if popup is not None:
+                popup.update_devices(
+                    self._gateway_devices,
+                    self._gateway_device_names,
+                )
+                if popup.isVisible():
+                    self._position_gateway_devices_popup()
+
     def _gateway_devices_updated(self, devices):
         self._gateway_devices = dict(devices or {})
+        current = set(self._gateway_devices)
+        self._gateway_device_names = {
+            address: name
+            for address, name in self._gateway_device_names.items()
+            if address in current
+        }
+        self._gateway_device_name_priorities = {
+            address: priority
+            for address, priority in self._gateway_device_name_priorities.items()
+            if address in current
+        }
+        self._gateway_device_name_pending.intersection_update(current)
         toggle = getattr(self, "gateway_mode", None)
         if toggle is None:
             return
@@ -3969,9 +4323,13 @@ class MainWindow(QMainWindow):
         popup = getattr(self, "gateway_devices_popup", None)
         if popup is not None:
             popup.set_language(self.language)
-            popup.update_devices(self._gateway_devices)
+            popup.update_devices(
+                self._gateway_devices,
+                self._gateway_device_names,
+            )
             if popup.isVisible():
                 self._position_gateway_devices_popup()
+        self._queue_gateway_device_name_resolution()
         detail = self.tr(
             f" دستگاه شناسایی‌شده: {count}." if count else "",
             f" Detected devices: {count}." if count else "",
@@ -4184,6 +4542,8 @@ class MainWindow(QMainWindow):
         active = self._gateway_runtime_active()
         pending_enable = self._gateway_apply_target is True
         self._gateway_requested = False
+        self._gateway_device_name_generation += 1
+        self._gateway_device_name_pending.clear()
         self._cancel_gateway_apply()
         self._set_gateway_toggle(False)
         self._sync_gateway_controls()
@@ -4359,6 +4719,9 @@ class MainWindow(QMainWindow):
         raise RuntimeError("Connection mode changed repeatedly during activation")
 
     def _selected_country_code(self) -> str:
+        source_getter = getattr(self, "_selected_route_source", None)
+        if callable(source_getter) and source_getter() == "suggested":
+            return ""
         combo = getattr(self, "country_combo", None)
         value = combo.currentData() if combo is not None else self.storage.settings.get("selected_country", "ALL")
         value = str(value or "ALL").strip().upper()
@@ -4437,7 +4800,8 @@ class MainWindow(QMainWindow):
         profile.country_verified_at = time.time()
         profile.country_source = str(location.source or "")
         profile.country_code = code
-        if profile.origin not in DIRECT_PROFILE_ORIGINS:
+        if (profile.origin not in DIRECT_PROFILE_ORIGINS
+                and profile.origin != "builtin"):
             try:
                 fragment = profile.source_uri.rsplit("#", 1)[1]
                 sequence = int(fragment.split("-", 2)[1])
@@ -4467,6 +4831,25 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "country_combo"):
             return
         source = self._selected_route_source()
+        original_label = getattr(self, "original_configs_label", None)
+        if original_label is not None:
+            original_label.setVisible(source == "suggested")
+        if hasattr(self.country_combo, "setVisible"):
+            self.country_combo.setVisible(source != "suggested")
+        if source == "suggested":
+            self.country_combo.blockSignals(True)
+            self.country_combo.clear()
+            self.country_combo.addItem(
+                cyber_icon("server", "#78fff0", 19),
+                "UAC Spoof Original Configs", "ALL",
+            )
+            self.country_combo.setCurrentIndex(0)
+            self.country_combo.blockSignals(False)
+            count = len(self._route_source_profiles())
+            self.country_count.setText(self.tr(
+                f"{count} کانفیگ اصلی", f"{count} original configs"
+            ))
+            return
         selected = str(self.storage.settings.get(
             f"selected_country_{source}",
             self.storage.settings.get("selected_country", "ALL"),
@@ -4730,6 +5113,9 @@ class MainWindow(QMainWindow):
         if profile.route_mode == "reality-direct":
             return str(profile.sni or "").strip()
         carrier = carrier or self.storage.tuning.carrier_mode
+        builtin_route = MainWindow._builtin_route_entry(self, profile, carrier)
+        if builtin_route.get("fake_sni"):
+            return str(builtin_route["fake_sni"]).strip()
         settings = self.storage.settings
         scoped_pins = settings.get("pattern_profile_sni_pins_by_carrier", {})
         bucket = scoped_pins.get(carrier, {}) if isinstance(scoped_pins, dict) else {}
@@ -5249,7 +5635,14 @@ class MainWindow(QMainWindow):
                 profile.origin = USER_CONFIG_ORIGIN
                 profile.spoof_fake_sni = ""
             else:
-                profile.address = VERIFIED_SPOOF_EDGE
+                try:
+                    source_edge = ipaddress.ip_address(
+                        str(profile.address or "").strip()
+                    )
+                    if source_edge.version != 4 or source_edge.is_loopback:
+                        profile.address = VERIFIED_SPOOF_EDGE
+                except ValueError:
+                    profile.address = VERIFIED_SPOOF_EDGE
                 profile.config_host = "127.0.0.1"
                 profile.config_port = 40443
                 profile.origin = USER_CONFIG_ORIGIN
@@ -5346,6 +5739,8 @@ class MainWindow(QMainWindow):
         self._maker_generation += 1
         generation = self._maker_generation
         self._maker_running = True
+        self._assistant_maker_test_completed_at = 0.0
+        self._assistant_maker_next_action = ""
         self._update_maker_guide()
         self._maker_cancel_event = threading.Event()
         self._maker_tester = SniBatchTester(self.bridge.log.emit)
@@ -5369,11 +5764,7 @@ class MainWindow(QMainWindow):
         workers = self.maker_threads.value()
         timeout = float(self.maker_timeout.value())
         tuning = self.storage.tuning
-        carrier = tuning.carrier_mode
-        strategy = str(self.storage.settings.get(
-            f"working_strategy_{carrier}",
-            "tls_sni_records" if carrier == "mci" else "wrong_seq",
-        ) or "").strip().lower()
+        carrier_tunings = self.storage.all_carrier_tunings()
         tester = self._maker_tester
         cancel = self._maker_cancel_event
 
@@ -5382,10 +5773,11 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
-                results = tester.run(
+                results = tester.run_all_modes(
                     profiles, tuning, cancel,
-                    workers=workers, timeout=timeout, strategy=strategy,
+                    workers=workers, timeout=timeout,
                     progress=progress,
+                    carrier_tunings=carrier_tunings,
                 )
                 self.bridge.maker_done.emit(
                     {"count": len(results), "cancelled": cancel.is_set()},
@@ -5513,6 +5905,9 @@ class MainWindow(QMainWindow):
         self._maker_finish_test_ui()
         healthy = len(self.maker_model.healthy_results())
         total = self.maker_model.rowCount()
+        if healthy and not cancelled:
+            self._assistant_maker_test_completed_at = time.time()
+            self._assistant_maker_next_action = "maker_add_all"
         self.maker_progress.set_status(
             self.tr("تست متوقف شد", "Testing stopped") if cancelled else
             self.tr("تست زنده کامل شد", "Live testing completed"),
@@ -5527,6 +5922,9 @@ class MainWindow(QMainWindow):
             f"Config testing finished; {healthy} configs are healthy.",
             "warning" if cancelled else "success", False,
         )
+        controller = self.assistant_controller
+        if controller is not None and getattr(controller, "enabled", False):
+            QTimer.singleShot(0, lambda: controller.evaluate(force=True))
 
     def _maker_failed(self, message, generation):
         if generation != self._maker_generation:
@@ -5558,6 +5956,8 @@ class MainWindow(QMainWindow):
         self._maker_import_generation += 1
         self._maker_finish_test_ui()
         self._maker_import_in_progress = False
+        self._assistant_maker_test_completed_at = 0.0
+        self._assistant_maker_next_action = ""
         self._maker_last_loaded_url = ""
         self._maker_last_converted_editor_text = ""
         self._maker.clear()
@@ -5719,6 +6119,8 @@ class MainWindow(QMainWindow):
             f"{len(added)} SNI Maker configs saved in User Config.",
             "success", False,
         )
+        self._assistant_maker_test_completed_at = 0.0
+        self._assistant_maker_next_action = ""
 
     def _maker_copy_marked(self):
         results = [
@@ -5917,16 +6319,21 @@ class MainWindow(QMainWindow):
         self.storage.profiles.extend(profiles); self.storage.save_profiles(); self.refresh_profiles(); self.show_toast(self.tr(f"{len(profiles)} کانفیگ اضافه شد", f"Added {len(profiles)} config(s)"), "success"); self._set_activity("ورود کانفیگ کامل شد.", "Config import completed.", "success", False)
 
     def sync_profiles(self):
-        self.sync_btn.setEnabled(False); self._set_activity("در حال دریافت کانفیگ‌های پیشنهادی…", "Syncing suggested configs…")
-        def work():
-            try:
-                text = requests.get(REMOTE_CONFIGS_URL, timeout=15).text; items = parse_many(text, suggested=True); existing = {x.source_uri.split('#')[0] for x in self.storage.profiles}; added = 0
-                self.storage.profiles = [x for x in self.storage.profiles if x.origin != "github"]
-                for item in items:
-                    if item.source_uri.split('#')[0] not in existing: item.origin = "github"; item.name = "GitHub " + item.name; self.storage.profiles.append(item); added += 1
-                self.storage.save_profiles(); self.bridge.profiles_changed.emit(); self.bridge.log.emit(f"Suggested configs synced: {added}"); self.bridge.activity.emit(self.tr(f"همگام‌سازی کامل شد؛ {added} کانفیگ اضافه شد.", f"Sync complete; {added} config(s) added."), "success", False)
-            except Exception as exc: self.bridge.error.emit(str(exc))
-        threading.Thread(target=work, daemon=True).start()
+        self.sync_btn.setEnabled(False)
+        self._set_activity("در حال بازیابی کانفیگ‌های اصلی…", "Restoring original configs…")
+        try:
+            count = self.storage.restore_original_suggested_profiles()
+            self.bridge.profiles_changed.emit()
+            self.bridge.log.emit(f"Original suggested configs restored: {count}")
+            self._set_activity(
+                f"{count} کانفیگ اصلی UAC Spoof بازیابی شد.",
+                f"Restored {count} UAC Spoof original configs.",
+                "success", False,
+            )
+        except Exception as exc:
+            self._handle_error(str(exc))
+        finally:
+            self.sync_btn.setEnabled(True)
 
     def _begin_connect_attempt(self):
         self._cancel_mode_apply()
@@ -5937,6 +6344,17 @@ class MainWindow(QMainWindow):
 
     def _attempt_cancelled(self, generation, cancel):
         return self._closing or cancel.is_set() or generation != self._connect_generation
+
+    def _resume_pending_connection(self):
+        if self._closing:
+            self._connection_retry_pending = False
+            return
+        worker = self._connect_thread
+        if worker and worker.is_alive():
+            QTimer.singleShot(75, self._resume_pending_connection)
+            return
+        self._connection_retry_pending = False
+        self.toggle_connection()
 
     def _cancel_connect_attempt(self, wait=False, notify=False):
         self._cancel_mode_apply()
@@ -5988,9 +6406,23 @@ class MainWindow(QMainWindow):
         self.toggle_connection()
 
     @staticmethod
-    def _attempt_tuning_for_profile(profile, base_tuning, fake_sni, mux_enabled):
+    def _attempt_tuning_for_profile(profile, base_tuning, fake_sni, mux_enabled,
+                                    route_plan=None):
         tuning = replace(base_tuning, pattern_fake_sni=fake_sni,
                          xray_mux_enabled=mux_enabled)
+        if profile.origin == "builtin" and base_tuning.carrier_mode == "mci":
+            plan = route_plan or MCI_BUILTIN_ROUTE_PLANS[0]
+            primary = str(plan[1])
+            tuning = Tuning.enforce_carrier(base_tuning, "mci")
+            tuning = replace(
+                tuning,
+                pattern_fake_sni=fake_sni,
+                pattern_connect_ip=primary,
+                pattern_fallback_ips=MCI_BUILTIN_FALLBACK_EDGES,
+                pattern_use_profile_edges=False,
+                pattern_fake_repeat=MCI_BUILTIN_FAKE_REPEAT,
+                pattern_inject_delay_ms=MCI_BUILTIN_INJECT_DELAY_MS,
+            )
         if profile.verified_spoof:
             tuning = replace(
                 tuning,
@@ -5999,6 +6431,35 @@ class MainWindow(QMainWindow):
                 pattern_use_profile_edges=False,
             )
         return tuning
+
+    @staticmethod
+    def _mci_builtin_route_plan(profile, carrier, attempt_index=0):
+        if profile.origin != "builtin" or carrier != "mci":
+            return None
+        if profile.verified_spoof and profile.address:
+            strategy = str(profile.method or "wrong_seq").strip().lower()
+            if strategy not in {"wrong_seq", "full5", "full20", "tls_sni_records"}:
+                strategy = "wrong_seq"
+            return strategy, profile.address
+        index = max(0, int(attempt_index)) % len(MCI_BUILTIN_ROUTE_PLANS)
+        return MCI_BUILTIN_ROUTE_PLANS[index]
+
+    @staticmethod
+    def _profile_connection_strategy(profile, carrier, default_strategy,
+                                     builtin_route=None, route_plan=None):
+        route = builtin_route if isinstance(builtin_route, dict) else {}
+        if profile.origin == "builtin" and carrier == "mci":
+            return str((route_plan or MCI_BUILTIN_ROUTE_PLANS[0])[0])
+        cached = str(route.get("strategy", "") or "").strip().lower()
+        if cached in {"plain", "wrong_seq", "tls_sni_records", "full5", "full20"}:
+            return cached
+        profile_strategy = {
+            "full5": "full5",
+            "tls_sni_records": "tls_sni_records",
+        }.get(str(profile.method or "").strip().lower(), "")
+        if profile.origin == USER_CONFIG_ORIGIN and profile_strategy:
+            return profile_strategy
+        return default_strategy
 
     @staticmethod
     def _initial_connection_strategy(carrier, country_code=""):
@@ -6011,6 +6472,9 @@ class MainWindow(QMainWindow):
         if not tuning.xray_mux_enabled:
             return False
         carrier = carrier or tuning.carrier_mode
+        builtin_route = MainWindow._builtin_route_entry(self, profile, carrier)
+        if builtin_route and builtin_route.get("mux_enabled") is False:
+            return False
         scoped = self.storage.settings.get("profile_mux_compatibility_by_carrier", {})
         bucket = scoped.get(carrier, {}) if isinstance(scoped, dict) else {}
         entry = bucket.get(profile.id, {}) if isinstance(bucket, dict) else {}
@@ -6030,8 +6494,11 @@ class MainWindow(QMainWindow):
         bucket = scoped.get(carrier, {})
         bucket = dict(bucket) if isinstance(bucket, dict) else {}
         signature = profile.source_uri or f"{profile.protocol}:{profile.config_host}:{profile.config_port}"
-        live_edge = str(getattr(getattr(self, "engine", None), "fragment", None).active_edge or "").strip()\
-            if getattr(getattr(self, "engine", None), "fragment", None) is not None else ""
+        engine = getattr(self, "engine", None)
+        live_edge = str(getattr(engine, "active_upstream_address", "") or "").strip()
+        if not live_edge:
+            fragment = getattr(engine, "fragment", None)
+            live_edge = str(getattr(fragment, "active_edge", "") or "").strip()
         bucket[profile.id] = {
             "compatible": bool(compatible),
             "tested_at": time.time(),
@@ -6136,7 +6603,31 @@ class MainWindow(QMainWindow):
         if profile.route_mode == "reality-direct":
             reality_sni = str(profile.sni or "").strip().lower()
             return [reality_sni] if reality_sni else []
-        candidates = self._sni_candidates(profile, carrier, limit)
+        builtin = profile.origin == "builtin"
+        if builtin and carrier == "mci":
+            original_sni = str(profile.sni or "").strip().lower()
+            return [original_sni] * len(MCI_BUILTIN_ROUTE_PLANS) if original_sni else []
+        candidate_limit = max(limit, 4) if builtin else limit
+        candidates = self._sni_candidates(profile, carrier, candidate_limit)
+        if builtin:
+            preferred = []
+            cached = MainWindow._builtin_route_entry(
+                self, profile, carrier
+            ).get("fake_sni", "")
+            hints = BUILTIN_PROFILE_SNI_HINTS.get(
+                str(profile.sni or "").strip().lower(), ()
+            )
+            values = ((MCI_BUILTIN_FAKE_SNI, "support.cloudflare.com",
+                       "www.speedtest.net", cached, *hints)
+                      if carrier == "mci" else (cached, *hints))
+            for value in values:
+                value = str(value or "").strip().lower()
+                if value and value not in preferred:
+                    preferred.append(value)
+            candidates = [
+                *preferred,
+                *(value for value in candidates if value not in preferred),
+            ]
         fallback = str(getattr(profile, "spoof_fake_sni", "") or "").strip().lower()
         if fallback:
             if (
@@ -6148,7 +6639,50 @@ class MainWindow(QMainWindow):
                 ]
             elif fallback not in candidates:
                 candidates.append(fallback)
-        return candidates[:max(1, limit)]
+        return candidates[:max(1, candidate_limit)]
+
+    def _builtin_route_entry(self, profile, carrier=None):
+        if profile is None or profile.origin != "builtin":
+            return {}
+        carrier = carrier or self.storage.tuning.carrier_mode
+        scoped = self.storage.settings.get("builtin_profile_routes_by_carrier", {})
+        bucket = scoped.get(carrier, {}) if isinstance(scoped, dict) else {}
+        entry = bucket.get(profile.id, {}) if isinstance(bucket, dict) else {}
+        if not isinstance(entry, dict):
+            return {}
+        signature = profile.source_uri or f"{profile.protocol}:{profile.config_host}:{profile.config_port}"
+        if entry.get("signature") != signature:
+            return {}
+        if time.time() - float(entry.get("tested_at", 0) or 0) > BUILTIN_ROUTE_CACHE_TTL_S:
+            return {}
+        return entry
+
+    def _remember_builtin_route(self, profile, carrier, fake_sni, strategy,
+                                tuning, mux_enabled):
+        if profile.origin != "builtin":
+            return
+        scoped = self.storage.settings.get("builtin_profile_routes_by_carrier", {})
+        scoped = dict(scoped) if isinstance(scoped, dict) else {}
+        bucket = scoped.get(carrier, {})
+        bucket = dict(bucket) if isinstance(bucket, dict) else {}
+        engine = getattr(self, "engine", None)
+        active_edge = str(getattr(engine, "active_upstream_address", "") or "").strip()
+        if not active_edge:
+            fragment = getattr(engine, "fragment", None)
+            active_edge = str(getattr(fragment, "active_edge", "") or "").strip()
+        bucket[profile.id] = {
+            "fake_sni": str(fake_sni or "").strip().lower(),
+            "strategy": strategy if strategy in {
+                "plain", "wrong_seq", "tls_sni_records", "full5", "full20"
+            } else "wrong_seq",
+            "edge": active_edge or tuning.pattern_connect_ip,
+            "fallback_ips": tuning.pattern_fallback_ips,
+            "mux_enabled": bool(mux_enabled),
+            "signature": profile.source_uri or f"{profile.protocol}:{profile.config_host}:{profile.config_port}",
+            "tested_at": time.time(),
+        }
+        scoped[carrier] = bucket
+        self.storage.settings["builtin_profile_routes_by_carrier"] = scoped
 
     def _verified_route_result(self, domain, carrier):
         candidates = []
@@ -6195,9 +6729,27 @@ class MainWindow(QMainWindow):
                 if self._selected_route_source() == "user-config"
                 else verified or source_profiles
             )
+        tuning = self.storage.tuning
+        if (
+                auto_enabled
+                and forced_profile is None
+                and tuning.carrier_mode == "mci"
+                and self._selected_route_source() == "suggested"):
+            candidates = [
+                profile for profile in candidates
+                if MainWindow._mci_builtin_auto_eligible(profile)
+            ]
+            initial_positions = {
+                profile.id: index for index, profile in enumerate(candidates)
+            }
+            candidates.sort(
+                key=lambda profile: (
+                    MainWindow._mci_builtin_auto_rank(profile),
+                    initial_positions.get(profile.id, 999999),
+                )
+            )
         if cancel_event.is_set():
             raise EngineCancelled("Connection attempt cancelled")
-        tuning = self.storage.tuning
         ping_host = (candidates[0].address if country_code and candidates else "")\
             or tuning.pattern_connect_ip or "104.18.32.47"
 
@@ -6222,17 +6774,31 @@ class MainWindow(QMainWindow):
         benchmarks = self.storage.settings.get(f"profile_benchmarks_pattern_{carrier}", {})
         benchmarks = benchmarks if isinstance(benchmarks, dict) else {}
         now = time.time()
+        candidate_positions = {profile.id: index for index, profile in enumerate(candidates)}
         def quality(profile):
             result = benchmarks.get(profile.id, {})
             fresh = now - float(result.get("tested_at", 0)) < 24 * 3600
             page_ok = (bool(result.get("ok")) and result.get("engine") == "patterniha-wrong-seq-v1" and fresh)
             if carrier == "mci":
                 download_fresh = now - float(result.get("download_tested_at", 0) or 0) < 6 * 3600
-                download_verified = result.get("download_ok") is True and download_fresh
+                download_verified = (
+                    result.get("download_ok") is True
+                    and download_fresh
+                    and (
+                        profile.origin != "builtin"
+                        or (
+                            result.get("url") == MCI_BUILTIN_WEB_GATE
+                            and int(result.get("download_bytes", 0) or 0)
+                            >= MCI_BUILTIN_WEB_GATE_MIN_BYTES
+                        )
+                    )
+                )
                 download_mbps = float(result.get("download_mbps", 0) or 0)
                 benchmark_known = bool(result) and result.get("engine") == "patterniha-wrong-seq-v1"
                 download_failed = (result.get("download_ok") is False
                                    or result.get("download_state") == "failed")
+                if profile.origin == "builtin" and not download_verified:
+                    page_ok = False
 
 
 
@@ -6246,7 +6812,9 @@ class MainWindow(QMainWindow):
                     tier = 3
                 else:
                     tier = 4
-                return (tier,
+                original_order = (candidate_positions.get(profile.id, 999999)
+                                  if profile.origin == "builtin" and not download_verified else 0)
+                return (tier, original_order,
                         -float(result.get("score", 0)) if page_ok else 0,
                         float(result.get("download_first_byte_ms", 999999) or 999999),
                         -download_mbps, profile.id != remembered_id,
@@ -6258,6 +6826,26 @@ class MainWindow(QMainWindow):
                     not profile.last_ping_ok, profile.last_ping_ms if profile.last_ping_ok else 999999)
         return sorted(candidates, key=quality)
 
+    @staticmethod
+    def _mci_builtin_auto_eligible(profile):
+        if profile.origin != "builtin":
+            return True
+        try:
+            path = str(parse_outbound(profile).get("path", "") or "").lower()
+        except (TypeError, ValueError):
+            return True
+        return not (
+            path == "//assignment"
+            or path.startswith("/assignment?telegram--kanal--")
+        )
+
+    @staticmethod
+    def _mci_builtin_auto_rank(profile):
+        if profile.origin != "builtin":
+            return 1
+        source = str(profile.source_uri or "").lower()
+        return 0 if "?path=assignment&" in source else 1
+
     def _save_profile_benchmark(self, profile, strategy, page_ok, upload_state=None,
                                 fake_sni="", count_page_sample=True, carrier=None,
                                 download_state=None):
@@ -6266,6 +6854,14 @@ class MainWindow(QMainWindow):
         values = self.storage.settings.get(key, {})
         if not isinstance(values, dict): values = {}
         previous = values.get(profile.id, {}) if isinstance(values.get(profile.id, {}), dict) else {}
+        measured_download_state = (download_state
+                                   or getattr(self.engine, "last_download_state", "not_tested")
+                                   or "not_tested")
+        hard_mci_payload_failure = (
+            carrier == "mci"
+            and profile.origin == "builtin"
+            and measured_download_state == "failed"
+        )
         elapsed = float(self.engine.last_probe_ms or previous.get("startup_ms", 99999))
         is_youtube = "youtube.com/generate_204" in self.engine.last_probe_url
         page_verified = bool(page_ok and (carrier != "irancell" or is_youtube))
@@ -6279,7 +6875,8 @@ class MainWindow(QMainWindow):
             page_failures = 0
         else:
             page_failures += 1
-            keep_previous = bool(previous.get("ok")) and page_failures < 2
+            keep_previous = (bool(previous.get("ok")) and page_failures < 2
+                             and not hard_mci_payload_failure)
             if keep_previous:
                 elapsed = float(previous.get("startup_ms", elapsed))
                 page_verified = True
@@ -6323,9 +6920,6 @@ class MainWindow(QMainWindow):
 
 
 
-        measured_download_state = (download_state
-                                   or getattr(self.engine, "last_download_state", "not_tested")
-                                   or "not_tested")
         previous_download_state = str(previous.get("download_state", ""))
         previous_download_valid = (previous_download_state == "verified"
                                    or previous.get("download_ok") is True)
@@ -6358,7 +6952,7 @@ class MainWindow(QMainWindow):
             download_tested_at = time.time()
         elif carrier == "mci" and measured_download_state == "failed":
             download_failures += 1
-            if download_failures >= 2:
+            if download_failures >= 2 or hard_mci_payload_failure:
                 download_ok = False
                 effective_download_state = "failed"
                 download_speed_valid = False
@@ -6422,6 +7016,9 @@ class MainWindow(QMainWindow):
             value["last_upload_reason"] = self.engine.last_upload_reason
         values[profile.id] = value
         self.storage.settings[key] = values
+        if (hard_mci_payload_failure
+                and self.storage.settings.get(f"working_profile_{carrier}") == profile.id):
+            self.storage.settings.pop(f"working_profile_{carrier}", None)
         self.storage.save_settings()
 
     def _run_upload_quality(self, profile, strategy, fake_sni, carrier, generation, cancel):
@@ -6477,6 +7074,20 @@ class MainWindow(QMainWindow):
             self.bridge.log.emit(f"MCI DOWNLOAD inconclusive: {type(exc).__name__}")
             return "inconclusive", type(exc).__name__
 
+    def _verify_mci_builtin_payload(self, profile, carrier, cancel):
+        if carrier != "mci" or profile.origin != "builtin":
+            return True, "not required"
+        result, detail = self.engine.probe_web_access(
+            timeout=10.0, connect_timeout=4.0, cancel_event=cancel
+        )
+        verified = (
+            result is True
+            and getattr(self.engine, "last_download_state", "") == "verified"
+            and int(getattr(self.engine, "last_download_bytes", 0) or 0)
+            >= MCI_BUILTIN_WEB_GATE_MIN_BYTES
+        )
+        return verified, detail
+
     def _schedule_mci_warmup(self, carrier, cancel):
         """Prime one YouTube TLS path in the background for MCI only."""
         if carrier != "mci" or cancel.is_set():
@@ -6523,6 +7134,14 @@ class MainWindow(QMainWindow):
                 "ابتدا تست زنده سازنده SNI را متوقف کنید",
                 "Stop the SNI Maker live test before connecting",
             ), "warning")
+            return
+        worker = getattr(self, "_connect_thread", None)
+        if (not self.connecting and worker is not None
+                and worker.is_alive()):
+            if not getattr(self, "_connection_retry_pending", False):
+                self._connection_retry_pending = True
+                self._cancel_connect_attempt(notify=False)
+                QTimer.singleShot(75, self._resume_pending_connection)
             return
         if self.connecting:
             self.connecting = False
@@ -6668,16 +7287,45 @@ class MainWindow(QMainWindow):
                 for index, profile in enumerate(profiles, 1):
                     profile_snis = self._profile_sni_candidates(profile, carrier, limit=3)
                     profile_passed = False
+                    profile_download_state = "not_tested"
                     profile_mux_enabled = self._profile_mux_enabled(profile, base_tuning, carrier)
+                    builtin_route = MainWindow._builtin_route_entry(self, profile, carrier)
                     for sni_index, fake_sni in enumerate(profile_snis, 1):
+                        download_state = "not_tested"
+                        download_detail = ""
                         if self._attempt_cancelled(generation, cancel):
                             raise EngineCancelled("Connection attempt cancelled")
                         self.bridge.log.emit(f"CONFIG TRY {index}/{len(profiles)} {profile.name} SNI {sni_index}/{len(profile_snis)}={fake_sni}")
-                        attempt_strategy = strategy
-                        attempt_tuning = self._attempt_tuning_for_profile(
-                            profile, base_tuning, fake_sni, profile_mux_enabled
+                        route_plan = self._mci_builtin_route_plan(
+                            profile, carrier, sni_index - 1
                         )
-                        if not profile.verified_spoof:
+                        attempt_strategy = self._profile_connection_strategy(
+                            profile, carrier, strategy, builtin_route, route_plan
+                        )
+                        attempt_tuning = self._attempt_tuning_for_profile(
+                            profile, base_tuning, fake_sni, profile_mux_enabled,
+                            route_plan,
+                        )
+                        if (
+                                builtin_route.get("edge")
+                                and not (
+                                    profile.origin == "builtin"
+                                    and carrier == "mci"
+                                )):
+                            attempt_tuning = replace(
+                                attempt_tuning,
+                                pattern_connect_ip=str(builtin_route["edge"]),
+                                pattern_fallback_ips=str(
+                                    builtin_route.get("fallback_ips", "") or ""
+                                ),
+                                pattern_use_profile_edges=False,
+                            )
+                        if (
+                                not profile.verified_spoof
+                                and not (
+                                    profile.origin == "builtin"
+                                    and carrier == "mci"
+                                )):
                             measured_route = self._verified_route_result(fake_sni, carrier)
                             if measured_route:
                                 attempt_tuning = self._bind_verified_sni_route(attempt_tuning, measured_route)
@@ -6697,9 +7345,15 @@ class MainWindow(QMainWindow):
                                 "mci": "https://www.gstatic.com/generate_204",
                             }
                             preferred_url = preferred_urls.get(carrier)
-                            page_ok, detail = self.engine.probe(timeout=6, preferred_url=preferred_url,
-                                                                require_preferred=(carrier in preferred_urls),
-                                                                cancel_event=cancel)
+                            mci_builtin = profile.origin == "builtin" and carrier == "mci"
+                            if mci_builtin:
+                                page_ok, detail = True, "payload check pending"
+                            else:
+                                page_ok, detail = self.engine.probe(
+                                    timeout=6, preferred_url=preferred_url,
+                                    require_preferred=(carrier in preferred_urls),
+                                    cancel_event=cancel,
+                                )
                             if (not page_ok and carrier == "mci"
                                     and attempt_strategy == "tls_sni_records"):
 
@@ -6708,6 +7362,8 @@ class MainWindow(QMainWindow):
                                 self.bridge.log.emit(
                                     f"MCI TLS FALLBACK {profile.name} fakeSni={fake_sni}"
                                 )
+                                if self._attempt_cancelled(generation, cancel):
+                                    raise EngineCancelled("Connection attempt cancelled")
                                 self.engine.stop(notify=False)
                                 attempt_strategy = "wrong_seq"
                                 self.engine.start(
@@ -6724,6 +7380,8 @@ class MainWindow(QMainWindow):
 
 
                                 self.bridge.log.emit(f"MUX FALLBACK {profile.name} fakeSni={fake_sni}")
+                                if self._attempt_cancelled(generation, cancel):
+                                    raise EngineCancelled("Connection attempt cancelled")
                                 self.engine.stop(notify=False)
                                 fallback_tuning = replace(attempt_tuning, xray_mux_enabled=False)
                                 self.engine.start(profile, fallback_tuning, bypass, notify=False,
@@ -6737,8 +7395,76 @@ class MainWindow(QMainWindow):
                                     profile_mux_enabled = False
                                     self._remember_profile_mux(profile, False, fallback_tuning, carrier)
                                     self.bridge.log.emit("MUX FALLBACK WIN; Mux disabled for this working route")
+                            if (not page_ok and carrier == "irancell"
+                                    and (profile.origin == "builtin"
+                                         or (profile.origin == USER_CONFIG_ORIGIN
+                                             and profile.method == "full5"))):
+                                alternate_strategy = (
+                                    "wrong_seq"
+                                    if attempt_strategy == "full5" else
+                                    "tls_sni_records"
+                                    if attempt_strategy == "wrong_seq" else
+                                    "wrong_seq"
+                                )
+                                self.bridge.log.emit(
+                                    f"IRANCELL BUILTIN FALLBACK {profile.name} "
+                                    f"{attempt_strategy}->{alternate_strategy} fakeSni={fake_sni}"
+                                )
+                                if self._attempt_cancelled(generation, cancel):
+                                    raise EngineCancelled("Connection attempt cancelled")
+                                self.engine.stop(notify=False)
+                                fallback_tuning = replace(
+                                    attempt_tuning, xray_mux_enabled=False
+                                )
+                                self.engine.start(
+                                    profile, fallback_tuning, bypass, notify=False,
+                                    enable_system_proxy=False,
+                                    strategy_override=alternate_strategy,
+                                    cancel_event=cancel,
+                                )
+                                page_ok, detail = self.engine.probe(
+                                    timeout=6, preferred_url=preferred_url,
+                                    require_preferred=True, cancel_event=cancel,
+                                )
+                                if page_ok:
+                                    attempt_strategy = alternate_strategy
+                                    attempt_tuning = fallback_tuning
+                                    profile_mux_enabled = False
+                                    self._remember_profile_mux(
+                                        profile, False, fallback_tuning, carrier
+                                    )
                             if self._attempt_cancelled(generation, cancel):
                                 raise EngineCancelled("Connection attempt cancelled")
+                            if profile.origin == "builtin" and carrier == "mci":
+                                payload_ok, payload_detail = self._verify_mci_builtin_payload(
+                                    profile, carrier, cancel
+                                )
+                                download_detail = payload_detail
+                                download_state = "verified" if payload_ok else "failed"
+                                profile_download_state = download_state
+                                page_ok = payload_ok
+                                if payload_ok:
+                                    detail = payload_detail
+                                    payload_latency = float(
+                                        getattr(self.engine, "last_download_first_byte_ms", 0)
+                                        or getattr(self.engine, "last_download_ms", 0)
+                                        or 0
+                                    )
+                                    if payload_latency > 0:
+                                        self.engine.last_probe_ms = payload_latency
+                                    self.engine.last_probe_url = MCI_BUILTIN_WEB_GATE
+                                else:
+                                    detail = f"payload check failed: {payload_detail}"
+                                    engine = getattr(self, "engine", None)
+                                    actual_edge = str(
+                                        getattr(engine, "active_upstream_address", "")
+                                        or attempt_tuning.pattern_connect_ip
+                                    ).strip()
+                                    self.bridge.log.emit(
+                                        f"MCI BUILTIN PAYLOAD REJECT {profile.name} "
+                                        f"edge={actual_edge} "
+                                        f"strategy={attempt_strategy}: {payload_detail}"
+                                    )
                             if page_ok and profile.route_is_verified:
                                 self.bridge.activity.emit(self.tr(
                                     "در حال بررسی کشور واقعی آی‌پی خروجی…",
@@ -6771,16 +7497,15 @@ class MainWindow(QMainWindow):
                                         latency_signal.emit(route_latency, "tunnel")
                                 if base_tuning.xray_mux_enabled and attempt_tuning.xray_mux_enabled:
                                     self._remember_profile_mux(profile, True, attempt_tuning, carrier)
-                                download_state = "not_tested"
-                                download_detail = ""
                                 with self._proxy_mode_apply_lock:
                                     connection_mode = self._apply_connection_mode_after_probe(cancel)
                                 if self._attempt_cancelled(generation, cancel):
                                     raise EngineCancelled("Connection attempt cancelled")
-                                self.storage.settings[f"working_strategy_{carrier}"] = attempt_strategy
                                 self.storage.settings[f"working_profile_{carrier}"] = profile.id
-                                self.storage.settings[f"working_pattern_sni_{carrier}"] = fake_sni
-                                self.storage.settings[f"working_pattern_sni_at_{carrier}"] = time.time()
+                                if profile.origin != "builtin":
+                                    self.storage.settings[f"working_strategy_{carrier}"] = attempt_strategy
+                                    self.storage.settings[f"working_pattern_sni_{carrier}"] = fake_sni
+                                    self.storage.settings[f"working_pattern_sni_at_{carrier}"] = time.time()
                                 self.storage.settings["selected_id"] = profile.id
 
 
@@ -6790,7 +7515,11 @@ class MainWindow(QMainWindow):
                                     working_tuning.pattern_connect_ip = profile.address or VERIFIED_SPOOF_EDGE
                                     working_tuning.pattern_fallback_ips = profile.fallback_address
                                     working_tuning.pattern_use_profile_edges = False
-                                active_edge = str(getattr(self.engine.fragment, "active_edge", "") or "").strip()
+                                engine = getattr(self, "engine", None)
+                                active_edge = str(getattr(engine, "active_upstream_address", "") or "").strip()
+                                if not active_edge:
+                                    fragment = getattr(engine, "fragment", None)
+                                    active_edge = str(getattr(fragment, "active_edge", "") or "").strip()
                                 if active_edge:
                                     previous_edges = [
                                         attempt_tuning.pattern_connect_ip,
@@ -6805,13 +7534,22 @@ class MainWindow(QMainWindow):
                                             fallbacks.append(edge)
                                     working_tuning.pattern_connect_ip = active_edge
                                     working_tuning.pattern_fallback_ips = ",".join(fallbacks[:4])
-                                self.storage.settings[f"working_pattern_edge_{carrier}"] = active_edge or working_tuning.pattern_connect_ip
-                                self.storage.settings[f"working_pattern_route_{carrier}"] = {
-                                    "edge": active_edge or working_tuning.pattern_connect_ip,
-                                    "fake_sni": fake_sni,
-                                    "tested_at": time.time(),
-                                }
-                                self.storage.set_tuning(working_tuning)
+                                if profile.origin != "builtin":
+                                    self.storage.settings[f"working_pattern_edge_{carrier}"] = active_edge or working_tuning.pattern_connect_ip
+                                    self.storage.settings[f"working_pattern_route_{carrier}"] = {
+                                        "edge": active_edge or working_tuning.pattern_connect_ip,
+                                        "fake_sni": fake_sni,
+                                        "tested_at": time.time(),
+                                    }
+                                MainWindow._remember_builtin_route(
+                                    self, profile, carrier, fake_sni,
+                                    attempt_strategy, attempt_tuning,
+                                    profile_mux_enabled,
+                                )
+                                if profile.origin == "builtin":
+                                    self.storage.save_settings()
+                                else:
+                                    self.storage.set_tuning(working_tuning)
                                 self._save_profile_benchmark(
                                     profile, attempt_strategy, True, "not_tested", fake_sni,
                                     carrier=carrier, download_state=download_state,
@@ -6844,10 +7582,11 @@ class MainWindow(QMainWindow):
                                     "Spoof core is active; Windows Proxy is off.",
                                 ), "success", False)
                                 self._schedule_mci_warmup(carrier, cancel)
-                                self._schedule_mci_download_quality(
-                                    profile, attempt_strategy, fake_sni, carrier,
-                                    generation, cancel,
-                                )
+                                if download_state != "verified":
+                                    self._schedule_mci_download_quality(
+                                        profile, attempt_strategy, fake_sni, carrier,
+                                        generation, cancel,
+                                    )
                                 if attempt_tuning.background_quality_probe_enabled:
                                     threading.Thread(target=self._run_upload_quality,
                                                      args=(profile, strategy, fake_sni, carrier, generation, cancel),
@@ -6859,11 +7598,14 @@ class MainWindow(QMainWindow):
                         except Exception as attempt_error:
                             last_error = str(attempt_error)
                             self.bridge.log.emit(f"CONFIG FAIL {profile.name} fakeSni={fake_sni}: {last_error}")
+                        if self._attempt_cancelled(generation, cancel):
+                            raise EngineCancelled("Connection attempt cancelled")
                         self.engine.stop(notify=False)
                     if not profile_passed:
                         self._save_profile_benchmark(profile, strategy, False, "not_tested",
                                                      profile_snis[-1] if profile_snis else "",
-                                                     carrier=carrier)
+                                                     carrier=carrier,
+                                                     download_state=profile_download_state)
                 raise RuntimeError("No profile passed the real YouTube/page traffic test. " + last_error)
             except EngineCancelled:
                 return
@@ -6872,7 +7614,7 @@ class MainWindow(QMainWindow):
                     self.bridge.error.emit(str(exc))
                     self.bridge.state.emit(False)
             finally:
-                if not connected:
+                if not connected and not self._attempt_cancelled(generation, cancel):
                     self.engine.stop(notify=False)
 
         self._connect_thread = threading.Thread(target=work, name=f"connect-{generation}", daemon=True)
@@ -7633,7 +8375,7 @@ class MainWindow(QMainWindow):
     def show_toast(self, message, kind="success", undo=False):
         old = self.centralWidget().findChild(QFrame, "toast")
         if old: old.deleteLater()
-        toast = QFrame(self.centralWidget()); toast.setObjectName("toast"); toast.setProperty("kind", kind)
+        toast = QFrame(self.centralWidget()); toast.setObjectName("toast"); toast.setProperty("kind", kind); toast.setProperty("assistantCreatedAt", time.time())
         layout = QHBoxLayout(toast); layout.setContentsMargins(16, 12, 12, 12); layout.setSpacing(12)
         dot = QLabel(); dot.setObjectName("toastDot"); dot.setFixedSize(24, 24); icon_name = {"success": "check-circle", "warning": "alert", "danger": "x-circle"}.get(kind, "check-circle"); icon_color = {"success": "#23f5a6", "warning": "#ffd166", "danger": "#ff5c7c"}.get(kind, "#23f5e0"); dot.setPixmap(cyber_pixmap(icon_name, icon_color, 21)); text = QLabel(message); text.setObjectName("toastText"); text.setWordWrap(True)
         layout.addWidget(dot); layout.addWidget(text, 1)
@@ -7673,6 +8415,8 @@ class MainWindow(QMainWindow):
         self._position_toast()
         self._position_update_notification()
         self._position_gateway_devices_popup()
+        if self.assistant_controller is not None:
+            self.assistant_controller.schedule_reposition()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -7680,6 +8424,8 @@ class MainWindow(QMainWindow):
         self._layout_sni_maker()
         QTimer.singleShot(0, self._layout_home_dashboard)
         QTimer.singleShot(0, self._layout_sni_maker)
+        if self.assistant_controller is not None:
+            QTimer.singleShot(0, self.assistant_controller.schedule_reposition)
         if self._pending_update_notification is not None:
             info = self._pending_update_notification; self._pending_update_notification = None
             QTimer.singleShot(0, lambda value=info: self._show_update_notification(value))
@@ -7779,6 +8525,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        if self.assistant_controller is not None:
+            self.assistant_controller.disable(persist=False)
         if self._tray is not None:
             self._tray.hide()
         self._gateway_requested = False
@@ -7913,6 +8661,7 @@ QLabel#countryTitle { color: #f5ffff; font-size: 17px; font-weight: 900; }
 QLabel#countryDescription { color: #a9bfd7; font-size: 11px; }
 QLabel#countryCount { color: #9ffdf5; background: rgba(8,69,78,0.56); border: 1px solid rgba(72,236,225,0.25); border-radius: 9px; padding: 4px 9px; font-size: 10px; font-weight: 800; }
 QComboBox#countryCombo { background: rgba(4,20,43,0.96); border: 1px solid rgba(82,244,230,0.55); border-radius: 13px; padding: 7px 15px; color: #f4ffff; font-size: 13px; font-weight: 750; }
+QLabel#originalConfigsLabel { background: rgba(4,20,43,0.96); border: 1px solid rgba(82,244,230,0.55); border-radius: 13px; padding: 7px 15px; color: #f4ffff; font-size: 13px; font-weight: 750; }
 QComboBox#countryCombo:hover, QComboBox#countryCombo:focus { border-color: #67fff0; background: rgba(6,34,55,0.98); }
 QComboBox#countryCombo:disabled { color: #7890aa; border-color: rgba(111,145,181,0.28); background: rgba(8,20,38,0.72); }
 QComboBox#countryCombo QAbstractItemView { min-width: 350px; background: #091c35; border: 1px solid rgba(82,244,230,0.6); border-radius: 12px; padding: 7px; outline: 0; show-decoration-selected: 1; }
@@ -7950,6 +8699,7 @@ QScrollArea#gatewayDevicesScroll, QScrollArea#gatewayDevicesScroll > QWidget, QW
 QFrame#gatewayDeviceRow { background: rgba(8,30,54,0.88); border: 1px solid rgba(69,151,190,0.3); border-radius: 11px; }
 QFrame#gatewayDeviceRow:hover { background: rgba(10,46,65,0.94); border-color: rgba(35,245,224,0.5); }
 QLabel#gatewayDeviceCheck { background: rgba(9,78,61,0.48); border: 1px solid rgba(35,245,166,0.34); border-radius: 9px; }
+QLabel#gatewayDeviceName { color: #dffffa; font-size: 12px; font-weight: 850; }
 QLabel#gatewayDeviceIp { color: #f2fbff; font-size: 12px; font-weight: 800; }
 QLabel#gatewayDeviceMac { color: #7999b9; font-size: 9px; font-weight: 600; }
 QLabel#gatewayDeviceState { color: #55f5b4; font-size: 10px; font-weight: 850; }
@@ -7991,7 +8741,7 @@ QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QComboBox:hover { border
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTableView:focus { border: 1px solid $accent; background: rgba(6,22,42,0.98); }
 QLineEdit[invalid="true"], QTextEdit[invalid="true"] { border: 1px solid $danger; background: rgba(65,15,35,0.55); }
 QComboBox { min-height: 28px; padding-left: 11px; padding-right: 34px; }
-QComboBox#countryCombo { min-height: 20px; }
+QComboBox#countryCombo, QLabel#originalConfigsLabel { min-height: 20px; }
 QComboBox#carrierModeCombo { min-height: 20px; padding: 4px 28px 4px 9px; }
 QComboBox::drop-down { border: 0; width: 30px; }
 QComboBox::down-arrow { image: url("$chevronicon"); width: 14px; height: 14px; }
@@ -8146,6 +8896,17 @@ QFrame#toast[kind="warning"] { border-color: rgba(255,209,102,0.58); }
 QFrame#toast[kind="danger"] { border-color: rgba(255,92,124,0.62); }
 QLabel#toastText { color: #eefaff; font-weight: 700; }
 QPushButton#toastAction { min-height: 28px; background: transparent; border: 0; color: #72f6ec; font-weight: 850; padding: 5px 8px; }
+
+QFrame#assistantHelpCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(8,48,61,0.96),stop:1 rgba(27,23,73,0.94)); border: 1px solid rgba(35,245,224,0.34); border-radius: 18px; }
+QFrame#assistantBubble { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(7,30,54,0.99),stop:1 rgba(18,26,67,0.99)); border: 2px solid rgba(64,240,226,0.78); border-radius: 20px; }
+QScrollArea#assistantBubbleTextScroll, QScrollArea#assistantBubbleTextScroll > QWidget, QScrollArea#assistantBubbleTextScroll > QWidget > QWidget { background: transparent; border: 0; }
+QLabel#assistantBubbleText { color: #f4fbff; font-size: 14px; font-weight: 650; line-height: 1.5; padding: 2px; }
+QPushButton#assistantBubbleButton { min-height: 30px; padding: 5px 11px; color: #dffcff; background: rgba(10,60,78,0.88); border: 1px solid rgba(54,211,255,0.42); border-radius: 9px; font-size: 11px; font-weight: 800; }
+QPushButton#assistantBubbleButton:hover { color: #031422; background: #58f5e7; border-color: #dffffc; }
+QFrame#assistantToggleOption { background: rgba(5,22,42,0.82); border: 1px solid rgba(54,211,255,0.18); border-radius: 12px; }
+QFrame#assistantToggleOption:hover { border-color: rgba(35,245,224,0.48); background: rgba(9,38,58,0.92); }
+QFrame#assistantPreferenceOption { background: rgba(4,22,40,0.62); border: 1px solid rgba(54,211,255,0.2); border-radius: 11px; }
+QFrame#assistantPreferenceOption:hover { border-color: rgba(35,245,224,0.48); background: rgba(8,42,57,0.82); }
 
 QScrollBar:vertical { background: rgba(5,15,30,0.72); width: 10px; margin: 2px; border-radius: 5px; }
 QScrollBar::handle:vertical { background: #27516d; border-radius: 5px; min-height: 36px; }
