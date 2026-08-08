@@ -33,7 +33,7 @@ DEFAULT_TUN_ALIAS = "UAC-Spoofer"
 SOCKS_HOST = "127.0.0.1"
 SOCKS_PORT = 20808
 GATEWAY_DNS_RESOLVER = "1.1.1.1"
-GATEWAY_TCP_MSS = 1280
+GATEWAY_TCP_MSS = 1360
 GATEWAY_DEVICE_TTL = 45.0
 GATEWAY_FORWARDER_TIMEOUT = 6.0
 GATEWAY_SOCKS_HEALTH_INTERVAL = 10.0
@@ -1256,7 +1256,9 @@ class GatewayManager:
         self.arp = arp or ScapyArpBackend()
         self.forwarder = forwarder or ForwardPathHelper(
             log=self.log,
-            rewrite_dns=False,
+            block_quic=False,
+            rewrite_dns=True,
+
         )
         self.poll_interval = max(0.05, float(poll_interval))
         self.discovery_interval = max(self.poll_interval, float(discovery_interval))
@@ -1484,6 +1486,7 @@ class GatewayManager:
 
     def _emit_state(self, name: str, detail: str = "") -> None:
         self.state_changed(name, len(self.devices), detail)
+        
     @staticmethod
     def _should_use_arp_spoofing(lan: LanAdapter) -> bool:
         identity = f"{lan.alias} {lan.description}".casefold()
@@ -1636,8 +1639,9 @@ class GatewayManager:
                 check_cancelled()
                 self.windows.apply(state)
                 check_cancelled()
-                if arp_spoofing: #apr spoofing mode enabled, start responder
+                if arp_spoofing:
                     self.log("MOBILE GATEWAY ARP responder starting")
+
                     start_responder = getattr(
                         self.arp,
                         "start_responder",
@@ -1661,8 +1665,6 @@ class GatewayManager:
                         repeat=3,
                     )
 
-                check_cancelled()
-                self._call(self.arp.redirect, state, devices, repeat=3)
                 check_cancelled()
                 state["status"] = "active"
                 self._write_state(state)

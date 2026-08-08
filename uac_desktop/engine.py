@@ -1002,10 +1002,37 @@ def build_singbox_tun_config(
         if normalized not in networks:
             networks.append(normalized)
     source_scope = {"source_ip_cidr": networks} if networks else {}
-    direct_rules.extend([
-        {**source_scope, "port": 53, "action": "hijack-dns"},
-        {"network": "icmp", "action": "route", "outbound": "direct"},
-    ])
+
+    direct_rules.append({
+        **source_scope,
+        "port": 53,
+        "action": "hijack-dns",
+    })
+
+    if networks:
+
+        direct_rules.append({
+            "source_ip_cidr": networks,
+            "network": "udp",
+            "port": 443,
+            "action": "reject",
+            "method": "default",
+            "no_drop": True,
+        })
+
+        direct_rules.append({
+            "source_ip_cidr": networks,
+            "network": "icmp",
+            "action": "reject",
+            "method": "default",
+            "no_drop": True,
+        })
+    else:
+        direct_rules.append({
+            "network": "icmp",
+            "action": "route",
+            "outbound": "direct",
+        })
     processes = []
     protected = {"sing-box.exe", os.path.basename(sys.executable).lower()}
     for value in bypass_processes or []:
