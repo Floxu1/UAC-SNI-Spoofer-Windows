@@ -1037,7 +1037,15 @@ def build_singbox_tun_config(
             "action": "route",
             "outbound": "direct",
         })
-    direct_outbound = {"type": "direct", "tag": "direct"}
+    direct_outbound = {
+        "type": "direct",
+        "tag": "direct",
+    }
+
+    physical_interface = str(gateway_interface or "").strip()
+
+    if networks and physical_interface:
+        direct_outbound["bind_interface"] = physical_interface
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {

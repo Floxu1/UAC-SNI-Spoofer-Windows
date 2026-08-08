@@ -905,7 +905,7 @@ class ForwardPathHelper:
         network = ipaddress.ip_network(f"{lan.address}/{lan.prefix}", strict=False)
         with self._lock:
             self._lan = lan
-            self._network = network
+            self._network = network  # type: ignore[assignment]
             self._devices = {
                 str(ipaddress.IPv4Address(address))
                 for address in dict(devices or {})
@@ -1025,6 +1025,7 @@ class ForwardPathHelper:
         handle: Any | None = None
         try:
             handle = self._new_handle()
+            assert handle is not None
             handle.open()
             with self._lock:
                 if stop_event.is_set():
@@ -1483,7 +1484,19 @@ class GatewayManager:
 
     def _emit_state(self, name: str, detail: str = "") -> None:
         self.state_changed(name, len(self.devices), detail)
+    @staticmethod
+    def _should_use_arp_spoofing(lan: LanAdapter) -> bool:
+        identity = f"{lan.alias} {lan.description}".casefold()
 
+        wireless_markers = (
+            "wi-fi",
+            "wifi",
+            "wireless",
+            "wlan",
+            "802.11",
+        )
+
+        return any(marker in identity for marker in wireless_markers)
     def start(
         self,
         engine: Any | None = None,
@@ -1519,6 +1532,20 @@ class GatewayManager:
             state: dict[str, Any] | None = None
             try:
                 lan = self.windows.detect_lan({tun_alias})
+
+                arp_spoofing = self._should_use_arp_spoofing(lan)
+
+                gateway_mode = (
+                    "arp-spoof"
+                    if arp_spoofing
+                    else "router-gateway"
+                )
+
+                self.log(
+                    f"MOBILE GATEWAY mode={gateway_mode} "
+                    f"interface={lan.alias}"
+                )
+
                 check_cancelled()
                 tun = None
                 tun_error: Exception | None = None
@@ -1576,6 +1603,7 @@ class GatewayManager:
                     "owner": owner,
                     "started_at": time.time(),
                     "status": "starting",
+                    "arp_spoofing": arp_spoofing, # apr spoofing mode enabled or not
                     "lan": asdict(lan),
                     "tun": asdict(tun),
                     "tun_runtime": tun_runtime,
@@ -1608,14 +1636,31 @@ class GatewayManager:
                 check_cancelled()
                 self.windows.apply(state)
                 check_cancelled()
-                start_responder = getattr(self.arp, "start_responder", None)
-                if callable(start_responder):
-                    self._call(
-                        start_responder,
-                        state,
-                        device_seen=self._record_device,
-                        device_named=self._record_device_name,
+                if arp_spoofing: #apr spoofing mode enabled, start responder
+                    self.log("MOBILE GATEWAY ARP responder starting")
+                    start_responder = getattr(
+                        self.arp,
+                        "start_responder",
+                        None,
                     )
+
+                    if callable(start_responder):
+                        self._call(
+                            start_responder,
+                            state,
+                            device_seen=self._record_device,
+                            device_named=self._record_device_name,
+                        )
+
+                    check_cancelled()
+
+                    self._call(
+                        self.arp.redirect,
+                        state,
+                        devices,
+                        repeat=3,
+                    )
+
                 check_cancelled()
                 self._call(self.arp.redirect, state, devices, repeat=3)
                 check_cancelled()
@@ -1773,17 +1818,22 @@ class GatewayManager:
             if changed:
                 state["devices"] = devices
                 self._write_state(state)
-        if changed:
+        if changed:  #changed devices, update forwarder and emit state
             self.forwarder.set_devices(devices)
-            try:
-                self._call(
-                    self.arp.redirect,
-                    state,
-                    {key: mac},
-                    repeat=2,
-                )
-            except Exception as exc:
-                self.log(f"MOBILE GATEWAY device redirect retry: {exc}")
+
+            if bool(state.get("arp_spoofing", True)):
+                try:
+                    self._call(
+                        self.arp.redirect,
+                        state,
+                        {key: mac},
+                        repeat=2,
+                    )
+                except Exception as exc:
+                    self.log(
+                        f"MOBILE GATEWAY device redirect retry: {exc}"
+                    )
+
             self.devices_changed(devices)
             self._emit_state("active")
         return changed
@@ -1909,7 +1959,13 @@ class GatewayManager:
                 or self._token != token
             ):
                 return False
-        self._call(self.arp.redirect, current, devices, repeat=3 if changed else 1)
+        if bool(current.get("arp_spoofing", True)): #if arp spoofing mode enabled, update arp redirect
+            self._call(
+                self.arp.redirect,
+                current,
+                devices,
+                repeat=3 if changed else 1,
+            )
         return True
 
     def _refresh_devices_async(self) -> None:
@@ -1964,11 +2020,24 @@ class GatewayManager:
                     and not self._stopping
                     and not self._stop_event.is_set()
                 )
-            if state and devices and active:
+                #if apr zan jende period shod 
+            if ( 
+                state
+                and devices
+                and active
+                and bool(state.get("arp_spoofing", True)) 
+            ):
                 try:
-                    self._call(self.arp.redirect, state, devices, repeat=1)
+                    self._call(
+                        self.arp.redirect,
+                        state,
+                        devices,
+                        repeat=1,
+                    )
                 except Exception as exc:
-                    self.log(f"MOBILE GATEWAY ARP retry: {exc}")
+                    self.log(
+                        f"MOBILE GATEWAY ARP retry: {exc}"
+                    )
 
     def _restore_state(
         self,
@@ -1986,11 +2055,16 @@ class GatewayManager:
             self.forwarder.stop()
         except Exception as exc:
             self.log(f"MOBILE GATEWAY forwarding filter cleanup: {exc}")
-        if include_arp:
+        if (
+            include_arp
+            and bool(state.get("arp_spoofing", True))
+        ):
             try:
                 self.arp.restore(state)
             except Exception as exc:
-                self.log(f"MOBILE GATEWAY ARP restore skipped: {exc}")
+                self.log(
+            f"MOBILE GATEWAY ARP restore skipped: {exc}"
+        )
         try:
             self.windows.restore(state)
         except Exception as exc:
