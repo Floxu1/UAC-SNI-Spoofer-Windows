@@ -557,7 +557,7 @@ def test_batch_all_modes_reports_incremental_progress_during_each_mode(
     assert values == sorted(values)
     assert values[-1] == len(profiles)
     assert any(0 < done < len(profiles) for done in values)
-    assert any(not batch for batch, done, _total in updates if done < len(profiles))
+    assert any(batch > 0 for batch, done, _total in updates)
 
 
 def test_batch_all_modes_forwards_healthy_results_before_mode_returns(

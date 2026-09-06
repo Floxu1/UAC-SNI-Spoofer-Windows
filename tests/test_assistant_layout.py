@@ -739,7 +739,7 @@ def test_long_message_is_fully_scrollable_without_text_clipping(qapp):
         "در پایین حباب بریده نشود. برای دیدن ادامه‌ی راهنما، متن را اسکرول کن. "
     ) * 18
     bubble.set_message(long_message, False, False, False, True)
-    bubble.resize(bubble.measure_for(QSize(900, 460)))
+    bubble.resize(bubble.measure_for(QSize(360, 220)))
     bubble.show()
     _process_events(qapp, 30)
 

@@ -5,6 +5,19 @@ import pytest
 from tools import prepare_github_release as release
 
 
+def test_release_source_bundle_includes_license_and_suggested_configs():
+    source = Path(__file__).resolve().parents[1]
+    script = (source / "tools" / "prepare_github_release.py").read_text(encoding="utf-8")
+    assert (source / "LICENSE").is_file()
+    assert (source / "NOTICE").is_file()
+    assert (source / "configs.txt").is_file()
+    assert (source / "configs.examples.txt").is_file()
+    assert '"LICENSE"' in script
+    assert '"NOTICE"' in script
+    assert '"configs.txt"' in script
+    assert "UAC-Spoofer-GPL-3.0.txt" in script
+
+
 def test_release_runtime_manifest_covers_tun_assets():
     assert set(release.PORTABLE_RUNTIME_FILES) == {
         Path("UAC-Spoofer-Desktop.exe"),

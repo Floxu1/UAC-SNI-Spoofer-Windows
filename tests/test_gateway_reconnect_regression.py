@@ -54,6 +54,7 @@ def test_gateway_tun_keeps_xray_loopback_hop_off_the_physical_binding():
     assert outbounds["direct"] == {
         "type": "direct",
         "tag": "direct",
+        "bind_interface": "Ethernet",
     }
 
 
