@@ -71,9 +71,9 @@ target="_blank">
 
 مراحل اجرا:
 
-1. فایل زیر را از بخش GitHub Releases دانلود کنید:
-<a href="https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/download/1.0.9/UAC-Spoofer-Desktop-v1.0.8-Windows-x64-portable.zip" target="_blank">
-UAC-Spoofer-Desktop-v1.0.8-Windows-x64-portable.zip
+1. آخرین فایل Portable را از بخش GitHub Releases دانلود کنید:
+<a href="https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest" target="_blank">
+UAC-Spoofer-Desktop-v1.1.1-Windows-x64-portable.zip
 </a>
 
 
@@ -91,7 +91,7 @@ target="_blank">
 </a>
 
 5. در صورت نمایش پیام UAC ویندوز، آن را تأیید کنید.
-ا
+
 برای اجرای نسخه Portable نیازی به نصب Python نیست.
 
 ## اجرای نسخه سورس

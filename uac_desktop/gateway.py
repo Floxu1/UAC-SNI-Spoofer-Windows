@@ -685,18 +685,21 @@ class ScapyArpBackend:
         if not pc_mac:
             raise GatewayError("LAN capture MAC is missing")
 
-        # Keep the original interface name whenever it works.
-        # Only the ARP/DHCP responder gets an Npcap fallback.
+        # keep the original interface name whenever it works.
+        # only the ARP/DHCP responder gets an Npcap fallback.
+        conf = api.get("conf")
         try:
-            api["conf"].ifaces.dev_from_name(responder_iface)
-
-        except ValueError:
+            if conf is None:
+                raise ValueError("scapy conf is unavailable")
+            conf.ifaces.dev_from_name(responder_iface)
+        except (ValueError, AttributeError, TypeError, KeyError):
             try:
-                api["conf"].ifaces.reload()
+                if conf is not None:
+                    conf.ifaces.reload()
             except Exception:
                 pass
 
-            for interface in api["conf"].ifaces.values():
+            for interface in getattr(getattr(conf, "ifaces", None), "values", lambda: ())():
                 try:
                     ipv4_addresses = list(
                         getattr(interface, "ips", {}).get(4, [])

@@ -111,13 +111,14 @@ def test_singbox_gateway_mode_only_proxies_gateway_source_network():
         "port": 53,
         "action": "hijack-dns",
     } in rules
-    assert not any(
-        rule.get("source_ip_cidr") == network
-        and rule.get("network") == "udp"
-        and rule.get("port") == 443
-        and rule.get("action") == "reject"
-        for rule in rules
-    )
+    assert {
+        "source_ip_cidr": network,
+        "network": "udp",
+        "port": 443,
+        "action": "reject",
+        "method": "default",
+        "no_drop": True,
+    } in rules
     assert config["dns"]["rules"] == [{
         "domain_regex": [
             r"(?i)\.(?:instagram\.com|facebook\.com|"
@@ -148,7 +149,11 @@ def test_singbox_gateway_mode_only_proxies_gateway_source_network():
         outbound for outbound in config["outbounds"]
         if outbound["tag"] == "direct"
     )
-    assert direct == {"type": "direct", "tag": "direct"}
+    assert direct == {
+        "type": "direct",
+        "tag": "direct",
+        "bind_interface": "Wi-Fi",
+    }
 
 
 def test_gateway_lease_restores_runtime_tun_and_proxy_without_stopping_engine():

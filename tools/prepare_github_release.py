@@ -138,7 +138,11 @@ def main() -> None:
         "main.py",
         "README.md",
         "README.en.md",
+        "LICENSE",
+        "NOTICE",
         "requirements.txt",
+        "configs.txt",
+        "configs.examples.txt",
         "build.ps1",
         "install-engine.ps1",
         "run.ps1",
@@ -163,6 +167,8 @@ def main() -> None:
     copy_item(ROOT / "requirements.txt", STAGE / "requirements.txt")
     licenses = STAGE / "LICENSES"
     licenses.mkdir()
+    copy_item(ROOT / "LICENSE", licenses / "UAC-Spoofer-GPL-3.0.txt")
+    copy_item(ROOT / "NOTICE", licenses / "NOTICE.txt")
     copy_item(
         ROOT / "third_party" / "patterniha_sni_spoofing" / "LICENSE",
         licenses / "Patterniha-GPL-3.0.txt",
@@ -212,6 +218,8 @@ def main() -> None:
             "normal", "thinking", "waiting", "happy", "sad", "guiding_right", "confused", "surprised"
         ), start=1)),
         OUT / "README.md",
+        OUT / "LICENSES" / "UAC-Spoofer-GPL-3.0.txt",
+        OUT / "LICENSES" / "NOTICE.txt",
         OUT / "LICENSES" / "sing-box-LICENSE.txt",
         portable_zip,
         source_zip,

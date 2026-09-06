@@ -235,14 +235,14 @@ def configured_forwarder(**kwargs):
     return helper
 
 
-def test_gateway_default_forwarder_leaves_dns_to_singbox(
+def test_gateway_default_forwarder_rewrites_lan_dns(
         tmp_path):
     manager = GatewayManager(
         state_file=tmp_path / "gateway.json",
         watchdog_launcher=lambda _state: None,
     )
 
-    assert manager.forwarder.rewrite_dns is False
+    assert manager.forwarder.rewrite_dns is True
 
 
 def test_start_stop_round_trip_is_idempotent(tmp_path):

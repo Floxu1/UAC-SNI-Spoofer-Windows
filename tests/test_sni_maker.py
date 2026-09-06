@@ -430,7 +430,9 @@ def test_file_and_github_blob_url_import(tmp_path):
         "https://raw.githubusercontent.com/Delta-Kronecker/Sub/"
         "refs/heads/main/config/sni/all_configs_sni.txt"
     )
-    assert maker_module.DEFAULT_REPOSITORY_URL == "https://mifa.world/vless"
+    assert maker_module.DEFAULT_REPOSITORY_URL == (
+        "https://gitverse.ru/api/repos/flaafix/AetrisVPN_Black_list/raw/branch/master/configs.txt"
+    )
     assert session.calls[0][0] == normalize_repository_url(blob_url)
     assert session.calls[0][1]["headers"]["If-None-Match"] == '"old"'
     assert url_result.added_count == 1

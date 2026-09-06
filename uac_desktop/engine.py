@@ -21,7 +21,7 @@ import requests
 
 from . import __version__
 from .gateway import GatewayManager
-from .npcap import npcap_available
+from .npcap import ensure_npcap
 from .models import ProxyProfile, Tuning, parse_outbound
 from .pattern_core import PatternSniCore
 from .paths import (BIN, DATA_DIR, SING_BOX_CONFIG, SING_BOX_OWNER_FILE,
@@ -476,6 +476,8 @@ class WindowsProxy:
                 if int(info.get("pid", -1)) == current_pid:
                     continue
                 command = [str(value) for value in (info.get("cmdline") or [])]
+                if "--proxy-watchdog" in command:
+                    continue
                 name = str(info.get("name") or "").lower()
                 if frozen_name and name == frozen_name:
                     return True
@@ -488,6 +490,35 @@ class WindowsProxy:
             except (psutil.Error, OSError, TypeError, ValueError):
                 continue
         return False
+
+    @staticmethod
+    def _launch_watchdog(owner: dict[str, object]) -> None:
+        args = ["--proxy-watchdog", str(owner["pid"]),
+                repr(float(owner["create_time"])), str(owner["token"])]
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, *args]
+        else:
+            entrypoint = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "main.py"))
+            command = [sys.executable, entrypoint, *args]
+        kwargs: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "close_fds": True,
+        }
+        if getattr(sys, "frozen", False):
+            environment = os.environ.copy()
+            environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            kwargs["env"] = environment
+        if sys.platform == "win32":
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                | 0x00000008
+            )
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(command, **kwargs)
 
     def enable(self, bypass: str = "<local>;localhost;127.*") -> None:
         with _proxy_state_guard():
@@ -572,7 +603,7 @@ class WindowsProxy:
         self._previous = state
         self._state_token = token
         try:
-
+            self._launch_watchdog(owner)
             self._write_app_proxy_values(bypass, enabled)
             self._refresh()
         except BaseException:
@@ -691,7 +722,38 @@ class WindowsProxy:
         helper._state_token = str(owner.get("token", "")) if isinstance(owner, dict) else ""
         return bool(helper.disable())
 
-
+    @classmethod
+    def run_watchdog(cls, parent_pid: int, parent_create_time: float, token: str,
+                     poll_interval: float = 0.25) -> int:
+        """wait outside the GUI process and restore only the matching snapshot."""
+        expected_owner = {
+            "pid": int(parent_pid), "create_time": float(parent_create_time), "token": token,
+        }
+        while cls._owner_is_alive(expected_owner):
+            state = cls._load_state()
+            if state is None:
+                return 0
+            if not cls._owner_matches(state.get("owner", {}), parent_pid,
+                                      parent_create_time, token):
+                return 0
+            time.sleep(max(0.02, float(poll_interval)))
+        delay = max(0.05, float(poll_interval))
+        for _attempt in range(20):
+            state = cls._load_state()
+            if state is None:
+                return 0
+            if not cls._owner_matches(state.get("owner", {}), parent_pid,
+                                      parent_create_time, token):
+                return 0
+            try:
+                if cls.recover_stale(expected_pid=parent_pid,
+                                     expected_create_time=parent_create_time,
+                                     expected_token=token):
+                    return 0
+            except Exception:
+                pass
+            time.sleep(delay)
+        return 1
 
     @staticmethod
     def _refresh() -> None:
@@ -1972,16 +2034,15 @@ class Engine:
                 raise RuntimeError("Cannot enable Mobile Gateway before the engine is running")
             run_id = self._run_id
 
+        npcap_result = ensure_npcap()
+
         self._check_cancel(cancel_event)
 
-        if not npcap_available():
+        if not npcap_result.available:
             raise RuntimeError(
-                "Mobile Gateway requires Npcap. "
-                "Install Npcap first, make sure its service is running, "
-                "then restart UAC Spoofer."
+                "Npcap setup was not completed. "
+                f"Details: {npcap_result.detail}"
             )
-
-        self._check_cancel(cancel_event)
 
         self.gateway.start(
             engine=self,
