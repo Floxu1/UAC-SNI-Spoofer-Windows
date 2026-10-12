@@ -1,131 +1,188 @@
-# UAC SNI Spoofer Windows
+<div align="center">
 
-## Language / زبان
+<img src="assets/icon.png" width="112" alt="UAC SNI Spoofer icon">
 
-[فارسی](./README.md) | **English**
+# UAC SNI Spoofer — Windows
+
+**A one-click Windows network dashboard: Xray + Patterniha SNI spoofing, and a second Psiphon-over-WARP engine.**
+
+[![Version](https://img.shields.io/badge/version-1.1.1-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](#download--quick-start)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Floxu1/UAC-SNI-Spoofer-Windows?style=flat-square&label=latest)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Floxu1/UAC-SNI-Spoofer-Windows/total?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
+
+[فارسی](./README.md) · **English** · [Step-by-step guide](https://floxu1.github.io/UAC-SNI-Spoofer-Windows/) · [Telegram](https://t.me/UacSniSpoofer)
+
+<img src="assets/readme/engine1-home.png" width="860" alt="Engine 1 home screen">
+
+</div>
 
 ---
-[کانال تلگرام](https://t.me/UacSniSpoofer): `t.me/UacSniSpoofer`
 
----
+## Table of contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Engine 1 — Xray + SNI spoofing](#engine-1--xray--sni-spoofing)
+- [Engine 2 — UAC PoW (Psiphon over WARP)](#engine-2--uac-pow-psiphon-over-warp)
+- [Download & quick start](#download--quick-start)
+- [Build from source](#build-from-source)
+- [FAQ & troubleshooting](#faq--troubleshooting)
+- [What's new in 1.1.1](#whats-new-in-111)
+- [Credits](#credits)
+- [License](#license)
 
 ## Overview
 
-UAC SNI Spoofer Windows is a Windows network dashboard built around Xray and the Patterniha SNI-spoofing method.
+UAC SNI Spoofer Windows wraps two complete tunnel engines in one bilingual (Persian/English, RTL/LTR) desktop app:
 
-The application manages carrier-specific routes, scans and ranks SNI and Edge pairs, applies the Windows proxy automatically, and restores the previous proxy state when the connection is stopped or the app exits.
+| | Engine 1 — `Xray` | Engine 2 — `UAC PoW` |
+|---|---|---|
+| Core | `Xray` + Patterniha SNI-spoofing core | `aether` (WARP / MASQUE) + `Psiphon` |
+| Needs configs | Yes (built-in suggested list, your own, or SNI Maker) | No |
+| Best for | MCI / IranCell lines with SNI filtering | Lines where configs keep dying |
 
-The desktop profiles are tuned separately for **MCI / Hamrah Aval** and **IranCell**, so changing one carrier does not overwrite or break the other carrier's settings.
-
-<img width="1436" height="925" alt="image" src="https://github.com/user-attachments/assets/c6b8530a-a50f-4002-afb4-726561451b79" />
+Both engines apply the Windows proxy automatically and restore the previous proxy and network state on disconnect, exit, or after a crash.
 
 ## Features
 
-- Separate MCI, IranCell, and Auto carrier modes
-- Xray-based local SOCKS/HTTP tunnel
-- Optional system-wide sing-box TUN mode for Windows TCP and UDP traffic
-- Mobile Gateway for sharing the active connection with devices on the local network
-- Patterniha SNI and Edge scanner with live results
-- MCI TLS startup optimization
-- YouTube route warmup for faster video startup
-- Suggested configuration ranking using real page checks and bounded download tests
-- Persian and English interface with RTL/LTR support
-- App Bypass
-- Live logs
-- Public IP check
-- Advanced tuning for route, SNI, DNS, timeout, and fallback behavior
-- GitHub Releases update checker
-- Safe Windows proxy restore after disconnect, exit, or restart
+**Connection & routing**
+- Separate, isolated profiles for **MCI / Hamrah Aval**, **IranCell** and **Auto**; changing one never overwrites the other.
+- Local `SOCKS`/`HTTP` tunnel, automatic **Windows Proxy** with safe restore.
+- Optional system-wide **TUN mode** (`sing-box`) for TCP + UDP, verified with a real YouTube route before reporting "connected"; `ping` stays direct so CMD shows real latency.
+- **Mobile Gateway** — share the connection with phones on the same LAN, no proxy/static-IP setup on the phone; live device list.
+- **App Bypass** — chosen processes go direct (also translated into `sing-box` rules in TUN mode).
+- **Iranian sites direct** (on by default) — Iranian domains/IPs skip the tunnel; toggle in Tuning.
+- **Mux off by default** (measured to break SNI/ECH ws routes); can still be enabled in Tuning.
 
-## TUN mode
+**Finding a working route**
+- **Quick-start wizard** — detects your carrier and the line's DPI behaviour, then finds and saves working configs for you.
+- **Auto mode with quality pick** — tests the top candidates in parallel and chooses by real page load + throughput, not just ping.
+- **SNI Maker** — fetch a public list (Patterniha's by default), live-test every config through the real tunnel, keep the healthy ones; filter by country.
+- **SNI Lab / batch tester** and carrier-aware **SNI finder** with per-edge rounds of real tunnel tests.
+- **Clean IP finder** — re-tests cached good Cloudflare edges for your carrier, then samples ranges with a real TLS ClientHello.
+- **ECH keys** — fetches and caches ECH configs from several resolvers in parallel (faster than per-dial lookup).
+- **Gene Lab import** — import `strategies.json` into the pattern settings, with a learning multi-gene pool.
 
-`Windows Proxy` remains the default mode. When `TUN Mode` is enabled, the app creates a `UAC-Spoofer` virtual interface with sing-box and sends Windows TCP and UDP traffic through the local Xray SOCKS listener, the Patterniha core, and the active config. The app verifies a real YouTube route through the TUN interface before reporting the connection as active.
+**UI & diagnostics**
+- Public IP card with flag, ISP/ASN, city and time zone (fast multi-source lookup with cache).
+- Active Route card (config, country, edge IP, fake SNI, Spoof/ECH), live download/upload/latency.
+- Readable, grouped **Live Logs** with summary header and connect summary.
+- Simple and pro **Tuning** dialogs (route, SNI, DNS, timeouts, fallback, pattern core).
+- Engine switch guard (asks before disconnecting), one-time coach marks, GitHub Releases update checker.
+- One-time **1.1.1 data reset** — old data is *moved* (never deleted) to `%APPDATA%\UAC Spoofer Desktop.backup-before-1.1.1-<time>` so 1.1.1 starts clean with the wizard.
 
-SOCKS, VLESS, and Trojan do not transport ICMP. Ping requests therefore use a dedicated Direct rule over the physical interface so CMD reports real network latency. Web pages and video traffic continue through the tunnel.
+## Engine 1 — Xray + SNI spoofing
 
-Disabling TUN while connected removes its interface and routes immediately. If Windows Proxy is enabled, that mode is restored automatically. App Bypass process names are also translated into direct sing-box route rules.
+Xray routes traffic through the Patterniha core, which disguises the TLS handshake with a fake SNI toward a clean Cloudflare edge.
 
-## Mobile Gateway
+<table>
+<tr>
+<td width="50%" valign="top" align="center"><img src="assets/readme/engine1-sni-maker.png" alt="SNI Maker"><br><sub>SNI Maker</sub></td>
+<td width="50%" valign="top" align="center"><img src="assets/readme/engine1-sni-lab.png" alt="SNI Lab"><br><sub>SNI Lab</sub></td>
+</tr>
+<tr>
+<td width="50%" valign="top" align="center"><img src="assets/readme/engine1-tuning.png" alt="Tuning"><br><sub>Tuning</sub></td>
+<td width="50%" valign="top" align="center"><img src="assets/readme/wizard.png" alt="Quick-start wizard"><br><sub>Quick-start wizard</sub></td>
+</tr>
+</table>
 
-Enable `Mobile Gateway` on the Home page to automatically discover devices on the same local network and route their traffic through the active UAC Spoofer connection. Mobile phones and other devices can keep their normal DHCP settings without manually configuring a proxy or static IP address.
+## Engine 2 — UAC PoW (Psiphon over WARP)
 
-The badge beside the option shows the number of connected devices. Select it to view each device's IP address and connection state. Disconnecting the VPN, disabling Mobile Gateway, or exiting the application removes the gateway configuration and restores the previous Windows network state.
+No configs needed: `aether` raises a WARP leg (MASQUE / WireGuard ladder with clean-IP scanning) and `Psiphon` runs through it. Pick an exit country or leave it on Auto.
 
-## Carrier support
+<table>
+<tr>
+<td colspan="2" align="center"><img src="assets/readme/engine2-home.png" alt="Engine 2 home"><br><sub>Engine 2 home</sub></td>
+</tr>
+<tr>
+<td width="50%" valign="top" align="center"><img src="assets/readme/engine2-settings.png" alt="PoW settings"><br><sub>PoW settings</sub></td>
+<td width="50%" valign="top" align="center"><img src="assets/readme/engine2-country.png" alt="Exit country"><br><sub>Exit country</sub></td>
+</tr>
+</table>
 
-This application is tuned for the following carriers:
+Options include Psiphon-over-WARP (default), HTTP/2 fragment, parallel MASQUE sessions, low-RTT IP pick and direct-Psiphon-first.
 
-- MCI / Hamrah Aval
-- IranCell
+## Download & quick start
 
-In `mci` mode, the app uses the independent MCI profile. In `irancell` mode, it uses the independent IranCell profile. For the most stable result, select your current carrier manually.
+1. Download `UAC-Spoofer-Desktop-v1.1.1-Windows-x64-portable.zip` from **[Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** (verify with `SHA256SUMS.txt`).
+2. Extract the whole ZIP; keep the `_internal` folder next to the exe.
+3. Run `UAC-Spoofer-Desktop.exe` and accept the UAC prompt (admin is needed for the spoofing driver, TUN and gateway).
+4. Follow the quick-start wizard, then press **Connect**.
 
-## Portable version
+No Python install is required. Full illustrated guide: **[floxu1.github.io/UAC-SNI-Spoofer-Windows](https://floxu1.github.io/UAC-SNI-Spoofer-Windows/)**.
 
-The portable version is prepared for users who do not want to install Python or extra dependencies.
+## Build from source
 
-How to run:
-
-1. Download the following file from GitHub Releases:
-
-```text
-UAC-Spoofer-Desktop-v1.0.8-Windows-x64-portable.zip
-```
-
-2. Extract the full ZIP archive.
-3. Keep the `_internal` folder beside the executable file.
-4. Run:
-
-```text
-UAC-Spoofer-Desktop.exe
-```
-
-5. Accept the Windows UAC prompt if it appears.
-
-Python is not required for the portable build.
-
-## Run from source
-
-Requirements:
-
-- Windows 10/11 x64
-- Python 3.11 or 3.12
-
-Run:
+**Requirements:** Windows 10/11 x64 · Python 3.11/3.12 · `git` · Go 1.26+ · Rust 1.88+ (`cargo`) with `cmake` and `NASM` (for `boring-sys`).
 
 ```powershell
-python -m pip install -r requirements.txt
-powershell -ExecutionPolicy Bypass -File .\install-engine.ps1
-python main.py
+git clone https://github.com/Floxu1/UAC-SNI-Spoofer-Windows.git
+cd UAC-SNI-Spoofer-Windows
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+# -> dist\UAC-Spoofer-Desktop\UAC-Spoofer-Desktop.exe
 ```
 
-## Carrier mode
+`build.ps1` installs `requirements.txt`, runs `install-engine.ps1`, then PyInstaller. `install-engine.ps1` fills `bin\` idempotently:
 
-The application includes multiple carrier modes:
+| File | Source |
+|---|---|
+| `xray.exe`, `geoip.dat`, `geosite.dat` | Xray-core `26.3.27` release, SHA-256 pinned |
+| `sing-box.exe`, `libcronet.dll` | sing-box `1.13.14` release, SHA-256 pinned |
+| `uac-psiphon.exe` | `go build` of `pow_helper/` (Psiphon tunnel-core, pinned by `go.sum`) |
+| `aether.exe` | `cargo build` of `core/aether` from [UAC-SNI-Spoofer-Android](https://github.com/Floxu1/UAC-SNI-Spoofer-Android) at a pinned commit (or `UAC_AETHER_SRC`) |
 
-- `mci`: independent MCI / Hamrah Aval route, SNI, Edge, benchmarks, and tuning
-- `irancell`: independent IranCell route and tuning
-- `auto`: app-managed automatic profile
+Run from source without packaging: `python -m pip install -r requirements.txt`, `.\install-engine.ps1`, `python main.py`.
 
-For the most stable and deterministic result, select your current carrier manually.
+## FAQ & troubleshooting
 
+<details><summary><b>It doesn't connect on Engine 1.</b></summary>
+
+Run the quick-start wizard again, select your carrier manually, and try **Auto**. Use SNI Maker or Clean IP to refresh routes. If configs keep dying, try Engine 2.
+</details>
+
+<details><summary><b>Which proxy mode should I use?</b></summary>
+
+`Windows Proxy` covers browsers and most apps. Use `TUN` for games and apps that ignore the system proxy.
+</details>
+
+<details><summary><b>Ping in CMD shows my real latency — is the tunnel off?</b></summary>
+
+No. ICMP can't travel over SOCKS/VLESS/Trojan, so `ping` is routed direct on purpose.
+</details>
+
+<details><summary><b>My old settings disappeared after updating to 1.1.1.</b></summary>
+
+That is the one-time 1.1.1 reset. Everything was moved to `%APPDATA%\UAC Spoofer Desktop.backup-before-1.1.1-<time>`; nothing was deleted. It never runs again.
+</details>
+
+<details><summary><b>The internet is broken after a crash.</b></summary>
+
+Start the app once and exit: it restores the saved Windows proxy and gateway state automatically.
+</details>
+
+## What's new in 1.1.1
+
+- Engine 2 **UAC PoW** (Psiphon over WARP) with its own settings, exit-country picker and speed options.
+- Quick-start wizard, coach marks and a full illustrated guide site.
+- Auto mode now picks by real quality (page load + throughput) among parallel-tested candidates.
+- Iranian sites go direct by default; Mux off by default.
+- Faster public-IP lookup (multi-source, cached).
+- Clean IP finder, ECH key cache, SNI finder, Gene Lab import.
+- One-time data reset for a clean start (old data moved to a backup folder).
+- A fresh clone now builds everything (`aether`, `uac-psiphon` included) with `build.ps1`.
 
 ## Credits
 
-Special thanks to the **Patterniha** group for inventing and introducing this SNI-spoofing method.
+- Special thanks to the **Patterniha** group for inventing and introducing this SNI-spoofing method. Upstream source and its GPL-3.0 license: `third_party/patterniha_sni_spoofing/`.
+- [**Xray-core**](https://github.com/XTLS/Xray-core) — tunnel core.
+- [**sing-box**](https://github.com/SagerNet/sing-box) `v1.13.14` by SagerNet — optional TUN mode; license shipped as `bin/sing-box-LICENSE`.
+- [**Psiphon tunnel-core**](https://github.com/Psiphon-Labs/psiphon-tunnel-core) — inner hop of Engine 2 (`pow_helper/`).
+- **aether** — WARP/MASQUE client from [UAC-SNI-Spoofer-Android](https://github.com/Floxu1/UAC-SNI-Spoofer-Android), licensed AGPL-3.0-only.
 
-**sing-box v1.13.14** is bundled for optional TUN mode, with its license included as `bin/sing-box-LICENSE`.
-
-The integrated upstream source and GPL-3.0 license are included under:
-
-```text
-third_party/patterniha_sni_spoofing/
-```
----
 ## License
 
-This project is released under the **GNU General Public License v3.0 (GPL-3.0)**.
+Released under the **GNU General Public License v3.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE). You may use, study and modify the software; distributed modified versions must stay GPL-3.0 and provide source. Do not remove Patterniha credits from this project or derivative distributions.
 
-You may use, study, and modify the software, but if you distribute modified or derivative versions, you must comply with GPL-3.0, provide access to the source code, and keep the same license terms.
-
-The full license text is available in [LICENSE](LICENSE).
+<div align="center"><sub>Copyright © 2026 Floxu1</sub></div>
