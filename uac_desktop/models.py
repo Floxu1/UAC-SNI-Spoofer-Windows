@@ -22,13 +22,17 @@ MCI_PROTECTED_FALLBACK_EDGES = ",".join(MCI_PROTECTED_FALLBACK_EDGE_LIST)
 MCI_PROTECTED_FAKE_SNI = "www.speedtest.net"
 MCI_PROTECTED_FAKE_REPEAT = 1
 MCI_PROTECTED_INJECT_DELAY_MS = 0
-MCI_PROTECTED_ROUTE_STRATEGY = "plain"
-MCI_PROTECTED_ROUTE_PLANS = tuple(
-    (MCI_PROTECTED_ROUTE_STRATEGY, edge)
-    for edge in (
-        MCI_PROTECTED_PRIMARY_EDGE,
-        *MCI_PROTECTED_FALLBACK_EDGE_LIST,
-    )
+# Updated MCI DPI reads a single ClientHello. Try the Patterniha hybrid first
+# (allowed Fake SNI plus a 5-byte TLS split), then the other MCI-only methods
+# and edges. IranCell does not use this list.
+MCI_PROTECTED_ROUTE_STRATEGY = "full5"
+MCI_PROTECTED_ROUTE_PLANS = (
+    ("full5", MCI_PROTECTED_PRIMARY_EDGE),
+    ("wrong_seq", MCI_PROTECTED_PRIMARY_EDGE),
+    ("tls_sni_records", MCI_PROTECTED_PRIMARY_EDGE),
+    ("full5", MCI_PROTECTED_FALLBACK_EDGE_LIST[0]),
+    ("tls_sni_records", MCI_PROTECTED_FALLBACK_EDGE_LIST[0]),
+    ("plain", MCI_PROTECTED_PRIMARY_EDGE),
 )
 
 
@@ -71,6 +75,9 @@ class ProxyProfile:
     country_source: str = ""
     route_mode: str = "sni"
     verified_route: bool = False
+    # SNI finder tags (carrier, network, edge, fake_sni, method, tested_at,
+    # score, fail_streak, demoted). Empty for every other profile.
+    maker_meta: dict = field(default_factory=dict)
 
     @property
     def target_label(self) -> str:
@@ -108,6 +115,8 @@ class ProxyProfile:
                 }
                 if query.get("security", "").lower() == "reality":
                     clean["route_mode"] = "reality-direct"
+                elif query.get("ech") or query.get("echcl"):
+                    clean["route_mode"] = "ech-direct"
             except (TypeError, ValueError):
                 pass
         return cls(**clean)
@@ -135,8 +144,10 @@ class Tuning:
 
 
 
-    xray_mux_enabled: bool = True
+    xray_mux_enabled: bool = False
     xray_mux_concurrency: int = 8
+    # Iranian sites (geosite:category-ir, .ir, geoip:ir, private) bypass the tunnel.
+    iran_direct: bool = True
 
     background_quality_probe_enabled: bool = False
     background_quality_probe_delay_s: int = 30
@@ -146,6 +157,15 @@ class Tuning:
     pattern_connect_ip: str = "104.18.32.47"
     pattern_fallback_ips: str = "172.64.155.209"
     pattern_use_profile_edges: bool = False
+    # Runtime-only: comma list of a Gene Lab strategy's own working edges,
+    # tried before the normal edge list. Never persisted (Storage clears it).
+    pattern_gene_edges: str = ""
+    # Runtime-only: clean edge IPs found by the auto clean-IP finder (never persisted).
+    pattern_clean_edges: str = ""
+    # Runtime-only: IP chosen with "Use this IP" (Full scan); tried before everything.
+    pattern_session_edge: str = ""
+    # JSON list of Gene Lab primitive ops (empty = unused)
+    pattern_gene_ops: str = ""
     pattern_fake_sni: str = "chatgpt.com"
     pattern_fake_repeat: int = 1
     pattern_inject_delay_ms: int = 1
@@ -349,6 +369,8 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
                                route_mode=(
                                    "reality-direct"
                                    if query.get("security", "").lower() == "reality"
+                                   else "ech-direct"
+                                   if (query.get("ech") or query.get("echcl"))
                                    else "sni"
                                ))
         match = SPOOF_META_RE.fullmatch(fragment)
@@ -457,4 +479,38 @@ def parse_outbound(profile: ProxyProfile) -> dict:
         "header_type": query.get("headertype") or "none",
         "alpn": alpn,
         "insecure": insecure,
+        "ech": query.get("ech") or query.get("echcl") or query.get("echconfiglist") or "",
     }
+
+
+DIRECT_ROUTE_MODES = ("reality-direct", "ech-direct")
+
+
+def uri_has_ech(uri) -> bool:
+    try:
+        query = {
+            str(key).lower(): str(value)
+            for key, value in urllib.parse.parse_qsl(
+                urllib.parse.urlsplit(str(uri or "")).query, keep_blank_values=True)
+        }
+    except (TypeError, ValueError):
+        return False
+    return bool(query.get("ech") or query.get("echcl") or query.get("echconfiglist"))
+
+
+def is_ech_route(profile) -> bool:
+    return (str(getattr(profile, "route_mode", "") or "") == "ech-direct"
+            or (str(getattr(profile, "route_mode", "") or "") != "reality-direct"
+                and uri_has_ech(getattr(profile, "source_uri", ""))))
+
+
+def is_direct_route(profile) -> bool:
+    """Reality and ECH configs dial the server directly (no fake-SNI spoof)."""
+    return (str(getattr(profile, "route_mode", "") or "") in DIRECT_ROUTE_MODES
+            or is_ech_route(profile))
+
+
+def route_label(profile) -> str:
+    if str(getattr(profile, "route_mode", "") or "") == "reality-direct":
+        return "Reality"
+    return "ECH" if is_ech_route(profile) else "SNI"

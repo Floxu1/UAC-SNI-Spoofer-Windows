@@ -1402,10 +1402,15 @@ class GatewayManager:
         self._socks_health_ok = ready
         return ready
 
-    @staticmethod
-    def _socks_ready() -> bool:
+    def _socks_ready(self) -> bool:
+        engine = getattr(self, "engine", None)
+        port = getattr(engine, "socks_port", SOCKS_PORT)
         try:
-            with socket.create_connection((SOCKS_HOST, SOCKS_PORT), timeout=0.8) as connection:
+            port = int(port)
+        except (TypeError, ValueError):
+            port = SOCKS_PORT
+        try:
+            with socket.create_connection((SOCKS_HOST, port), timeout=0.8) as connection:
                 connection.settimeout(0.8)
                 connection.sendall(b"\x05\x01\x00")
                 return connection.recv(2) == b"\x05\x00"

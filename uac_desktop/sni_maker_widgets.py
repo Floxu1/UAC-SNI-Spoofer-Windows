@@ -143,7 +143,7 @@ def _country_badge_icon_cached(code: str, width: int, height: int) -> QIcon:
             gradient.setColorAt(0.0, QColor.fromHsv(hue, 165, 185))
             gradient.setColorAt(1.0, QColor.fromHsv((hue + 34) % 360, 205, 104))
             painter.fillPath(path, gradient)
-            font = QFont("Segoe UI", max(7, int(height * 0.43)), QFont.Weight.DemiBold)
+            font = QFont("Inter", max(7, int(height * 0.43)), QFont.Weight.Medium)
             painter.setFont(font); painter.setPen(QColor("#ffffff"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, normalized)
         painter.setClipping(False)
@@ -247,6 +247,34 @@ class MakerResult:
         return dataclasses.asdict(self)
 
 
+def _uri_is_ech(uri: str) -> bool:
+    lowered = str(uri or "").lower()
+    return "ech=" in lowered and ("&ech=" in lowered or "?ech=" in lowered or "echcl=" in lowered)
+
+
+_ECH_ICON = None
+
+
+def _ech_badge_icon():
+    """Small 'ECH' pill shown before the config in the results table."""
+    global _ECH_ICON
+    if _ECH_ICON is None:
+        from PySide6.QtGui import QFont, QIcon, QPainter, QPixmap
+        pixmap = QPixmap(40, 18)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor(196, 181, 253, 200))
+        painter.setBrush(QColor(196, 181, 253, 40))
+        painter.drawRoundedRect(1, 1, 38, 16, 8, 8)
+        font = QFont(); font.setPixelSize(10); font.setBold(True)
+        painter.setFont(font); painter.setPen(QColor("#d9ceff"))
+        painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), "ECH")
+        painter.end()
+        _ECH_ICON = QIcon(pixmap)
+    return _ECH_ICON
+
+
 class MakerColumns(IntEnum):
     MARK = 0
     COUNTRY = 1
@@ -334,6 +362,8 @@ class MakerResultsModel(QAbstractTableModel):
                 return result.uri
             return ""
         if role == Qt.ItemDataRole.DecorationRole:
+            if column == MakerColumns.URI and _uri_is_ech(result.uri):
+                return _ech_badge_icon()
             if column == MakerColumns.COUNTRY:
                 return country_badge_icon(result.country_code)
             if column == MakerColumns.STATUS:

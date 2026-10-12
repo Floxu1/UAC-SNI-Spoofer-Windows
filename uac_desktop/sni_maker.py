@@ -420,6 +420,29 @@ def convert_to_sni(
     )
     if is_sni_config(profile):
         return SniConversionResult(source, replace(profile), "already_sni")
+    if query.get("ech") or query.get("echcl"):
+        # ECH: keep the original server/port and URI; tested and connected
+        # directly (no fake-SNI spoof would survive ECH).
+        direct = replace(profile)
+        direct.id = str(uuid.uuid5(uuid.NAMESPACE_URL, config_signature(profile.source_uri)))
+        direct.name = profile.name if profile.name.lower().endswith(" ech") else f"{profile.name} \u00b7 ECH"
+        direct.protocol = parsed.scheme.lower()
+        direct.config_host = parsed.hostname or profile.config_host
+        direct.config_port = parsed.port or 443
+        direct.address = parsed.hostname or profile.address
+        direct.fallback_address = ""
+        direct.port = parsed.port or 443
+        direct.sni = server_name
+        direct.origin = "sni-maker"
+        direct.route_mode = "ech-direct"
+        direct.method = "plain"
+        direct.verified_route = False
+        direct.verified_spoof = False
+        direct.spoof_fake_sni = ""
+        direct.last_ping_ok = False
+        direct.last_ping_ms = 0.0
+        direct.country_code = ""
+        return SniConversionResult(source, direct, "converted")
     if not any(query.get(key, "").strip() for key in ("sni", "servername")):
         rewritten_query = (
             f"{parsed.query}&sni={urllib.parse.quote(server_name, safe='')}"
@@ -539,7 +562,7 @@ def _test_result(profile: ProxyProfile, outcome: SniProbeResult) -> SniTestResul
         tested_profile.country_verified_at = 0.0
         tested_profile.country_source = ""
     if outcome.success and outcome.route_verified:
-        if tested_profile.route_mode == "reality-direct":
+        if tested_profile.route_mode in ("reality-direct", "ech-direct"):
             tested_profile.verified_route = True
             tested_profile.verified_spoof = False
         else:

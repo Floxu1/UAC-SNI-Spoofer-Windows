@@ -224,7 +224,17 @@ class FragmentProxy:
         remote = socket.create_connection((host, profile.port), timeout=connect_timeout)
         self._tune_socket(remote)
         remote.settimeout(min(4.5, max(1.2, timeout_ms / 1000)) if carrier == "mci" else max(0.9, timeout_ms / 1000))
-        pieces = fragments(first, strategy, self._tuning.multi_fragment_size)
+        gene_ops = None
+        raw_ops = str(getattr(self._tuning, "pattern_gene_ops", "") or "").strip()
+        if raw_ops:
+            try:
+                import json as _json
+                parsed = _json.loads(raw_ops)
+                if isinstance(parsed, list):
+                    gene_ops = [x for x in parsed if isinstance(x, dict)]
+            except Exception:
+                gene_ops = None
+        pieces = fragments(first, strategy, self._tuning.multi_fragment_size, ops=gene_ops)
         self._detail(f"FRAGMENT {strategy} {len(pieces)} pieces: " + ", ".join(f"{len(x)} B" for x in pieces[:12]))
         for index, piece in enumerate(pieces):
             remote.sendall(piece)

@@ -16,6 +16,7 @@ import asyncio
 import concurrent.futures
 import ctypes
 import ipaddress
+import json
 import os
 import socket
 import struct
@@ -27,14 +28,15 @@ from typing import Callable
 from pydivert import Flag, Packet, WinDivert
 
 from .packet_templates import ClientHelloMaker
-from ..tls_tools import fragments
+from ..tls_tools import fragments, gene_plan_from_ops
 
 
 LogFn = Callable[[str], None]
 TrafficFn = Callable[[int, int], None]
 IP_UNICAST_IF = 31
 TLS_FRAGMENT_STRATEGIES = frozenset({
-    "plain", "tls_sni_records", "full5", "full10", "full20",
+    "plain", "tls_sni_records", "full5", "full10", "full20", "multi64",
+    "sni_boundary", "sni_split", "primitive",
 })
 
 
@@ -396,6 +398,18 @@ class PatternSniCore:
         raw = [configured, *fallbacks.replace(";", ",").split(",")]
         if bool(getattr(tuning, "pattern_use_profile_edges", False)):
             raw = [profile.address, profile.fallback_address, *raw]
+        # Gene Lab strategy edges (imported working IPs) go first; the normal
+        # list stays behind them as failover.
+        # Auto clean-IP picks go right after gene edges (or first without a gene).
+        gene_edges = str(getattr(tuning, "pattern_gene_edges", "") or "")
+        clean_edges = str(getattr(tuning, "pattern_clean_edges", "") or "")
+        try:
+            from ..clean_ip import order_edges
+            raw = order_edges(gene_edges, clean_edges, [str(v or "") for v in raw],
+                              str(getattr(tuning, "pattern_session_edge", "") or ""))
+        except Exception:
+            if gene_edges.strip():
+                raw = [*gene_edges.replace(";", ",").split(","), *raw]
         edges = list(dict.fromkeys(ip for value in raw if (ip := _valid_ipv4(value))))
         if not edges:
             raise ValueError("Pattern core has no valid IPv4 edge")
@@ -434,6 +448,12 @@ class PatternSniCore:
             }.get(self._strategy_override, 0.0)
         else:
             self._fragment_delay_s = 0.0
+        if self._fragment_delay_s <= 0 and self._strategy_override in TLS_FRAGMENT_STRATEGIES:
+            tuned_delay = int(getattr(tuning, "sni_split_delay_ms", 0) or 0)
+            if self._strategy_override in {"full5", "full10", "full20", "multi", "multi64"}:
+                tuned_delay = int(getattr(tuning, "multi_delay_ms", tuned_delay) or tuned_delay)
+            if tuned_delay > 0:
+                self._fragment_delay_s = max(0, min(80, tuned_delay)) / 1000
         self._post_fake_delay_s = (
             max(0, min(20, int(getattr(tuning, "pattern_inject_delay_ms", 0))))
             / 1000
@@ -441,6 +461,17 @@ class PatternSniCore:
         )
         self._fake_sni = str(getattr(tuning, "pattern_fake_sni", "chatgpt.com") or profile.sni)
         self._fake_sni_bytes(self._fake_sni)
+        self._gene_ops = []
+        self._gene_plan_logged = False
+        self._gene_strict = bool(getattr(tuning, "pattern_gene_strict", False))
+        raw_ops = str(getattr(tuning, "pattern_gene_ops", "") or "").strip()
+        if raw_ops:
+            try:
+                parsed = json.loads(raw_ops)
+                if isinstance(parsed, list):
+                    self._gene_ops = [x for x in parsed if isinstance(x, dict)]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._gene_ops = []
         self._edges = self._build_edges(profile, tuning)
         self._interface_ip = default_interface_ipv4(self._edges[0])
         self._interface_index = best_interface_index(self._edges[0])
@@ -709,7 +740,28 @@ class PatternSniCore:
                             if not chunk:
                                 break
                             first += chunk
-                        pieces = fragments(first, self._strategy_override)
+                        piece_delays: list[int] | None = None
+                        if self._strategy_override == "primitive":
+                            plan = gene_plan_from_ops(
+                                first, getattr(self, "_gene_ops", None),
+                                strict=bool(getattr(self, "_gene_strict", False)),
+                            )
+                            pieces = [p for p in plan.pieces if p] or [first]
+                            piece_delays = list(plan.delays_ms) if len(pieces) == len(plan.pieces) else None
+                            if not getattr(self, "_gene_plan_logged", False):
+                                self._gene_plan_logged = True
+                                self.log(
+                                    f"PATTERN GENE ops applied={','.join(plan.applied) or '-'} "
+                                    f"skipped={','.join(plan.skipped) or '-'} pieces={len(pieces)} "
+                                    f"delays={piece_delays}"
+                                    + (f" parseFallback={plan.error}" if plan.error else "")
+                                )
+                        else:
+                            pieces = fragments(
+                                first,
+                                self._strategy_override,
+                                ops=getattr(self, "_gene_ops", None),
+                            )
                         attempts = 3 if self._handshake_failover else 1
                         for attempt in range(attempts):
                             if outgoing is None:
@@ -719,7 +771,11 @@ class PatternSniCore:
                             for index, piece in enumerate(pieces):
                                 await loop.sock_sendall(outgoing, piece)
                                 self.upload += len(piece)
-                                if index + 1 < len(pieces):
+                                if piece_delays is not None:
+                                    gene_delay = piece_delays[index] if index < len(piece_delays) else 0
+                                    if gene_delay > 0:
+                                        await asyncio.sleep(gene_delay / 1000)
+                                elif index + 1 < len(pieces):
                                     delay = (
                                         self._fragment_delay_s
                                         if self._fragment_delay_s > 0

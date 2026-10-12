@@ -56,9 +56,39 @@ def tls_record(version: bytes, payload: bytes) -> bytes:
     return b"\x16" + version + struct.pack(">H", len(payload)) + payload
 
 
-def fragments(data: bytes, strategy: str, chunk_size: int = 5) -> list[bytes]:
+def _permute_indices(n: int, seed: int) -> list[int]:
+    order = list(range(max(0, int(n))))
+    if len(order) <= 1:
+        return order
+    state = int(seed) & 0xFFFFFFFF or 1
+    for i in range(len(order) - 1, 0, -1):
+        state = (1103515245 * state + 12345) & 0xFFFFFFFF
+        j = state % (i + 1)
+        order[i], order[j] = order[j], order[i]
+    return order
+
+
+def fragments_from_ops(data: bytes, ops: list | None) -> list[bytes]:
+    """Gene Lab primitive ops on the live ClientHello (see gene_ops.build_plan).
+
+    Live-safe subset: record_cut, sni_cut, tcp_frag, delay. Use
+    gene_plan_from_ops() when per-piece delays are needed.
+    """
+    if not data:
+        return [data]
+    return [p for p in gene_plan_from_ops(data, ops).pieces if p] or [data]
+
+
+def gene_plan_from_ops(data: bytes, ops: list | None, strict: bool = False):
+    from .gene_ops import build_plan
+    return build_plan(data, [op for op in (ops or []) if isinstance(op, dict)], strict=strict)
+
+
+def fragments(data: bytes, strategy: str, chunk_size: int = 5, ops: list | None = None) -> list[bytes]:
     if len(data) < 2:
         return [data]
+    if strategy == "primitive":
+        return fragments_from_ops(data, ops)
     if strategy == "plain":
         return [data]
     location = locate_sni(data)

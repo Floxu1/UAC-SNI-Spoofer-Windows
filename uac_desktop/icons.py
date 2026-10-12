@@ -118,6 +118,7 @@ _ICONS: Final[dict[str, str]] = {
         <path d="M1 14h6M9 8h6M17 16h6"/>
     """,
     "chevron-right": """<path d="m9 18 6-6-6-6"/>""",
+    "arrow-down": """<path d="M12 5v14M6 13l6 6 6-6"/>""",
     "chevron-left": """<path d="m15 18-6-6 6-6"/>""",
     "search": """<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>""",
     "trash": """
@@ -237,7 +238,7 @@ def _fallback_pixmap(name: str, colour: QColor, size: int) -> QPixmap:
     painter.setPen(pen)
     inset = max(2.0, size * 0.12)
     painter.drawRoundedRect(QRectF(inset, inset, size - 2 * inset, size - 2 * inset), size * 0.2, size * 0.2)
-    painter.setFont(QFont("Segoe UI", max(7, int(size * 0.34)), QFont.Weight.DemiBold))
+    painter.setFont(QFont("Inter", max(7, int(size * 0.34)), QFont.Weight.Medium))
     painter.drawText(result.rect(), Qt.AlignmentFlag.AlignCenter, (name[:1] or "?").upper())
     painter.end()
     return result

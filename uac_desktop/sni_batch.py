@@ -35,6 +35,44 @@ class LiveConfigResult:
     error: str = ""
     carrier_mode: str = ""
     strategy: str = ""
+    quality: dict | None = None
+
+
+def _quality_samples(session, proxies, headers, cancel, budget: float = 4.5) -> dict:
+    """Auto quality pick: 3x generate_204 + 2 real page loads, all in parallel
+    (own connections each), bounded by ~budget seconds."""
+    jobs = [("204", "http://www.gstatic.com/generate_204")] * 3 + [
+        ("page", "https://www.google.com/"), ("page", "https://www.wikipedia.org/")]
+    errs = []
+
+    def one(kind, url):
+        if cancel.is_set():
+            return None
+        sess = requests.Session()
+        sess.trust_env = False
+        started = time.monotonic()
+        try:
+            r = sess.get(url, proxies=proxies, headers=headers,
+                         timeout=(2.0, 3.0) if kind == "204" else (2.5, budget))
+            _ = r.content
+            ok = r.status_code == 204 if kind == "204" else 200 <= r.status_code < 400
+            if not ok:
+                errs.append(f"{url.split('/')[2]}: HTTP {r.status_code}")
+            return (time.monotonic() - started) * 1000 if ok else None
+        except Exception as exc:
+            errs.append(f"{url.split('/')[2]}: {type(exc).__name__}")
+            return None
+        finally:
+            sess.close()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futs = [pool.submit(one, k, u) for k, u in jobs]
+        vals = []
+        for f in futs:
+            try:
+                vals.append(f.result(timeout=budget + 3))
+            except Exception:
+                vals.append(None)
+    return {"s204": vals[:3], "pages": vals[3:], "errors": errs}
 
 
 class _CancelSignal:
@@ -62,7 +100,8 @@ def _reserve_local_ports(count: int) -> list[tuple[int, socket.socket]]:
 
 def build_batch_xray_config(
         profiles: list[ProxyProfile], proxy_ports: list[int],
-        relay_port: int | None | list[int | None], tuning: Tuning) -> dict:
+        relay_port: int | None | list[int | None], tuning: Tuning,
+        ech_overrides: dict | None = None) -> dict:
     relay_ports = (
         [None if value is None else int(value) for value in relay_port]
         if isinstance(relay_port, (list, tuple))
@@ -86,11 +125,13 @@ def build_batch_xray_config(
             "tag": inbound_tag,
             "settings": {"allowTransparent": False},
         })
+        ech_value = str(parse_outbound(profile).get("ech") or "")
         config = build_xray_config(
             profile, tuning=tuning,
             upstream_address=(
                 "127.0.0.1" if target_relay is not None else None
             ),
+            ech_config=(ech_overrides or {}).get(ech_value) or None,
         )
         outbound = config["outbounds"][0]
         outbound["tag"] = outbound_tag
@@ -183,6 +224,11 @@ def _probe_proxy(
         ("ipwho.is", "https://ipwho.is/"),
         ("api.country.is", "https://api.country.is/"),
     )
+    ech_route = getattr(profile, "route_mode", "") == "ech-direct"
+    if ech_route:
+        # ECH dials are slower to first byte; geo lookups were the main
+        # false-negative cause (40/83 on MCI). Longer budget + a 204 fallback.
+        timeout = float(timeout) * 1.8
     deadline = time.monotonic() + max(1.0, float(timeout))
     try:
         for sample, (source, url) in enumerate(endpoints):
@@ -212,11 +258,30 @@ def _probe_proxy(
                 result.country = country or _country_name(code)
                 result.exit_ip = exit_ip
                 result.source = source
+                if getattr(profile, "_quality_probe", False):
+                    result.quality = _quality_samples(session, proxies, headers, cancel)
                 return result
             except (
                     OSError, ValueError, TypeError, AttributeError,
                     requests.RequestException) as exc:
                 errors.append(f"{source}: {exc}")
+        if ech_route and not cancel.is_set():
+            try:
+                started = time.monotonic()
+                response = session.get(
+                    "https://www.gstatic.com/generate_204", proxies=proxies,
+                    timeout=(3.0, 5.0), headers=headers)
+                if response.status_code == 204:
+                    result.ok = True
+                    result.ping_ms = max(1.0, (time.monotonic() - started) * 1000)
+                    result.country_code = "XX"
+                    result.country = ""
+                    result.source = "generate_204"
+                    if getattr(profile, "_quality_probe", False):
+                        result.quality = _quality_samples(session, proxies, headers, cancel)
+                    return result
+            except (OSError, ValueError, requests.RequestException) as exc:
+                errors.append(f"generate_204: {exc}")
         result.error = errors[-1] if errors else "live route test failed"
         return result
     finally:
@@ -301,16 +366,32 @@ class SniBatchTester:
             timeout: float = 8.0,
             progress: Callable[[list[LiveConfigResult], int, int], None] | None = None,
             carrier_tunings: dict[str, Tuning] | None = None,
+            clean_edges: dict[str, list[str]] | None = None,
+            preferred_carrier: str = "",
             ) -> list[LiveConfigResult]:
         plans = (
             ("irancell", "full5"),
             ("mci", "tls_sni_records"),
             ("auto", "wrong_seq"),
         )
+        preferred = str(preferred_carrier or "").strip().lower()
+        if preferred in {carrier for carrier, _strategy in plans}:
+            plans = tuple(sorted(plans, key=lambda plan: plan[0] != preferred))
+        edge_map = {
+            str(key).lower(): [ip for ip in (_valid_ip(v) for v in (values or [])) if ip]
+            for key, values in (clean_edges or {}).items()
+        }
         pending = list(profiles)
         total = len(pending)
         winners: dict[int, LiveConfigResult] = {}
         errors: dict[int, list[str]] = {id(profile): [] for profile in pending}
+        ech_profiles = [
+            p for p in pending
+            if p.route_mode == "ech-direct" or parse_outbound(p).get("ech")
+        ] if pending and all(hasattr(p, "source_uri") for p in pending) else []
+        ech_ids = {id(p) for p in ech_profiles}
+        if ech_profiles:
+            pending = [p for p in pending if id(p) not in ech_ids]
         source_tunings = carrier_tunings or {}
         last_progress = 0
         live_emitted: set[int] = set()
@@ -327,7 +408,7 @@ class SniBatchTester:
         def prepare_healthy(result, carrier, strategy):
             result.carrier_mode = carrier
             result.strategy = strategy
-            if result.profile.route_mode != "reality-direct":
+            if result.profile.route_mode not in ("reality-direct", "ech-direct"):
                 result.profile.method = {
                     "full5": "full5",
                     "tls_sni_records": "tls_sni_records",
@@ -335,6 +416,54 @@ class SniBatchTester:
                 }[strategy]
             return result
 
+        if ech_profiles and not cancel.is_set():
+            # ECH configs: one direct round, no spoof/relay, no carrier rounds.
+            self.log(f"SNI MAKER ECH direct: {len(ech_profiles)} configs")
+            try:
+                from . import ech_keys
+                from .paths import DATA_DIR as _data_dir
+                ech_cache = ech_keys.EchKeyCache(_data_dir / "ech_keys.json")
+                self._ech_overrides = {}
+                for value in {str(parse_outbound(p).get("ech") or "") for p in ech_profiles}:
+                    if value:
+                        res = ech_keys.resolve(value, ech_cache, self.log)
+                        if res.state in ("fresh", "cached"):
+                            self._ech_overrides[value] = res.value
+            except Exception as exc:
+                self.log(f"ECH KEY: batch prefetch unavailable: {exc}")
+            ech_tuning = Tuning.from_dict(
+                source_tunings.get(preferred, tuning).to_dict()
+                if preferred in source_tunings else tuning.to_dict())
+
+            def ech_progress(batch, done_n, total_n):
+                updates = []
+                for result in batch:
+                    result.strategy = "ech"
+                    result.carrier_mode = "direct"
+                    if result.ok:
+                        live_emitted.add(id(result.profile))
+                    updates.append(result)
+                emit_progress(updates, 0)
+            try:
+                ech_results = self.run(
+                    ech_profiles, ech_tuning, cancel, workers=workers,
+                    timeout=timeout, progress=ech_progress)
+            except Exception as exc:
+                self.log(f"SNI MAKER ECH ERROR {exc}")
+                ech_results = []
+            by_id = {id(r.profile): r for r in ech_results}
+            for profile in ech_profiles:
+                result = by_id.get(id(profile))
+                if result is not None and result.ok:
+                    result.strategy = "ech"; result.carrier_mode = "direct"
+                    profile.method = "plain"
+                    winners[id(profile)] = result
+                else:
+                    errors[id(profile)].append(
+                        f"ech-direct: {(result.error if result else 'no result') or 'route failed'}")
+            ech_failed = [p for p in ech_profiles if id(p) not in winners]
+        else:
+            ech_failed = list(ech_profiles)
         for plan_index, (carrier, strategy) in enumerate(plans):
             if cancel.is_set() or not pending:
                 break
@@ -385,10 +514,18 @@ class SniBatchTester:
                 )
 
             try:
+                mode_edges = edge_map.get(carrier, [])
+                if mode_edges:
+                    self.log(
+                        f"SNI MAKER {carrier}: clean edges "
+                        f"{','.join(mode_edges)}"
+                    )
+                run_kwargs = {"priority_edges": mode_edges} if mode_edges else {}
                 mode_results = self.run(
                     selected, mode_tuning, cancel,
                     workers=workers, timeout=timeout, strategy=strategy,
                     progress=mode_progress,
+                    **run_kwargs,
                 )
             except Exception as exc:
                 message = f"{carrier}/{strategy}: {exc}"
@@ -427,7 +564,7 @@ class SniBatchTester:
                     profile=profile,
                     error=" | ".join(errors[id(profile)]) or "All route modes failed",
                 )
-                for profile in pending
+                for profile in [*pending, *ech_failed]
             ]
             emit_progress(failed, total, force=True)
             final_results = [*winners.values(), *failed]
@@ -448,7 +585,9 @@ class SniBatchTester:
             cancel: threading.Event, workers: int = 64,
             timeout: float = 8.0,
             strategy: str | None = None,
-            progress: Callable[[list[LiveConfigResult], int, int], None] | None = None
+            progress: Callable[[list[LiveConfigResult], int, int], None] | None = None,
+            probe: Callable | None = None,
+            priority_edges: list[str] | None = None,
             ) -> list[LiveConfigResult]:
         supported = [
             profile for profile in profiles
@@ -467,7 +606,8 @@ class SniBatchTester:
             raise ValueError("SNI Maker profile has an invalid remote port")
         direct_routes = [
             (
-                profile.route_mode == "reality-direct"
+                profile.route_mode in ("reality-direct", "ech-direct")
+                or bool(parse_outbound(profile).get("ech"))
                 or parse_outbound(profile)["security"] == "reality"
             )
             for profile in supported
@@ -505,7 +645,7 @@ class SniBatchTester:
             )
         ).strip().lower()
         if selected_strategy not in {
-                "wrong_seq", "tls_sni_records", "full5", "full10", "full20"}:
+                "wrong_seq", "tls_sni_records", "full5", "full10", "full20", "primitive"}:
             selected_strategy = (
                 "tls_sni_records"
                 if probe_tuning.carrier_mode == "mci"
@@ -528,8 +668,10 @@ class SniBatchTester:
                 ).replace(";", ",").split(",")
             ),
         ]
+        clean_first = [_valid_ip(value) for value in (priority_edges or [])]
         probe_edges = list(dict.fromkeys(
-            value for value in [*source_edges, *configured_edges] if value
+            value for value in [*clean_first, *source_edges, *configured_edges]
+            if value
         ))
         if probe_edges:
             probe_tuning.pattern_connect_ip = probe_edges[0]
@@ -539,7 +681,8 @@ class SniBatchTester:
             f"carrier={probe_tuning.carrier_mode} workers={workers}"
         )
         config = build_batch_xray_config(
-            supported, proxy_ports, profile_relay_ports, probe_tuning
+            supported, proxy_ports, profile_relay_ports, probe_tuning,
+            ech_overrides=getattr(self, "_ech_overrides", None),
         )
         config_path = DATA_DIR / f"sni-maker-batch-{os.getpid()}.json"
         results = []
@@ -589,7 +732,7 @@ class SniBatchTester:
                     max_workers=workers, thread_name_prefix="sni-maker") as pool:
                 futures = {
                     pool.submit(
-                        _probe_proxy, profile, port, timeout, stop_signal
+                        (probe or _probe_proxy), profile, port, timeout, stop_signal
                     ): profile
                     for profile, port in zip(supported, proxy_ports)
                 }

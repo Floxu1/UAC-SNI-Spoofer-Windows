@@ -282,21 +282,30 @@ def scan_domains(domains: list[str], threads: int, tries: int, timeout: int, pro
     return sorted(results, key=lambda x: (-x.score, -x.stability, x.first_byte_ms, x.ping_ms, x.domain))
 
 
-def current_ip(proxy: bool = False) -> str:
-    proxies = {"http": "http://127.0.0.1:20809", "https": "http://127.0.0.1:20809"} if proxy else None
+def current_ip(proxy: bool = False, http_port: int | None = None) -> str:
+    proxies = None
+    if proxy:
+        from .engine import HTTP_PORT
+        port = HTTP_PORT if http_port is None else http_port
+        proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
     response = requests.get("https://api.ipify.org?format=json", proxies=proxies, timeout=8)
     return response.json().get("ip", "unknown")
 
 
-def current_location(proxy: bool = False, timeout: float = 5.0) -> GeoLocation | None:
+def current_location(proxy: bool = False, timeout: float = 5.0,
+                     http_port: int | None = None) -> GeoLocation | None:
     """Resolve the exit IP and country, preferably through the active tunnel.
 
     ipwho.is is used first because it returns the same GeoIP-style country that
     public IP-check websites expose.  Two small fallbacks keep country
     verification available when that provider is temporarily rate-limited.
     """
-    proxies = ({"http": "http://127.0.0.1:20809",
-                "https": "http://127.0.0.1:20809"} if proxy else None)
+    proxies = None
+    if proxy:
+        from .engine import HTTP_PORT
+        port = HTTP_PORT if http_port is None else http_port
+        proxies = {"http": f"http://127.0.0.1:{port}",
+                   "https": f"http://127.0.0.1:{port}"}
     session = requests.Session()
     session.trust_env = False
     headers = {"User-Agent": "UAC-Spoofer-Desktop/exit-country"}

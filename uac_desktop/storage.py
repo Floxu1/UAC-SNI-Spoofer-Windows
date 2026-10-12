@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from pathlib import Path
 
+from . import gene_pool
 from .app_config import UPDATE_REPOSITORY_URL
 from .models import ProxyProfile, Tuning, default_profiles, verified_profiles
 from .paths import BOOKMARKS_FILE, PROFILES_FILE, SETTINGS_FILE, SNI_RESULTS_FILE
@@ -225,7 +227,11 @@ class Storage:
 
     @classmethod
     def _enforced_carrier_tuning(cls, carrier: str, tuning: Tuning) -> Tuning:
-        return Tuning.enforce_carrier(tuning, cls._carrier_name(carrier))
+        value = Tuning.enforce_carrier(tuning, cls._carrier_name(carrier))
+        value.pattern_gene_edges = ""  # runtime-only gene edges are never stored
+        value.pattern_clean_edges = ""  # runtime-only clean-IP picks are never stored
+        value.pattern_session_edge = ""
+        return value
 
     def _best_saved_edge(self, carrier: str, domain: str = "") -> str:
         candidates = []
@@ -555,6 +561,74 @@ class Storage:
 
     def save_profiles(self) -> None:
         _write(PROFILES_FILE, [x.to_dict() for x in self.profiles])
+
+
+    @property
+    def gene_strategies(self) -> list:
+        value = self.settings.get("gene_strategies", [])
+        return list(value) if isinstance(value, list) else []
+
+    def set_gene_strategies(self, strategies: list, selected_id: str = "") -> None:
+        cleaned = []
+        for item in strategies or []:
+            if isinstance(item, dict) and item.get("method"):
+                cleaned.append(item)
+        self.settings["gene_strategies"] = cleaned
+        self.settings["selected_gene_strategy_id"] = str(selected_id or "")
+        self.settings["gene_stats"] = gene_pool.prune_stats(self.gene_stats, cleaned)
+        if self.gene_last_winner not in {str(g.get("id")) for g in cleaned}:
+            self.settings["gene_last_winner"] = ""
+        self.save_settings()
+
+    @property
+    def selected_gene_strategy_id(self) -> str:
+        return str(self.settings.get("selected_gene_strategy_id", "") or "")
+
+    @property
+    def multi_gene_enabled(self) -> bool:
+        """Smart multi-gene pool (Auto/Irancell only). Default off."""
+        return bool(self.settings.get("multi_gene_enabled", False))
+
+    def set_multi_gene_enabled(self, enabled: bool) -> None:
+        self.settings["multi_gene_enabled"] = bool(enabled)
+        self.save_settings()
+
+    @property
+    def gene_stats(self) -> dict:
+        value = self.settings.get("gene_stats", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def gene_last_winner(self) -> str:
+        return str(self.settings.get("gene_last_winner", "") or "")
+
+    def record_gene_result(self, gene: dict, ok: bool, now: float | None = None) -> bool:
+        """Persist a Connect outcome for a gene; returns True if it entered cooldown."""
+        now = time.time() if now is None else float(now)
+        stats, entered = gene_pool.record_result(self.gene_stats, gene, ok, now)
+        self.settings["gene_stats"] = stats
+        if ok:
+            self.settings["gene_last_winner"] = str(gene.get("id", ""))
+        self.save_settings()
+        return entered
+
+    @property
+    def strategy_locked(self) -> bool:
+        """When True, Connect never rotates to another method automatically."""
+        return bool(self.settings.get("strategy_locked", False))
+
+    def set_strategy_locked(self, locked: bool) -> None:
+        self.settings["strategy_locked"] = bool(locked)
+        self.save_settings()
+
+    def selected_gene_strategy(self) -> dict | None:
+        selected = self.selected_gene_strategy_id
+        if not selected:
+            return None
+        for item in self.gene_strategies:
+            if isinstance(item, dict) and str(item.get("id", "")) == selected:
+                return item
+        return None
 
     def save_settings(self) -> None:
         _write(SETTINGS_FILE, self.settings)

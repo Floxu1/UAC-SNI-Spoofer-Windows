@@ -65,10 +65,14 @@ def run_event_loop(app, window) -> int:
         except Exception:
             pass
         try:
+            from uac_desktop.process_win import cleanup_bin_helpers
+            cleanup_bin_helpers()
+        except Exception:
+            pass
+        try:
             WindowsProxy.recover_stale(expected_pid=int(owner["pid"]),
                                        expected_create_time=float(owner["create_time"]))
         except Exception:
-
             pass
 
 
@@ -88,6 +92,13 @@ def main() -> int:
     except Exception:
         pass
 
+    # One-time 1.1.1 data reset: after proxy/gateway were restored from the OLD
+    # owner files, before anything loads settings/profiles.
+    try:
+        from uac_desktop import data_reset
+        data_reset.run()
+    except Exception:
+        pass
 
     from PySide6.QtGui import QFont, QFontDatabase, QIcon
     from PySide6.QtWidgets import QApplication
@@ -106,9 +117,9 @@ def main() -> int:
         GatewayManager().recover()
     except Exception:
         pass
-    for font_file in ("Vazirmatn-Regular.ttf", "Vazirmatn-Bold.ttf"):
-        QFontDatabase.addApplicationFont(str(ASSETS / "fonts" / font_file))
-    app.setFont(QFont("Vazirmatn", 10))
+    from uac_desktop import fonts as ui_fonts
+    ui_fonts.load_fonts()
+    ui_fonts.apply_app_font(app, "en")
     icon = ASSETS / "icon.png"
     if icon.exists():
         app.setWindowIcon(QIcon(str(icon)))

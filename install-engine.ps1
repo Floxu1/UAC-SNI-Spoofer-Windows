@@ -102,3 +102,83 @@ if ($LASTEXITCODE -ne 0 -or $verifiedVersion -notmatch "sing-box version $([rege
     throw "sing-box $singVersion runtime validation failed."
 }
 Write-Host $verifiedVersion.Trim()
+
+# --- uac-psiphon.exe: built from source in pow_helper/ (Go, deps pinned by go.sum) ---
+$psiphonExe = Join-Path $bin 'uac-psiphon.exe'
+$powHelper = Join-Path $PSScriptRoot 'pow_helper'
+if (-not (Test-Path $psiphonExe) -or $env:UAC_REBUILD_POW -eq '1') {
+    $go = Get-Command go -ErrorAction SilentlyContinue
+    if ($null -eq $go -and (Test-Path 'C:\Program Files\Go\bin\go.exe')) { $go = Get-Command 'C:\Program Files\Go\bin\go.exe' }
+    if ($null -eq $go) {
+        throw 'Go was not found. uac-psiphon.exe is built from pow_helper/ and needs Go 1.26+ (https://go.dev/dl/). Install Go, reopen the shell and rerun.'
+    }
+    if (-not (Test-Path (Join-Path $powHelper 'go.mod'))) { throw "pow_helper/go.mod was not found at $powHelper." }
+    Write-Host 'Building uac-psiphon.exe from pow_helper (go build)...'
+    Push-Location $powHelper
+    try {
+        $env:CGO_ENABLED = '0'; $env:GOOS = 'windows'; $env:GOARCH = 'amd64'
+        & $go.Source build -mod=readonly -trimpath -ldflags '-s -w' -o $psiphonExe .
+        if ($LASTEXITCODE -ne 0) { throw "go build of uac-psiphon failed (exit $LASTEXITCODE)." }
+    } finally {
+        Pop-Location
+    }
+}
+if (-not (Test-Path $psiphonExe)) { throw 'uac-psiphon.exe was not produced.' }
+Write-Host "uac-psiphon.exe ready ($((Get-Item $psiphonExe).Length) bytes)"
+
+# --- aether.exe: Rust crate core/aether of UAC-SNI-Spoofer-Android (no prebuilt release) ---
+$aetherVersion = '1.6.0'
+$aetherRepo = 'https://github.com/Floxu1/UAC-SNI-Spoofer-Android.git'
+$aetherCommit = '1327c02f47539858f1fe41b3f02a4c7196620b46'
+$aetherExe = Join-Path $bin 'aether.exe'
+$needsAether = -not (Test-Path $aetherExe)
+if (-not $needsAether) {
+    try {
+        $installedVersion = (& $aetherExe --version 2>&1 | Out-String)
+        $needsAether = ($LASTEXITCODE -ne 0 -or $installedVersion -notmatch "aether $([regex]::Escape($aetherVersion))")
+    } catch {
+        $needsAether = $true
+    }
+}
+if ($needsAether) {
+    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+    if ($null -eq $cargo) {
+        throw "Rust/cargo was not found. aether.exe $aetherVersion is built from $aetherRepo (core/aether) and needs Rust 1.88+ (https://rustup.rs) plus cmake/NASM for boring-sys. Or place a prebuilt aether.exe $aetherVersion in bin\."
+    }
+    # Source: UAC_AETHER_SRC (path to core/aether), sibling checkout, or a pinned fresh clone.
+    $aetherSrc = $env:UAC_AETHER_SRC
+    if (-not $aetherSrc) {
+        $sibling = Join-Path (Split-Path $PSScriptRoot -Parent) 'mobile-build\core\aether'
+        if (Test-Path (Join-Path $sibling 'Cargo.toml')) { $aetherSrc = $sibling }
+    }
+    if (-not $aetherSrc) {
+        $git = Get-Command git -ErrorAction SilentlyContinue
+        if ($null -eq $git) { throw 'git is needed to fetch the aether source.' }
+        $clone = Join-Path $env:TEMP "uac-android-$($aetherCommit.Substring(0,7))"
+        if (-not (Test-Path (Join-Path $clone 'core\aether\Cargo.toml'))) {
+            Write-Host "Fetching aether source ($aetherCommit)..."
+            if (Test-Path $clone) { Remove-Item -LiteralPath $clone -Recurse -Force }
+            & git init -q $clone
+            & git -C $clone remote add origin $aetherRepo
+            & git -C $clone fetch -q --depth 1 origin $aetherCommit
+            if ($LASTEXITCODE -ne 0) { throw 'git fetch of the aether source failed.' }
+            & git -C $clone checkout -q FETCH_HEAD
+        }
+        $aetherSrc = Join-Path $clone 'core\aether'
+    }
+    Write-Host "Building aether $aetherVersion from $aetherSrc (cargo build --release)..."
+    Push-Location $aetherSrc
+    try {
+        & $cargo.Source build --release --locked --bin aether
+        if ($LASTEXITCODE -ne 0) { throw "cargo build of aether failed (exit $LASTEXITCODE)." }
+        $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $aetherSrc 'target' }
+        Copy-Item -LiteralPath (Join-Path $targetDir 'release\aether.exe') -Destination $aetherExe -Force
+    } finally {
+        Pop-Location
+    }
+}
+$verifiedVersion = (& $aetherExe --version 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0 -or $verifiedVersion -notmatch "aether $([regex]::Escape($aetherVersion))") {
+    throw "aether $aetherVersion runtime validation failed."
+}
+Write-Host $verifiedVersion.Trim()

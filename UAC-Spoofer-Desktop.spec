@@ -1,4 +1,4 @@
-from PyInstaller.utils.hooks import collect_data_files
+﻿from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = [
     ('assets', 'assets'),
@@ -10,6 +10,9 @@ datas = [
     ('bin/sing-box.exe', 'bin'),
     ('bin/libcronet.dll', 'bin'),
     ('bin/sing-box-LICENSE', 'bin'),
+
+    ('bin/aether.exe', 'bin'),
+    ('bin/uac-psiphon.exe', 'bin'),
 
     ('wizard guider', 'wizard guider'),
     (
@@ -24,7 +27,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    hiddenimports=collect_submodules('dns'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -60,3 +63,4 @@ coll = COLLECT(
     upx_exclude=[],
     name='UAC-Spoofer-Desktop',
 )
+
