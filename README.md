@@ -6,7 +6,7 @@
 
 <p dir="rtl"><b>داشبورد شبکه یک‌کلیکی برای ویندوز: <code>Xray</code> با متد SNI Spoofing گروه Patterniha، به‌همراه موتور دوم سایفون روی وارپ</b></p>
 
-[![Version](https://img.shields.io/badge/version-1.1.1-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
+[![Version](https://img.shields.io/badge/version-1.1.2-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](#دانلود-و-شروع-سریع)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/Floxu1/UAC-SNI-Spoofer-Windows?style=flat-square&label=latest)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)
@@ -29,7 +29,7 @@
 - [دانلود و شروع سریع](#دانلود-و-شروع-سریع)
 - [ساخت از سورس](#ساخت-از-سورس)
 - [پرسش‌های رایج و رفع مشکل](#پرسشهای-رایج-و-رفع-مشکل)
-- [تازه‌های نسخه ۱.۱.۱](#تازههای-نسخه-۱۱۱)
+- [تازه‌های نسخه ۱.۱.۲](#تازههای-نسخه-۱۱۲)
 - [قدردانی](#قدردانی)
 - [مجوز](#مجوز)
 
@@ -106,7 +106,7 @@
 
 ## دانلود و شروع سریع
 
-۱. فایل <code>UAC-Spoofer-Desktop-v1.1.1-Windows-x64-portable.zip</code> را از **[صفحه Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** دانلود کنید (با <code>SHA256SUMS.txt</code> بررسی کنید).<br>
+۱. فایل <code>UAC-Spoofer-Desktop-v1.1.2-Windows-x64-portable.zip</code> را از **[صفحه Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** دانلود کنید (با <code>SHA256SUMS.txt</code> بررسی کنید).<br>
 ۲. کل فایل ZIP را استخراج کنید و پوشه <code>_internal</code> را کنار فایل اجرایی نگه دارید.<br>
 ۳. فایل <code>UAC-Spoofer-Desktop.exe</code> را اجرا کنید و پیام UAC ویندوز را تأیید کنید (دسترسی ادمین برای درایور Spoof، حالت TUN و درگاه لازم است).<br>
 ۴. دستیار شروع سریع را دنبال کنید و دکمه **اتصال** را بزنید.
@@ -166,8 +166,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 برنامه را یک بار باز و سپس خارج کنید؛ وضعیت ذخیره‌شده پروکسی و درگاه ویندوز خودکار بازگردانده می‌شود.
 </details>
 
-## تازه‌های نسخه ۱.۱.۱
+## تازه‌های نسخه ۱.۱.۲
 
+- دریافت خودکار کلید WARP با مسیر ‏OOB (‏<code>keyfetch-net</code> / SChannel) برای شبکه‌هایی مثل AS48944؛ محافظ TUN و رزرو پورت پروکسی.
 - موتور دوم **‏UAC PoW** (سایفون روی وارپ) با تنظیمات، انتخاب کشور خروجی و گزینه‌های سرعت.
 - دستیار شروع سریع، راهنماهای روی صفحه و سایت آموزش تصویری کامل.
 - انتخاب حالت خودکار بر اساس کیفیت واقعی (بارگذاری صفحه و سرعت) بین گزینه‌های تست‌شده هم‌زمان.

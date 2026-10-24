@@ -6,7 +6,7 @@
 
 **A one-click Windows network dashboard: Xray + Patterniha SNI spoofing, and a second Psiphon-over-WARP engine.**
 
-[![Version](https://img.shields.io/badge/version-1.1.1-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
+[![Version](https://img.shields.io/badge/version-1.1.2-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](#download--quick-start)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/Floxu1/UAC-SNI-Spoofer-Windows?style=flat-square&label=latest)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)
@@ -29,7 +29,7 @@
 - [Download & quick start](#download--quick-start)
 - [Build from source](#build-from-source)
 - [FAQ & troubleshooting](#faq--troubleshooting)
-- [What's new in 1.1.1](#whats-new-in-111)
+- [What's new in 1.1.2](#whats-new-in-112)
 - [Credits](#credits)
 - [License](#license)
 
@@ -106,7 +106,7 @@ Options include Psiphon-over-WARP (default), HTTP/2 fragment, parallel MASQUE se
 
 ## Download & quick start
 
-1. Download `UAC-Spoofer-Desktop-v1.1.1-Windows-x64-portable.zip` from **[Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** (verify with `SHA256SUMS.txt`).
+1. Download `UAC-Spoofer-Desktop-v1.1.2-Windows-x64-portable.zip` from **[Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** (verify with `SHA256SUMS.txt`).
 2. Extract the whole ZIP; keep the `_internal` folder next to the exe.
 3. Run `UAC-Spoofer-Desktop.exe` and accept the UAC prompt (admin is needed for the spoofing driver, TUN and gateway).
 4. Follow the quick-start wizard, then press **Connect**.
@@ -162,8 +162,9 @@ That is the one-time 1.1.1 reset. Everything was moved to `%APPDATA%\UAC Spoofer
 Start the app once and exit: it restores the saved Windows proxy and gateway state automatically.
 </details>
 
-## What's new in 1.1.1
+## What's new in 1.1.2
 
+- Automatic WARP key fetch via OOB lane (<code>keyfetch-net</code> / SChannel) for networks like AS48944; TUN guard and proxy port reserve.
 - Engine 2 **UAC PoW** (Psiphon over WARP) with its own settings, exit-country picker and speed options.
 - Quick-start wizard, coach marks and a full illustrated guide site.
 - Auto mode now picks by real quality (page load + throughput) among parallel-tested candidates.
