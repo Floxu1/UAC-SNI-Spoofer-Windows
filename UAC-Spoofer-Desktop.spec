@@ -1,4 +1,4 @@
-﻿from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = [
     ('assets', 'assets'),
@@ -12,6 +12,7 @@ datas = [
     ('bin/sing-box-LICENSE', 'bin'),
 
     ('bin/aether.exe', 'bin'),
+    ('bin/keyfetch-net.ps1', 'bin'),
     ('bin/uac-psiphon.exe', 'bin'),
 
     ('wizard guider', 'wizard guider'),

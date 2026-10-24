@@ -10,6 +10,7 @@ from typing import Any
 from .config import (
     DEFAULT_KEY_FETCH,
     KEY_ECH,
+    KEY_FETCHES_RETIRED,
     FIREWALL_AUTO,
     OUTER_AUTO,
     RECIPE_AUTO,
@@ -36,6 +37,11 @@ _KEY_MAP = (
     ("irancell_h3", "speed_irancell_h3", False),
     ("direct_psiphon_first", "speed_direct_psiphon_first", False),
     ("lowest_rtt_ip", "speed_lowest_rtt_ip", False),
+    ("quic_tuned", "quic_tuned", False),
+    ("h2_large_windows", "h2_large_windows", True),
+    ("h2_socket_tuning", "h2_socket_tuning", True),
+    ("h2_speed_pick", "h2_speed_pick", True),
+    ("h2_fragment_mode", "h2_fragment_mode", "auto"),
 )
 
 #: v2: key_fetch default moved from "ech" to the mobile "auto" race.
@@ -55,6 +61,13 @@ class PowStore:
         """Older desktop builds saved the then-default "ech" on first save.
         Move those files to the mobile default ("auto") once."""
         with self._lock:
+            # The ECH-DoH key route was retired (blocked on MCI): fall back to auto.
+            if str(self._doc.get("key_fetch", "")).strip().lower() in KEY_FETCHES_RETIRED:
+                self._doc["key_fetch"] = DEFAULT_KEY_FETCH
+                try:
+                    self._write()
+                except OSError:
+                    pass
             try:
                 version = int(self._doc.get("settings_version", 1) or 1)
             except (TypeError, ValueError):
@@ -106,6 +119,46 @@ class PowStore:
             self._doc["settings_version"] = SETTINGS_VERSION
             self._write()
         return validated
+
+    # -- exit mode (TUN vs Windows proxy) --------------------------------
+    def exit_proxy_mode(self) -> bool:
+        """Saved exit choice: False = TUN (the default), True = Windows proxy."""
+        with self._lock:
+            return bool(self._doc.get("exit_proxy_mode", False))
+
+    def save_exit_proxy_mode(self, proxy: bool) -> None:
+        with self._lock:
+            self._doc["exit_proxy_mode"] = bool(proxy)
+            self._write()
+
+    # -- local proxy port (Windows proxy / App Bypass mixed port) ---------
+    def proxy_http_port(self) -> int:
+        """Saved local HTTP port; 1822 (the built-in port) when unset."""
+        from ..proxy_ports import POW_HTTP_DEFAULT, POW_HTTP_KEY, pow_port_from_value
+        with self._lock:
+            return pow_port_from_value(self._doc.get(POW_HTTP_KEY, POW_HTTP_DEFAULT))
+
+    def psiphon_socks_port(self) -> int:
+        """Saved Psiphon local SOCKS port; 1821 (the built-in port) when unset."""
+        from ..proxy_ports import POW_SOCKS_DEFAULT, POW_SOCKS_KEY, pow_socks_from_value
+        with self._lock:
+            return pow_socks_from_value(self._doc.get(POW_SOCKS_KEY, POW_SOCKS_DEFAULT))
+
+    def save_psiphon_socks_port(self, port: int) -> int:
+        from ..proxy_ports import POW_SOCKS_KEY, pow_socks_from_value
+        value = pow_socks_from_value(port)
+        with self._lock:
+            self._doc[POW_SOCKS_KEY] = value
+            self._write()
+        return value
+
+    def save_proxy_http_port(self, port: int) -> int:
+        from ..proxy_ports import POW_HTTP_KEY, pow_port_from_value
+        value = pow_port_from_value(port)
+        with self._lock:
+            self._doc[POW_HTTP_KEY] = value
+            self._write()
+        return value
 
     # -- last connect -----------------------------------------------------
     def save_last_connect(self, last: LastConnect) -> None:

@@ -26,6 +26,8 @@ from typing import Callable
 from .config import (
     CHAIN_SOCKS_PORT,
     KEY_FETCHES,
+    KEY_FETCHES_WITH_APP_ECH,
+    KEY_FETCH_IDLE_TIMEOUT_S,
     KEY_FETCH_TIMEOUT_S,
     chain_outer_json,
     uses_mci_firewall,
@@ -70,9 +72,24 @@ def json_to_env(payload: dict) -> dict[str, str]:
         env["AETHER_MASQUE_HTTP2"] = "1"
     if payload.get("h2_fragmentation"):
         env["AETHER_MASQUE_H2_FRAGMENT"] = "1"
+    # Mobile PowCoreConfig.chainOuterJson tuning switches. The CLI reads
+    # AETHER_QUIC_TUNED=1; the three H2 switches are "1"/"0" (default on).
+    if payload.get("quic_tuned"):
+        env["AETHER_QUIC_TUNED"] = "1"
+    for key, name in (
+        ("h2_large_windows", "AETHER_MASQUE_H2_LARGE_WINDOWS"),
+        ("h2_socket_tuning", "AETHER_MASQUE_H2_SOCKET_TUNING"),
+        ("h2_speed_pick", "AETHER_MASQUE_H2_SPEED_PICK"),
+    ):
+        if key in payload:
+            env[name] = "1" if payload.get(key) else "0"
     api_camo = str(payload.get("api_camo", "") or "").strip().lower()
     if api_camo in KEY_FETCHES:
         env["AETHER_API_CAMO"] = api_camo
+    relay = str(payload.get("api_relay", "") or "").strip()
+    if relay:
+        # Relay URL list for the core's relay key route (auto + relay).
+        env["AETHER_API_RELAY"] = relay
     discovery = str(payload.get("endpoint_discovery", "") or "").strip().lower()
     if discovery in ("cache", "fresh", "clean", "saved"):
         env["AETHER_DISCOVERY"] = discovery
@@ -91,6 +108,45 @@ def json_to_env(payload: dict) -> dict[str, str]:
     if payload.get("renew_masque"):
         env["AETHER_RENEW_CERT"] = "1"
     return env
+
+
+def _app_ech_env(data_dir: Path, api_camo: str, on_log: LogCallback | None = None) -> dict[str, str]:
+    """AETHER_API_ECH for the core's ECH-DoH key route (modes auto and doh).
+
+    The key comes from ``ech_keys.prefetch_pow_key`` (cache in
+    ``data_dir/ech_keys.json``). A fresh cached key is returned at once and
+    refreshed in the background. Without one the request is not held back:
+    the refresh runs in the background for next time and the core is told
+    (AETHER_API_DOH=1) to race DoH-by-IP / Shecan / UDP itself, alongside its
+    clean-edge probe. Never raises.
+    """
+    if str(api_camo or "").strip().lower() not in KEY_FETCHES_WITH_APP_ECH:
+        return {}
+
+    def _log(message: str) -> None:
+        if on_log is None:
+            return
+        text = str(message)
+        if text.startswith("ECH KEY: "):
+            text = text[len("ECH KEY: "):]
+        try:
+            on_log(f"Key: ECH-DoH key list: {text}")
+        except Exception:
+            pass
+
+    try:
+        from .. import ech_keys
+
+        cache = ech_keys.EchKeyCache(Path(data_dir) / "ech_keys.json")
+        key, source = ech_keys.prefetch_pow_key(cache, log=_log, block=False)
+    except Exception as exc:
+        _log(f"prefetch error {type(exc).__name__}: {exc}")
+        key, source = "", ""
+    if key:
+        _log(f"handing the core an ECHConfigList ({source}) for the ECH-DoH route")
+        return {"AETHER_API_ECH": key}
+    _log("no app key yet; the core races DoH 8.8.8.8/8.8.4.4, Shecan and UDP itself")
+    return {"AETHER_API_DOH": "1"}
 
 
 def _prepare_args(binary: Path, payload: dict, renew: bool) -> list[str]:
@@ -127,6 +183,7 @@ def prepare_identity(
     on_log: LogCallback | None = None,
     stop: threading.Event | None = None,
     api_camo: str | None = None,
+    idle_timeout: float = KEY_FETCH_IDLE_TIMEOUT_S,
 ) -> dict:
     """Provision key/cert via ``aether --prepare-only``. Returns addresses JSON.
 
@@ -137,6 +194,11 @@ def prepare_identity(
     The core's ``Key:`` / ``Cert:`` progress lines are written to
     ``aether-core.log``, not stderr, on Windows: that file is tailed live and
     forwarded to ``on_log`` the same way the outer leg does.
+
+    Mobile parity: there is no overall budget. The request keeps running while
+    the core still produces output (stdout, stderr or ``aether-core.log``);
+    it is abandoned after ``idle_timeout`` seconds without any output, and
+    ``timeout`` is only a generous safety cap.
     """
     from .config import cert_renew_json, key_request_json
 
@@ -152,19 +214,28 @@ def prepare_identity(
     env = dict(os.environ)
     env.update(json_to_env(payload))
     env["AETHER_PREPARE_ONLY"] = "1"
+    if not env.get("AETHER_API_ECH"):
+        env.update(_app_ech_env(data_dir, env.get("AETHER_API_CAMO", ""), on_log))
     if renew:
         env["AETHER_RENEW_CERT"] = "1"
     args = _prepare_args(binary, payload, renew)
 
+    last_activity = [time.monotonic()]
+
+    def _progress(line: str) -> None:
+        last_activity[0] = time.monotonic()
+        if on_log is not None:
+            on_log(line)
+
     tail_stop = threading.Event()
     tail_thread: threading.Thread | None = None
     config_path = str(payload.get("config_path") or "")
-    if on_log is not None and config_path:
+    if config_path:
         core_log = Path(config_path).parent / "aether-core.log"
         start_offset = core_log.stat().st_size if core_log.exists() else 0
         tail_thread = threading.Thread(
             target=follow_core_log,
-            args=(core_log, tail_stop, on_log, start_offset),
+            args=(core_log, tail_stop, _progress, start_offset),
             name="pow-prepare-core-log",
             daemon=True,
         )
@@ -183,10 +254,14 @@ def prepare_identity(
     )
     out_lines: list[str] = []
     err_lines: list[str] = []
+
+    def _progress_quiet(_line: str) -> None:
+        last_activity[0] = time.monotonic()
+
     readers = [
-        threading.Thread(target=_drain_pipe, args=(process.stdout, out_lines), daemon=True,
+        threading.Thread(target=_drain_pipe, args=(process.stdout, out_lines, _progress_quiet), daemon=True,
                          name="pow-prepare-stdout"),
-        threading.Thread(target=_drain_pipe, args=(process.stderr, err_lines, on_log), daemon=True,
+        threading.Thread(target=_drain_pipe, args=(process.stderr, err_lines, _progress), daemon=True,
                          name="pow-prepare-stderr"),
     ]
     for reader in readers:
@@ -215,9 +290,13 @@ def prepare_identity(
         if stop is not None and stop.is_set():
             _finish(kill=True)
             raise RuntimeError("stopped")
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= deadline:
             _finish(kill=True)
             raise RuntimeError(f"key request timed out after {int(timeout)}s")
+        if idle_timeout and now - last_activity[0] >= idle_timeout:
+            _finish(kill=True)
+            raise RuntimeError(f"key request made no progress for {int(idle_timeout)}s")
         time.sleep(0.1)
     _finish(kill=False)
     stdout = "".join(out_lines)
@@ -314,6 +393,10 @@ class AetherProcess:
         self._tail: threading.Thread | None = None
         self._tail_stop = threading.Event()
         self._lock = threading.Lock()
+        from collections import deque
+
+        self.recent_lines: deque = deque(maxlen=12)
+        self._last_returncode = None
 
     @property
     def running(self) -> bool:
@@ -371,7 +454,29 @@ class AetherProcess:
             )
             self._tail.start()
 
+    def exit_detail(self) -> str:
+        """Why the outer leg is gone: exit code + its last meaningful log line."""
+        with self._lock:
+            process = self._process
+        code = process.poll() if process is not None else self._last_returncode
+        last = ""
+        for line in reversed(self.recent_lines):
+            text = line.strip()
+            if text and not text.lower().startswith(("debug", "trace")):
+                last = text
+                break
+        parts = []
+        if code is not None:
+            parts.append(f"exit code {code}" + (f" (0x{code & 0xFFFFFFFF:08X})" if code < 0 or code > 255 else ""))
+        if last:
+            parts.append(f"last: {last[:160]}")
+        return "; ".join(parts) or "no output"
+
     def _deliver(self, line: str) -> None:
+        try:
+            self.recent_lines.append(line)
+        except Exception:
+            pass
         callback = self._on_log
         if callback is None:
             return

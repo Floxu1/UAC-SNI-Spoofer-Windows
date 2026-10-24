@@ -427,7 +427,7 @@ class SniBatchTester:
                 for value in {str(parse_outbound(p).get("ech") or "") for p in ech_profiles}:
                     if value:
                         res = ech_keys.resolve(value, ech_cache, self.log)
-                        if res.state in ("fresh", "cached"):
+                        if res.state in ("fresh", "cached", "fallback"):
                             self._ech_overrides[value] = res.value
             except Exception as exc:
                 self.log(f"ECH KEY: batch prefetch unavailable: {exc}")

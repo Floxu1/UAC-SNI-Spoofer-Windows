@@ -85,7 +85,8 @@ def format_connected_block(config, gene, method, fake_sni, edge, edge_from,
         "=====================",
     ]
     if ech_state:
-        key = {"fresh": "key fresh", "cached": "key cached", "raw": "key from config"}.get(
+        key = {"fresh": "key fresh", "cached": "key cached", "raw": "key from config",
+               "fallback": "key built-in fallback"}.get(
             str(ech_state), "key via xray")
         lines.insert(-1, "  ECH      : on \u00b7 " + key)
     return "\n".join(lines)

@@ -487,7 +487,7 @@ def test_mci_suggested_auto_skips_only_builtin_404_paths(monkeypatch):
 
 def test_forced_user_config_keeps_mci_tls_strategy_in_auto_mode():
     assert MainWindow._initial_connection_strategy("mci", "") == "tls_sni_records"
-    assert MainWindow._initial_connection_strategy("irancell", "") == "wrong_seq"
+    assert MainWindow._initial_connection_strategy("irancell", "") == "full5"
     assert MainWindow._initial_connection_strategy("mci", "DE") == "wrong_seq"
 
 
@@ -507,7 +507,7 @@ def test_mci_builtin_uses_isolated_live_route_without_mutating_user_tuning():
 
     assert attempt.pattern_connect_ip == ui_module.MCI_BUILTIN_PRIMARY_EDGE
     assert attempt.pattern_fallback_ips == ui_module.MCI_BUILTIN_FALLBACK_EDGES
-    assert attempt.pattern_fake_sni == "chatgpt.com"
+    assert attempt.pattern_fake_sni == ui_module.MCI_BUILTIN_FAKE_SNI
     assert attempt.pattern_fake_repeat == ui_module.MCI_BUILTIN_FAKE_REPEAT == 1
     assert attempt.pattern_inject_delay_ms == ui_module.MCI_BUILTIN_INJECT_DELAY_MS == 0
     assert attempt.pattern_ack_timeout_ms == 8000
@@ -524,6 +524,40 @@ def test_mci_builtin_uses_isolated_live_route_without_mutating_user_tuning():
     assert base.pattern_socket_buffer_kb == 512
     assert base.pattern_upload_optimized is False
     assert base.xray_mux_enabled is True
+
+
+def test_irancell_attempt_keeps_config_and_tries_its_own_edge_first():
+    base = Tuning.carrier_preset("irancell")
+    profile = ProxyProfile(
+        origin="builtin",
+        address="51.15.56.211",
+        fallback_address="not-an-ip",
+        sni="www.ignitelimit.com",
+    )
+    original_address = profile.address
+
+    attempt = MainWindow._attempt_tuning_for_profile(
+        profile, base, "chatgpt.com", True,
+    )
+
+    assert attempt.pattern_connect_ip == "51.15.56.211"
+    assert attempt.pattern_connect_ip != base.pattern_connect_ip
+    assert "104.19.229.21" in attempt.pattern_fallback_ips
+    assert profile.address == original_address
+    assert base.pattern_connect_ip == "104.19.229.21"
+    assert MainWindow._initial_connection_strategy("irancell") == "full5"
+
+
+def test_adaptive_strategies_keep_last_winner_then_rotate():
+    assert MainWindow._adaptive_strategies("irancell", "full5", "wrong_seq") == [
+        "wrong_seq", "full5", "tls_sni_records",
+    ]
+    assert MainWindow._adaptive_strategies("auto", "wrong_seq") == [
+        "wrong_seq", "full5", "tls_sni_records",
+    ]
+    assert MainWindow._adaptive_strategies("mci", "tls_sni_records", "full5") == [
+        "tls_sni_records",
+    ]
 
 
 def test_mci_builtin_uses_live_primary_plan_but_user_config_keeps_existing_strategy():
@@ -558,7 +592,7 @@ def test_mci_builtin_starts_with_live_verified_web_route():
         dummy, profile, "mci", 3,
     ) == ["www.ignitelimit.com"] * len(ui_module.MCI_BUILTIN_ROUTE_PLANS)
     assert ui_module.MCI_BUILTIN_ROUTE_PLANS[0] == (
-        "plain", "104.18.1.1"
+        "full5", "104.18.1.1"
     )
 
 

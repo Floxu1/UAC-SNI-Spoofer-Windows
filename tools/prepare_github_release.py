@@ -22,6 +22,11 @@ PORTABLE_RUNTIME_FILES = (
     Path("_internal/bin/sing-box.exe"),
     Path("_internal/bin/libcronet.dll"),
     Path("_internal/bin/sing-box-LICENSE"),
+    Path("_internal/bin/geoip.dat"),
+    Path("_internal/bin/geosite.dat"),
+    Path("_internal/bin/aether.exe"),
+    Path("_internal/bin/uac-psiphon.exe"),
+    Path("_internal/assets/pow_server_entries.txt"),
 )
 ASSISTANT_ASSET_FILES = tuple(
     Path("_internal/wizard guider") / f"wizard_{index:02d}_{state}.png" for index, state in enumerate((

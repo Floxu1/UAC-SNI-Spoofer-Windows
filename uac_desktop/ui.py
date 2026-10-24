@@ -929,6 +929,11 @@ class ToggleOptionFrame(QFrame):
         super().mouseReleaseEvent(event)
 
 
+#: PoW Home HTTP/2 fragment switch label (Persian from the Home page) + auto tag.
+_POW_H2_FA = 'فرگمنت HTTP/2'
+_POW_AUTO_FA = 'خودکار'
+
+
 class ToggleSwitch(QCheckBox):
     """Keyboard-accessible custom switch without native checkbox chrome."""
 
@@ -2258,7 +2263,8 @@ class TuningDialog(QDialog):
                  multi_gene_enabled: bool = False,
                  multi_gene_status: str = "",
                  auto_clean_ip: bool = True,
-                 clean_ip_launcher=None):
+                 clean_ip_launcher=None,
+                 ech_via_pattern: bool = False):
         super().__init__(parent); self.language = language; self.t = lambda fa, en: en if language == "en" else fa; self._animated = False
         self._gene_strategies = list(gene_strategies or [])
         self._selected_gene_strategy_id = str(selected_gene_strategy_id or "")
@@ -2267,6 +2273,7 @@ class TuningDialog(QDialog):
         self._multi_gene_status = str(multi_gene_status or "")
         self._auto_clean_ip = bool(auto_clean_ip)
         self._clean_ip_launcher = clean_ip_launcher
+        self._ech_via_pattern = bool(ech_via_pattern)
         self._loading_tuning = False
         self._active_carrier = tuning.carrier_mode if tuning.carrier_mode in {"auto", "mci", "irancell"} else "auto"
         self._carrier_drafts = {
@@ -2438,6 +2445,9 @@ class TuningDialog(QDialog):
         self.clean_ip_scan_btn.setEnabled(callable(self._clean_ip_launcher))
         self.clean_ip_scan_btn.clicked.connect(
             lambda: self._clean_ip_launcher(self) if callable(self._clean_ip_launcher) else None)
+        # ECH via Pattern core (Engine 1, default off).
+        self.ech_via_pattern = ToggleSwitch(); self.ech_via_pattern.setChecked(self._ech_via_pattern)
+        self.ech_via_pattern.setAccessibleName("ECH via Pattern core")
 
         self.update_repo = QLineEdit(update_repo_url or DEFAULT_UPDATE_REPO_URL); self.update_repo.setProperty("technical", True); self.update_repo.setPlaceholderText("https://github.com/owner/repository")
         adv_layout.addWidget(self._section(
@@ -2503,7 +2513,10 @@ class TuningDialog(QDialog):
                      "Tests cached and sampled Cloudflare IPs before Connect (max ~5 s).")),
              (self.t("\u0627\u0633\u06a9\u0646 \u06a9\u0627\u0645\u0644", "Full scan"), self.clean_ip_scan_btn,
               self.t("\u0627\u0633\u06a9\u0646 \u062f\u0633\u062a\u06cc \u0648 \u0627\u0646\u062a\u062e\u0627\u0628 \u06cc\u06a9 IP \u0628\u0631\u0627\u06cc \u0647\u0645\u06cc\u0646 \u0646\u0634\u0633\u062a.",
-                     "Scan manually and pick one IP for this session."))]))
+                     "Scan manually and pick one IP for this session.")),
+             (self.t("\u0639\u0628\u0648\u0631 ECH \u0627\u0632 \u0647\u0633\u062a\u0647 Pattern", "ECH via Pattern core"), self._toggle_field(self.ech_via_pattern),
+              self.t("\u067e\u06cc\u0634\u200c\u0641\u0631\u0636 \u062e\u0627\u0645\u0648\u0634. \u06a9\u0627\u0646\u0641\u06cc\u06af\u200c\u0647\u0627\u06cc ECH \u0628\u0647\u200c\u062c\u0627\u06cc \u0627\u062a\u0635\u0627\u0644 \u0645\u0633\u062a\u0642\u06cc\u0645 \u0627\u0632 \u0647\u0633\u062a\u0647 \u0645\u062d\u0644\u06cc Pattern (wrong-seq) \u0631\u062f \u0645\u06cc\u200c\u0634\u0648\u0646\u062f\u061b ClientHello \u062e\u0648\u062f ECH \u062f\u0633\u062a \u0646\u0645\u06cc\u200c\u062e\u0648\u0631\u062f.",
+                     "Off by default. ECH configs go through the local Pattern core (wrong-seq) instead of dialing directly; the ECH ClientHello itself is not changed."))]))
         strategy = self._section(
             self.t("\u0627\u0633\u062a\u0631\u0627\u062a\u0698\u06cc", "Strategy"),
             self.t("\u0631\u0648\u0634 \u0627\u062a\u0635\u0627\u0644: \u0628\u062f\u0648\u0646 \u0698\u0646 (\u0631\u0648\u0634 \u062f\u0627\u062e\u0644\u06cc) \u06cc\u0627 \u06cc\u06a9 \u0698\u0646 Gene Lab.",
@@ -2516,6 +2529,10 @@ class TuningDialog(QDialog):
         self.strategy_state.setWordWrap(True); self.strategy_state.setAlignment(Qt.AlignLeading | Qt.AlignTop)
         strategy.layout().addWidget(self.strategy_state)
         body_layout.addWidget(strategy)
+        # Local proxy ports (Engine 1) — settings dialog only, not Home.
+        from .proxy_port_panel import install_xray_ports_into_tuning
+        install_xray_ports_into_tuning(self)
+        body_layout.addWidget(self._proxy_ports_section)
 
         adv = QFrame(); adv.setObjectName("settingsSection")
         adv_l = QVBoxLayout(adv); adv_l.setContentsMargins(18, 14, 18, 14); adv_l.setSpacing(10)
@@ -2669,6 +2686,12 @@ class TuningDialog(QDialog):
 
     def auto_clean_ip_value(self) -> bool:
         return bool(self.auto_clean_ip.isChecked())
+
+    def ech_via_pattern_value(self) -> bool:
+        toggle = getattr(self, "ech_via_pattern", None)
+        if toggle is None:
+            return bool(getattr(self, "_ech_via_pattern", False))
+        return bool(toggle.isChecked())
 
     def multi_gene_enabled_value(self) -> bool:
         return bool(self.multi_gene.isChecked())
@@ -2941,6 +2964,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         )
         self.assistant_controller = None
         self.engine = Engine(self.bridge.log.emit, self.bridge.state.emit, self.bridge.traffic.emit)
+        self.engine.ech_via_pattern = bool(self.storage.settings.get("ech_via_pattern", False))
+        self._apply_xray_port_setting()
         self.engine_mode, _engine_migrated = resolve_startup_engine(self.storage.settings)
         if _engine_migrated:
             try:
@@ -3800,6 +3825,32 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.process_search.textChanged.connect(self._filter_processes)
         return page
 
+    def _apply_xray_port_setting(self):
+        """Hand the saved engine-1 SOCKS/HTTP pair to the engine (next start)."""
+        try:
+            from .proxy_ports import xray_ports_from_settings
+            self.engine.preferred_ports = xray_ports_from_settings(self.storage.settings)
+        except Exception:
+            pass
+
+    def _sync_proxy_port_panels(self, except_panel=None):
+        """Ports live in settings dialogs now; nothing to sync on Home."""
+        return
+
+
+    def _refresh_proxy_port_panels_for_engine(self):
+        """No Home port panels."""
+        return
+
+
+    def _open_proxy_port_dialog(self):
+        """Ports are in Advanced / PoW Settings; open Advanced for Xray."""
+        try:
+            self.open_tuning()
+        except Exception:
+            pass
+
+
     def _tools_page(self):
         page, body = self._scroll_page(); root = QVBoxLayout(body); root.setContentsMargins(34, 28, 34, 26); root.setSpacing(16)
         root.addWidget(self._page_header("ابزارهای شبکه", "Network Tools", "قابلیت‌های بیشتر نسخه کامپیوتر", "Focused utilities for route, IP and diagnostics"))
@@ -4325,6 +4376,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.manual_option.setVisible(False)
             self._relayout_control_bar()
             self._load_pow_home_controls()
+            self._refresh_proxy_port_panels_for_engine()
         else:
             self._restore_bilingual(subtitle)
             self._restore_bilingual(self.country_description)
@@ -4344,6 +4396,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._relayout_control_bar()
             self.original_configs_label.setText("UAC Spoof Original Configs")
             self._restore_xray_home_controls()
+            self._refresh_proxy_port_panels_for_engine()
 
     def _load_pow_home_controls(self):
         controller = getattr(self, "pow_controller", None)
@@ -4360,10 +4413,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
         try:
             self.auto_mode.setChecked(bool(settings.chain_psiphon))
             self.pick_best.setChecked(bool(settings.optimized_mode))
-            proxy = bool(controller._exit_proxy_mode)
+            proxy = bool(controller.effective_exit_proxy())
             self.proxy_mode.setChecked(proxy)
             self.tun_mode.setChecked(not proxy)
-            self.gateway_mode.setChecked(bool(settings.h2_fragmentation))
+            self.gateway_mode.setChecked(bool(controller.h2_fragment_display()[0]))
             firewall = settings.firewall_profile if settings.firewall_profile in ("auto", "mci", "irancell") else "auto"
             self.carrier.setCurrentText(firewall)
             automatic = not (settings.exit_country_code or "").strip()
@@ -4373,6 +4426,73 @@ class MainWindow(LogsPageMixin, QMainWindow):
             for widget in widgets:
                 widget.blockSignals(False)
             self._pow_home_loading = False
+        self._pow_h2_label_state = None
+        self._pow_sync_home_visuals()
+
+    @staticmethod
+    def _pow_set_toggle(toggle, value):
+        """Set a switch without firing its handler, and move the thumb too
+        (the thumb animation hangs off the blocked toggled signal)."""
+        value = bool(value)
+        if toggle.isChecked() != value:
+            toggle.blockSignals(True)
+            toggle.setChecked(value)
+            toggle.blockSignals(False)
+        if hasattr(toggle, "_set_thumb_position") and getattr(toggle, "_thumb_position", None) != (1.0 if value else 0.0):
+            toggle._set_thumb_position(1.0 if value else 0.0)
+
+    def _pow_sync_home_visuals(self):
+        """PoW Home: TUN / Windows proxy show the real running exit (exactly one
+        on) and HTTP/2 fragment shows the effective state, with an auto tag
+        when adaptive fragmentation turned it on."""
+        controller = getattr(self, "pow_controller", None)
+        if controller is None or getattr(self, "engine_mode", ENGINE_XRAY) != ENGINE_POW:
+            return
+        if not hasattr(self, "proxy_mode") or getattr(self, "_pow_home_loading", False):
+            return
+        proxy = bool(controller.effective_exit_proxy())
+        self._pow_set_toggle(self.proxy_mode, proxy)
+        self._pow_set_toggle(self.tun_mode, not proxy)
+        for option, toggle, active in (
+            (self.proxy_option, self.proxy_mode, proxy),
+            (self.tun_option, self.tun_mode, not proxy),
+        ):
+            changed = False
+            if not option.isEnabled() or not toggle.isEnabled():
+                # Xray's TUN / gateway rules disable these rows; PoW needs both.
+                option.setEnabled(True)
+                toggle.setEnabled(True)
+                changed = True
+            if option.property("active") != active:
+                option.setProperty("active", active)
+                changed = True
+            if changed:
+                _restyle(option)
+        checked, auto_on = controller.h2_fragment_display()
+        self._pow_set_toggle(self.gateway_mode, checked)
+        if not self.gateway_mode.isEnabled():
+            self.gateway_mode.setEnabled(True)
+        state = bool(auto_on)
+        if getattr(self, "_pow_h2_label_state", None) != state:
+            self._pow_h2_label_state = state
+            fa, en = _POW_H2_FA, "HTTP/2 fragmentation"
+            if state:
+                fa, en = f"{fa} \u00b7 {_POW_AUTO_FA}", f"{en} \u00b7 auto"
+            self._set_bilingual(self._option_label(self.gateway_option), fa, en)
+            self.gateway_mode.setToolTip(self.tr(
+                "\u0631\u0648\u0634\u0646: \u0647\u0645\u06cc\u0634\u0647 \u0631\u0648\u0634\u0646. \u062e\u0627\u0645\u0648\u0634: \u062e\u0648\u062f\u06a9\u0627\u0631 (\u0627\u06af\u0631 DPI \u062f\u06cc\u062f\u0647 \u0634\u0648\u062f \u0631\u0648\u0634\u0646 \u0645\u06cc\u200c\u0634\u0648\u062f).",
+                "On: always fragment. Off: automatic (turns on by itself when DPI is suspected).",
+            ))
+
+    def _pow_exit_mode_clicked(self, proxy, enabled):
+        """TUN and Windows proxy are one choice: turning one on turns the other
+        off, turning one off selects the other. Applied live when connected."""
+        controller = getattr(self, "pow_controller", None)
+        if controller is None or getattr(self, "_pow_home_loading", False):
+            return
+        want_proxy = bool(proxy) if enabled else (not proxy)
+        controller.set_exit_mode(want_proxy)
+        self._pow_sync_home_visuals()
 
     def _fill_pow_country_combo(self, selected: str, automatic: bool):
         """PoW keeps a single exit control: the selector button."""
@@ -4464,6 +4584,20 @@ class MainWindow(LogsPageMixin, QMainWindow):
             for widget in widgets:
                 widget.blockSignals(False)
             self._pow_home_loading = False
+        # Undo what the PoW Home changed on the shared switches (thumbs, active
+        # look, enabled rows) so Xray shows its own saved state again.
+        try:
+            for toggle in (self.auto_mode, self.pick_best, self.proxy_mode, self.tun_mode, self.gateway_mode):
+                self._pow_set_toggle(toggle, toggle.isChecked())
+            self.proxy_option.setProperty("active", self.proxy_mode.isChecked())
+            self.tun_option.setProperty("active", self.tun_mode.isChecked())
+            self.proxy_option.setEnabled(not self._tun_mode_enabled())
+            _restyle(self.proxy_option)
+            _restyle(self.tun_option)
+            self._sync_gateway_controls()
+        except Exception:
+            pass
+        self._pow_h2_label_state = None
         try:
             self._refresh_country_selector()
             self.refresh_profiles()
@@ -5044,7 +5178,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
             label = "\u200fتونل \u2068Xray\u2069" if fa else "Xray tunnel"
         elif mode == "pow":
             from .pow.coordinator import FORWARD_HTTP_PORT
-            loader = lambda: fetch_details(FORWARD_HTTP_PORT)
+            coordinator = getattr(getattr(self, "pow_controller", None), "coordinator", None)
+            pow_port = int(getattr(coordinator, "forward_http_port", 0) or FORWARD_HTTP_PORT)
+            loader = lambda pow_port=pow_port: fetch_details(pow_port)
             label = "\u200fتونل \u2068UAC PoW\u2069" if fa else "UAC PoW tunnel"
         else:
             loader = direct_identity
@@ -5455,15 +5591,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if getattr(self, "_pow_home_loading", False):
                 return
-            if not enabled:
-                self.proxy_mode.blockSignals(True)
-                self.proxy_mode.setChecked(True)
-                self.proxy_mode.blockSignals(False)
-                return
-            self.tun_mode.blockSignals(True)
-            self.tun_mode.setChecked(False)
-            self.tun_mode.blockSignals(False)
-            self.pow_controller._exit_proxy_mode = True
+            self._pow_exit_mode_clicked(proxy=True, enabled=bool(enabled))
             return
         enabled = bool(enabled)
         self._save_flag("proxy_mode", enabled)
@@ -5869,15 +5997,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if getattr(self, "_pow_home_loading", False):
                 return
-            if not enabled:
-                self.tun_mode.blockSignals(True)
-                self.tun_mode.setChecked(True)
-                self.tun_mode.blockSignals(False)
-                return
-            self.proxy_mode.blockSignals(True)
-            self.proxy_mode.setChecked(False)
-            self.proxy_mode.blockSignals(False)
-            self.pow_controller._exit_proxy_mode = False
+            self._pow_exit_mode_clicked(proxy=False, enabled=bool(enabled))
             return
         enabled = bool(enabled)
         availability_error = ""
@@ -6523,7 +6643,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _gateway_mode_changed(self, enabled):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if not getattr(self, "_pow_home_loading", False):
-                self._pow_setting(h2_fragmentation=bool(enabled))
+                # On = force; off = auto (adaptive may turn it on again).
+                self.pow_controller.set_h2_fragment(bool(enabled))
+                self._pow_h2_label_state = None
+                self._pow_sync_home_visuals()
             return
         enabled = bool(enabled)
 
@@ -9639,6 +9762,18 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 self._set_connection_visual("error")
                 self._handle_error(message)
                 return
+        try:
+            self._apply_xray_port_setting()
+            port_problem = self.engine.check_configured_ports()
+        except Exception as exc:
+            port_problem = str(exc)
+        if port_problem:
+            message = self.tr(
+                f"پورت پروکسی انتخاب‌شده آزاد نیست: {port_problem}. در همین صفحه پورت دیگری بگذارید.",
+                f"The chosen proxy port is not free: {port_problem}. Pick another port on this page.",
+            )
+            self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
+            return
         generation, cancel = self._begin_connect_attempt()
         base_tuning = self.storage.tuning
         carrier = base_tuning.carrier_mode
@@ -10791,9 +10926,12 @@ class MainWindow(LogsPageMixin, QMainWindow):
                               self.storage.multi_gene_enabled,
                               self._multi_gene_status_text(),
                               bool(self.storage.settings.get(_clean_ip.SETTING_KEY, True)),
-                              self._open_clean_ip_scan)
+                              self._open_clean_ip_scan,
+                              ech_via_pattern=bool(self.storage.settings.get("ech_via_pattern", False)))
         if dialog.exec():
             self.storage.settings[_clean_ip.SETTING_KEY] = dialog.auto_clean_ip_value()
+            self.storage.settings["ech_via_pattern"] = dialog.ech_via_pattern_value()
+            self.engine.ech_via_pattern = bool(self.storage.settings["ech_via_pattern"])
             values = dialog.values(); value = dialog.value()
             gene_strategies, gene_selected = dialog.gene_selection()
             self.storage.set_gene_strategies(gene_strategies, gene_selected)

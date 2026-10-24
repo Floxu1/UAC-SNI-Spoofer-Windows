@@ -87,6 +87,8 @@ _RECIPE_OPTIONS = (
 )
 _KEY_FETCH_OPTIONS = (
     ("auto", "خودکار", "Auto"),
+    ("oob", "OOB", "OOB"),
+    ("relay", "رله", "Relay"),
     ("ech", "ECH", "ECH"),
     ("fragment", "فرگمنت", "Fragment"),
     ("external", "خارجی", "External"),
@@ -374,6 +376,7 @@ class PowSettingsDialog(QDialog):
         # the stored settings have been applied, or the first empty control
         # overwrites pow_settings.json.
         controller._editing = False
+        body_layout.addWidget(controller._build_proxy_ports_section())
         body_layout.addWidget(controller._build_tunnel_section())
         body_layout.addWidget(controller._build_speed_section())
         body_layout.addWidget(controller._build_identity_card())
@@ -491,7 +494,16 @@ class PowController:
         self._thread: threading.Thread | None = None
         self._connecting = False
         self._failed_message = ""
-        self._exit_proxy_mode = True
+        # TUN by default: the whole PC goes through the tunnel; the
+        # coordinator falls back to the Windows proxy when TUN cannot work.
+        # The choice is saved so it survives a restart.
+        try:
+            self._exit_proxy_mode = bool(self.store.exit_proxy_mode())
+        except Exception:
+            self._exit_proxy_mode = False
+        # Requested exit while a live switch runs (None when idle).
+        self._switch_target: bool | None = None
+        self._switch_token = None
         # The connection/identity cards live inside the settings dialog and are
         # built on demand; the page itself only needs the launcher summary.
         self.country_combo = None
@@ -555,6 +567,20 @@ class PowController:
         self._update_settings_summary()
         return page
 
+    def _build_proxy_port_card(self) -> QFrame:
+        """Deprecated: ports live in PoW Settings dialog."""
+        from PySide6.QtWidgets import QFrame
+        frame = QFrame()
+        frame.hide()
+        self.proxy_port_panel = None
+        return frame
+
+    def _build_proxy_ports_section(self) -> QFrame:
+        """HTTP + Psiphon SOCKS inside PowSettingsDialog (تنظیمات PoW)."""
+        from .proxy_port_panel import build_pow_ports_section
+        return build_pow_ports_section(self._window, self)
+
+
     def _build_settings_launcher(self) -> QFrame:
         from uac_desktop.ui import MotionFrame
 
@@ -604,6 +630,7 @@ class PowController:
             "chain_toggle", "optimized_toggle", "h2_toggle",
             "proxy_toggle", "tun_toggle", "identity_state", "identity_detail",
             "learned_box", "learned_count", *_SPEED_TOGGLES,
+            "pow_http_port_input", "pow_socks_port_input", "proxy_port_editor",
         ):
             setattr(self, name, None)
 
@@ -1157,6 +1184,8 @@ class PowController:
         self._activity_kind = ""
         self.status.reset()
         self._note_activity("progress")
+        token = object()
+        self._connect_token = token
 
         def _work() -> None:
             try:
@@ -1164,6 +1193,9 @@ class PowController:
                     settings, proxy_mode=proxy_mode, bypass_processes=bypass
                 )
                 window.bridge.log.emit(message)
+                if self._exit_proxy_mode != proxy_mode:
+                    # The exit switch was flipped while connecting: apply it now.
+                    self.coordinator.switch_exit_mode(lambda: self._exit_proxy_mode)
             except PowEngineError as exc:
                 self._failed_message = "" if str(exc) == "stopped" else str(exc)
                 if str(exc) != "stopped":
@@ -1174,7 +1206,10 @@ class PowController:
                 self._failed_message = str(exc) or repr(exc)
                 window.bridge.log.emit(f"UAC PoW error: {exc}")
             finally:
-                self._connecting = False
+                # An older attempt that unwinds late must not mark a newer
+                # connect as finished.
+                if getattr(self, "_connect_token", None) is token:
+                    self._connecting = False
 
         self._thread = threading.Thread(target=_work, name="pow-connect", daemon=True)
         self._thread.start()
@@ -1260,6 +1295,83 @@ class PowController:
             pass
 
     # -- refresh (GUI thread) ------------------------------------------------------
+    # -- exit mode / HTTP/2 fragment (Home switches) ----------------------------
+    def effective_exit_proxy(self) -> bool:
+        """What the Home switches show: the running session's real exit, the
+        requested one while a switch is applying, else the saved choice."""
+        if self._switch_target is not None:
+            return bool(self._switch_target)
+        try:
+            actual = self.coordinator.actual_proxy_mode
+        except Exception:
+            actual = None
+        return bool(self._exit_proxy_mode if actual is None else actual)
+
+    def set_exit_mode(self, proxy: bool) -> None:
+        """Save the exit choice; when connected, really switch the running exit."""
+        proxy = bool(proxy)
+        self._exit_proxy_mode = proxy
+        try:
+            self.store.save_exit_proxy_mode(proxy)
+        except Exception:
+            pass
+        try:
+            self._update_settings_summary()
+        except Exception:
+            pass
+        window = self._window
+        if not self.coordinator.running:
+            if self._connecting:
+                window.bridge.log.emit(
+                    "Exit mode saved; it is applied as soon as the current connect finishes")
+            return
+        if self.coordinator.actual_proxy_mode == proxy and self._switch_target is None:
+            return
+        self._switch_target = proxy
+        token = object()
+        self._switch_token = token
+
+        def _work() -> None:
+            try:
+                self.coordinator.switch_exit_mode(lambda: self._exit_proxy_mode)
+            except Exception as exc:
+                window.bridge.log.emit(f"UAC PoW exit switch failed: {exc}")
+            finally:
+                if self._switch_token is token:
+                    self._switch_target = None
+
+        threading.Thread(target=_work, name="pow-exit-switch", daemon=True).start()
+
+    def h2_fragment_display(self) -> tuple[bool, bool]:
+        """(switch on, turned on by adaptive auto). Off = auto mode."""
+        try:
+            mode = self.store.snapshot().h2_fragment_mode
+        except Exception:
+            mode = C.H2_FRAG_AUTO
+        if mode == C.H2_FRAG_ON:
+            return True, False
+        if mode == C.H2_FRAG_OFF:
+            return False, False
+        on = C.adaptive_on(self.data_dir)
+        return on, on
+
+    def set_h2_fragment(self, on: bool) -> None:
+        """On = force HTTP/2 fragmentation; off = back to auto (adaptive decides
+        again from scratch). Used at the next outer (re)connect, like mobile."""
+        if not on:
+            try:
+                C.AdaptiveObfuscation(self.data_dir).reset()
+            except Exception:
+                pass
+        changes = {"h2_fragment_mode": C.H2_FRAG_ON if on else C.H2_FRAG_AUTO,
+                   "h2_fragmentation": bool(on)}
+        setter = getattr(self._window, "_pow_setting", None)
+        if setter is not None:
+            setter(**changes)
+        else:
+            from dataclasses import replace
+            self.store.save(replace(self.store.snapshot(), **changes))
+
     def _thread_log(self, message: str) -> None:
         try:
             self._window.bridge.log.emit(str(message))
@@ -1274,6 +1386,12 @@ class PowController:
             snapshot = self.status.snapshot()
         except Exception:
             return
+        sync = getattr(window, "_pow_sync_home_visuals", None)
+        if sync is not None:
+            try:
+                sync()
+            except Exception:
+                pass
         try:
             self._render_snapshot(snapshot)
         except RuntimeError:
@@ -1378,7 +1496,7 @@ class PowController:
             window.ip_card.set_tight(False)
             badge.setVisible(False)
             badge._signature = None
-            exit_kind = window.tr("خروجی سایفون", "Psiphon exit") if self.coordinator.exit_port == C.PSIPHON_SOCKS_PORT else window.tr("خروجی WARP", "WARP exit")
+            exit_kind = window.tr("خروجی سایفون", "Psiphon exit") if self.coordinator.exit_port == getattr(self.coordinator, "psiphon_socks_port", C.PSIPHON_SOCKS_PORT) else window.tr("خروجی WARP", "WARP exit")
             name = ALL_NAMES.get(code, code) if code else ""
             secondary = window.ip_card.secondary
             if fa:

@@ -15,8 +15,9 @@ from pydivert import WinDivert
 
 from uac_desktop import __version__
 from uac_desktop.engine import (Engine, EngineCancelled, HTTP_PORT, SOCKS_PORT,
-                                USER_AGENT, XRAY_CONFIG, build_singbox_tun_config,
-                                build_xray_config, resolve_xray_upstream)
+                                USER_AGENT, XRAY_CONFIG, allocate_local_ports,
+                                build_singbox_tun_config, build_singbox_proxy_bypass_config, build_xray_config,
+                                resolve_xray_upstream)
 from uac_desktop.models import (ProxyProfile, Tuning, default_profiles,
                                 parse_many, parse_outbound)
 from uac_desktop.fragment_proxy import FragmentProxy
@@ -44,6 +45,48 @@ def test_xray_has_socks_and_http_inbounds():
     ports = {x["port"] for x in config["inbounds"]}
     assert ports == {SOCKS_PORT, HTTP_PORT}
     assert config["outbounds"][0]["protocol"] == "trojan"
+
+
+def test_mci_spoof_strategy_dials_local_pattern_not_the_edge():
+    profile = default_profiles()[2]
+    profile.origin = "builtin"
+    tuning = Tuning.carrier_preset("mci")
+    direct = build_xray_config(
+        profile, tuning=tuning, upstream_address="104.18.1.1", direct_edge=True,
+    )
+    spoof = build_xray_config(profile, tuning=tuning, direct_edge=False)
+    direct_server = direct["outbounds"][0]["settings"]["servers"][0]
+    spoof_server = spoof["outbounds"][0]["settings"]["servers"][0]
+    assert (direct_server["address"], direct_server["port"]) == ("104.18.1.1", 443)
+    assert (spoof_server["address"], spoof_server["port"]) == ("127.0.0.1", 40443)
+    assert spoof["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"] == profile.sni
+
+
+def test_allocate_keeps_preferred_ports_when_bindable(monkeypatch):
+    monkeypatch.setattr("uac_desktop.engine._bind_failure", lambda _port: None)
+    socks, http, reason = allocate_local_ports()
+    assert (socks, http, reason) == (SOCKS_PORT, HTTP_PORT, "")
+    config = build_xray_config(default_profiles()[0], socks_port=socks, http_port=http)
+    assert {item["port"] for item in config["inbounds"]} == {SOCKS_PORT, HTTP_PORT}
+
+
+def test_allocate_replaces_ports_rejected_by_windows(monkeypatch):
+    def bind(port):
+        if port in {SOCKS_PORT, HTTP_PORT}:
+            error = PermissionError(13, "forbidden")
+            error.winerror = 10013
+            return error
+        return None
+
+    monkeypatch.setattr("uac_desktop.engine._bind_failure", bind)
+    socks, http, reason = allocate_local_ports()
+    assert socks == 38408
+    assert http == 38409
+    assert "20808/20809 rejected by Windows excluded-port range" in reason
+    config = build_xray_config(default_profiles()[0], socks_port=socks, http_port=http)
+    assert {item["port"] for item in config["inbounds"]} == {38408, 38409}
+    tun = build_singbox_tun_config(socks_port=socks)
+    assert tun["outbounds"][0]["server_port"] == socks
 
 
 def test_xray_routes_quic_instead_of_blackholing_it():
@@ -139,6 +182,56 @@ def test_singbox_bypass_never_excludes_the_probe_process():
     assert all("sing-box.exe" not in {name.lower() for name in names}
                for names in process_rules)
 
+
+
+def test_singbox_tun_helper_processes_can_override_xray_default():
+    config = build_singbox_tun_config(
+        ["Telegram.exe"],
+        socks_port=1821,
+        helper_processes=["aether.exe", "uac-psiphon.exe"],
+    )
+    assert config["route"]["rules"][0] == {
+        "process_name": ["aether.exe", "uac-psiphon.exe"],
+        "ip_cidr": ["127.0.0.0/8"],
+        "action": "route",
+        "outbound": "local-direct",
+    }
+    assert config["route"]["rules"][1] == {
+        "process_name": ["aether.exe", "uac-psiphon.exe"],
+        "action": "route",
+        "outbound": "direct",
+    }
+    assert {
+        "process_name": ["Telegram.exe"],
+        "action": "route",
+        "outbound": "direct",
+    } in config["route"]["rules"]
+    assert config["outbounds"][0]["server_port"] == 1821
+
+
+def test_singbox_proxy_bypass_config_routes_selected_apps_direct():
+    config = build_singbox_proxy_bypass_config(
+        ["Telegram.exe", "aether.exe", "game.exe"],
+        listen_port=1822,
+        socks_port=1821,
+        helper_processes=["aether.exe", "uac-psiphon.exe"],
+    )
+    assert config["inbounds"][0]["type"] == "mixed"
+    assert config["inbounds"][0]["listen"] == "127.0.0.1"
+    assert config["inbounds"][0]["listen_port"] == 1822
+    assert config["outbounds"][0]["server_port"] == 1821
+    assert config["route"]["final"] == "proxy"
+    assert {
+        "process_name": ["aether.exe", "uac-psiphon.exe"],
+        "action": "route",
+        "outbound": "direct",
+    } in config["route"]["rules"]
+    # aether is a helper, so it must not also appear in the user bypass rule
+    assert {
+        "process_name": ["Telegram.exe", "game.exe"],
+        "action": "route",
+        "outbound": "direct",
+    } in config["route"]["rules"]
 
 def test_xray_mux_defaults_are_bounded_and_can_be_disabled():
     profile = default_profiles()[0]

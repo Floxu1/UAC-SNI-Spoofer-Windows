@@ -32,6 +32,14 @@ from .paths import (BIN, DATA_DIR, SING_BOX_CONFIG, SING_BOX_OWNER_FILE,
 SOCKS_PORT = 20808
 HTTP_PORT = 20809
 FRAGMENT_PORT = 40443
+#: Optional, default OFF: route ECH configs through the local Pattern core.
+#: Env UAC_ECH_VIA_PATTERN=1/0 overrides the settings toggle (key below).
+ECH_VIA_PATTERN_ENV = "UAC_ECH_VIA_PATTERN"
+ECH_VIA_PATTERN_SETTING = "ech_via_pattern"
+ECH_PATTERN_FAKE_SNI_ENV = "UAC_ECH_PATTERN_FAKE_SNI"
+#: wrong_seq never rewrites the relayed bytes: it injects a separate fake
+#: ClientHello with an out-of-window sequence, then relays Xray's bytes as-is.
+ECH_PATTERN_STRATEGY = "wrong_seq"
 # Hyper-V / WinNAT often reserves a block around the preferred pair. Scan upward
 # from here only after a real bind of 20808/20809 fails.
 PORT_SCAN_START = 38408
@@ -785,6 +793,66 @@ class WindowsProxy:
             pass
 
 
+def ech_via_pattern_enabled(setting: bool = False) -> bool:
+    """UAC_ECH_VIA_PATTERN=1/0 wins; otherwise the saved toggle (default off)."""
+    raw = str(os.environ.get(ECH_VIA_PATTERN_ENV, "") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(setting)
+
+
+def plan_ech_via_pattern(profile: ProxyProfile, tuning: Tuning, parsed: dict | None = None,
+                         upstream_address: str = ""):
+    """(core_profile, core_tuning) to send an ECH config through the Pattern core,
+    or None when the config is not an ECH/TLS route.
+
+    Xray keeps building the ECH ClientHello itself (outer SNI from the ECH config,
+    e.g. cloudflare-ech.com); the core's wrong_seq mode only adds its separate
+    fake hello and relays Xray's bytes unchanged. The core listens on
+    127.0.0.1:FRAGMENT_PORT and dials the config's own public IPv4 first, then
+    the tuning's edges. The fake SNI is never the config's real (inner) name."""
+    import dataclasses
+    parsed = parsed if parsed is not None else parse_outbound(profile)
+    if not parsed.get("ech") or str(parsed.get("security", "")).lower() != "tls":
+        return None
+    if str(getattr(profile, "route_mode", "") or "") == "reality-direct":
+        return None
+    own_edge = ""
+    try:
+        address = ipaddress.ip_address(str(upstream_address or parsed.get("host") or "").strip())
+        if address.version == 4 and address.is_global:
+            own_edge = str(address)
+    except ValueError:
+        pass
+    edge_port = int(parsed.get("port") or 443) if own_edge else int(getattr(profile, "port", 0) or 443)
+    real_names = {str(parsed.get(key) or "").strip().lower() for key in ("sni", "host_header")}
+    real_names.add(str(getattr(profile, "sni", "") or "").strip().lower())
+    real_names.discard("")
+    fake = str(os.environ.get(ECH_PATTERN_FAKE_SNI_ENV, "") or "").strip()
+    if not fake:
+        fake = str(getattr(tuning, "pattern_fake_sni", "") or "").strip()
+        if not fake or fake.lower() in real_names:
+            try:
+                fake = Tuning.carrier_preset(getattr(tuning, "carrier_mode", "auto")).pattern_fake_sni
+            except Exception:
+                fake = ""
+            if not fake or fake.lower() in real_names:
+                fake = Tuning().pattern_fake_sni
+    connect = str(getattr(tuning, "pattern_connect_ip", "") or "").strip()
+    fallbacks = [part.strip() for part in str(getattr(tuning, "pattern_fallback_ips", "") or "")
+                 .replace(";", ",").split(",") if part.strip()]
+    if own_edge:
+        fallbacks = list(dict.fromkeys(e for e in (connect, *fallbacks) if e and e != own_edge))
+        connect = own_edge
+    core_tuning = dataclasses.replace(
+        tuning, pattern_fake_sni=fake, pattern_connect_ip=connect,
+        pattern_fallback_ips=",".join(fallbacks))
+    core_profile = dataclasses.replace(profile, config_port=FRAGMENT_PORT, port=edge_port)
+    return core_profile, core_tuning
+
+
 def resolve_xray_upstream(profile: ProxyProfile) -> str:
     parsed = parse_outbound(profile)
     host = str(parsed["host"]).strip()
@@ -829,7 +897,8 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
                       upstream_address: str | None = None,
                       socks_port: int = SOCKS_PORT, http_port: int = HTTP_PORT,
                       direct_edge: bool | None = None,
-                      ech_config: str | None = None) -> dict:
+                      ech_config: str | None = None,
+                      xray_outbound_port: int | None = None) -> dict:
     tuning = tuning or Tuning()
     parsed = parse_outbound(profile)
     inferred_direct_edge = (
@@ -839,6 +908,9 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
     )
     mci_builtin_finalmask = inferred_direct_edge if direct_edge is None else bool(direct_edge)
     outbound_port = int(profile.port) if mci_builtin_finalmask else parsed["port"]
+    if xray_outbound_port:
+        # ECH via Pattern core: Xray dials the local core instead of the edge.
+        outbound_port = int(xray_outbound_port)
     inbounds = [
         {"listen": "127.0.0.1", "port": socks_port, "protocol": "socks", "tag": "socks-in",
          "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"}},
@@ -1284,9 +1356,14 @@ class Engine:
         self._bypass_processes: list[str] = []
         self._fragment_required = False
         self.active_upstream_address = ""
+        # ECH via Pattern core (default off); set from settings by the UI.
+        self.ech_via_pattern = False
+        self.ech_via_pattern_active = False
         self._log_level = "normal"
         self.socks_port = SOCKS_PORT
         self.http_port = HTTP_PORT
+        # User choice from Network Tools > Proxy Port (default = the pair above).
+        self.preferred_ports: tuple[int, int] = (SOCKS_PORT, HTTP_PORT)
         self.last_probe_ms: float | None = None
         self.last_probe_url: str = ""
         self.last_download_ok: bool | None = None
@@ -1825,6 +1902,31 @@ class Engine:
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.Error):
                 pass
 
+    def _configured_local_ports(self) -> tuple[int, int]:
+        """The user's SOCKS/HTTP pair, or the default pair when unset/invalid."""
+        from .proxy_ports import validate_xray_ports
+        try:
+            socks, http = (int(value) for value in getattr(
+                self, "preferred_ports", (SOCKS_PORT, HTTP_PORT)))
+        except (TypeError, ValueError):
+            return SOCKS_PORT, HTTP_PORT
+        if validate_xray_ports(socks, http):
+            return SOCKS_PORT, HTTP_PORT
+        return socks, http
+
+    def check_configured_ports(self) -> str:
+        """Why the user's custom pair cannot be used, or \"\".
+
+        The default pair keeps the automatic excluded-range fallback in
+        :func:`allocate_local_ports`, so it is never rejected here. A stale
+        app-owned Xray on the custom ports does not count; start() reclaims it.
+        """
+        socks, http = self._configured_local_ports()
+        if (socks, http) == (SOCKS_PORT, HTTP_PORT):
+            return ""
+        from .proxy_ports import busy_reasons
+        return "; ".join(busy_reasons((socks, http), self._is_owned_xray))
+
     def reclaim_stale_listeners(self, timeout: float = 3.0) -> list[int]:
         """Terminate orphaned app-owned Xray listeners and reject foreign conflicts.
 
@@ -1891,7 +1993,18 @@ class Engine:
             self._check_cancel(cancel_event)
             self._release_owned_listeners()
             self._check_cancel(cancel_event)
-            socks_port, http_port, port_reason = allocate_local_ports()
+            configured = self._configured_local_ports()
+            if configured == (SOCKS_PORT, HTTP_PORT):
+                socks_port, http_port, port_reason = allocate_local_ports()
+            else:
+                problem = self.check_configured_ports()
+                if problem:
+                    raise RuntimeError(
+                        f"Custom local proxy port is not free: {problem}. "
+                        "Change it in Network Tools > Proxy Port."
+                    )
+                socks_port, http_port = configured
+                port_reason = "custom ports from settings"
             self.socks_port = socks_port
             self.http_port = http_port
             self.system_proxy.socks_port = socks_port
@@ -1957,8 +2070,28 @@ class Engine:
                 str(upstream_address or "").strip()
                 if mci_builtin_finalmask else ""
             )
+            ech_pattern = None
+            self.ech_via_pattern_active = False
+            xray_outbound_port = None
+            if (direct_reality and not mci_builtin_finalmask
+                    and ech_via_pattern_enabled(getattr(self, "ech_via_pattern", False))):
+                ech_pattern = plan_ech_via_pattern(profile, tuning, parsed_outbound, upstream_address)
+                if ech_pattern is None:
+                    self.log("ECH VIA PATTERN: on, but this is not an ECH/TLS config; dialing directly as before")
             self._check_cancel(cancel_event)
-            if self._fragment_required:
+            if ech_pattern is not None:
+                core_profile, core_tuning = ech_pattern
+                self._fragment_required = True
+                self.log(
+                    f"ECH VIA PATTERN: on; Xray -> 127.0.0.1:{core_profile.config_port} -> Pattern "
+                    f"{ECH_PATTERN_STRATEGY} (ECH ClientHello relayed unchanged) "
+                    f"fakeSni={core_tuning.pattern_fake_sni} edge={core_tuning.pattern_connect_ip}:"
+                    f"{core_profile.port} fallback={core_tuning.pattern_fallback_ips or '-'}")
+                self.fragment.start(core_profile, core_tuning, ECH_PATTERN_STRATEGY)
+                upstream_address = "127.0.0.1"
+                xray_outbound_port = int(core_profile.config_port)
+                self.ech_via_pattern_active = True
+            elif self._fragment_required:
                 self.fragment.start(profile, tuning, strategy_override)
             try:
                 self._check_cancel(cancel_event)
@@ -1977,6 +2110,7 @@ class Engine:
                     socks_port=self.socks_port, http_port=self.http_port,
                     direct_edge=mci_builtin_finalmask,
                     ech_config=ech_config,
+                    xray_outbound_port=xray_outbound_port,
                 )
                 XRAY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
                 creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -2006,10 +2140,11 @@ class Engine:
                 if enable_system_proxy:
                     self.enable_system_proxy(cancel_event)
                 self.log(f"XRAY started socks=127.0.0.1:{self.socks_port} http=127.0.0.1:{self.http_port}")
-                if ech_value and self.ech_state == "cached":
+                if ech_value and self.ech_state in ("cached", "fallback"):
                     self._ech_cached_key_check(
                         profile, bypass_processes, tuning, upstream_address,
-                        mci_builtin_finalmask, ech_value, ech_config, cancel_event)
+                        mci_builtin_finalmask, ech_value, ech_config, cancel_event,
+                        xray_outbound_port=xray_outbound_port)
                 if notify:
                     self.state(True)
             except Exception:
@@ -2017,7 +2152,8 @@ class Engine:
                 raise
 
     def _ech_cached_key_check(self, profile, bypass_processes, tuning, upstream_address,
-                              direct_edge, ech_value, used_key, cancel_event=None) -> None:
+                              direct_edge, ech_value, used_key, cancel_event=None,
+                              xray_outbound_port=None) -> None:
         """Xray does not retry on an ECH rejection. With a cached (possibly stale)
         key: probe once; on failure refetch the key and restart Xray once."""
         try:
@@ -2040,7 +2176,8 @@ class Engine:
         config = build_xray_config(
             profile, bypass_processes, tuning, upstream_address=upstream_address,
             socks_port=self.socks_port, http_port=self.http_port,
-            direct_edge=direct_edge, ech_config=resolution.value)
+            direct_edge=direct_edge, ech_config=resolution.value,
+            xray_outbound_port=xray_outbound_port)
         XRAY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
         old = self.process
         try:

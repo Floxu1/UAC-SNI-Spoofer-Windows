@@ -729,6 +729,9 @@ def test_main_window_assistant_controls_stay_locked(qapp, tmp_path, monkeypatch)
         assert window.assistant_toggle.isChecked() is False
         assert window.assistant_toggle.isEnabled() is False
         assert window.assistant_option.row_click_enabled is False
+        # Retired from the UI: no sidebar switch, no support card, no layout slot.
+        assert window.assistant_option.isHidden() and window.assistant_help_card.isHidden()
+        assert window.sidebar_footer.layout().indexOf(window.assistant_option) == -1
         assert window.assistant_guides_toggle.isChecked() is True
         assert window.assistant_warnings_toggle.isChecked() is True
         window.assistant_toggle.setChecked(True)
@@ -739,6 +742,34 @@ def test_main_window_assistant_controls_stay_locked(qapp, tmp_path, monkeypatch)
         window.assistant_replay_button.click()
         _process_events(qapp, 120)
         assert window.assistant_toggle.isChecked() is False
+    finally:
+        window._force_quit = True
+        window.close()
+
+
+def test_saved_assistant_enabled_is_reset_and_option_hidden(qapp, tmp_path, monkeypatch):
+    import json
+    import uac_desktop.storage as storage_module
+    import uac_desktop.ui as ui_module
+
+    for name, filename in (
+        ("SETTINGS_FILE", "settings.json"),
+        ("PROFILES_FILE", "profiles.json"),
+        ("BOOKMARKS_FILE", "bookmarks.json"),
+        ("SNI_RESULTS_FILE", "sni-results.json"),
+    ):
+        monkeypatch.setattr(storage_module, name, tmp_path / filename)
+    (tmp_path / "settings.json").write_text(json.dumps({"assistant_enabled": True, "language": "en"}), encoding="utf-8")
+    monkeypatch.setattr(ui_module.MainWindow, "_setup_tray", lambda self: setattr(self, "_tray", None))
+    monkeypatch.setattr(ui_module.MainWindow, "refresh_processes", lambda self: None)
+    monkeypatch.setattr(ui_module.MainWindow, "check_for_updates", lambda self, manual=False: None)
+    monkeypatch.setattr(ui_module.MainWindow, "_queue_target_latency_probe", lambda self: None)
+    window = ui_module.MainWindow()
+    try:
+        assert window.storage.settings["assistant_enabled"] is False
+        assert window.assistant_controller is None
+        assert window.assistant_option.isHidden() and window.assistant_help_card.isHidden()
+        assert window.sidebar_footer.layout().indexOf(window.assistant_option) == -1
     finally:
         window._force_quit = True
         window.close()

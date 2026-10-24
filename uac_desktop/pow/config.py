@@ -78,16 +78,65 @@ KEY_AUTO = "auto"
 KEY_ECH = "ech"
 KEY_FRAGMENT = "fragment"
 KEY_EXTERNAL = "external"
-KEY_FETCHES = (KEY_AUTO, KEY_ECH, KEY_FRAGMENT, KEY_EXTERNAL)
+#: Register / enroll through the WARP registration relay (a Cloudflare Worker).
+#: The device only talks TLS to the relay host, so the filtered
+#: api.cloudflareclient.com / cloudflare-ech.com names never leave it.
+#: Started first, with no delay, in the auto race.
+KEY_RELAY = "relay"
+#: Register / enroll straight to api.cloudflareclient.com with TCP urgent-data
+#: (OOB) desyncs of the ClientHello done natively in the core. Three methods
+#: that got a real key on MCI are tried one after another (never in parallel):
+#: disoob-byte0-ttl1, oob-insni+5-ttl1, oob-byte0-nottl; the first that the
+#: API answers wins. No relay, no server, no admin. Auto runs this first and
+#: only falls back to the relay race when all three fail.
+KEY_OOB = "oob"
+#: Retired ECH-DoH route: its outer SNI cloudflare-ech.com is filtered on MCI,
+#: so it could never finish there. Saved settings with it migrate to auto.
+KEY_DOH = "doh"
+KEY_FETCHES = (KEY_AUTO, KEY_OOB, KEY_RELAY, KEY_ECH, KEY_FRAGMENT, KEY_EXTERNAL)
+#: Old values that now mean auto.
+KEY_FETCHES_RETIRED = (KEY_DOH, "ech-doh")
+#: Modes that get the app-fetched ECHConfigList in AETHER_API_ECH. Empty since
+#: the ECH-DoH route was retired (kept so older imports still resolve).
+KEY_FETCHES_WITH_APP_ECH: tuple[str, ...] = ()
+#: Built-in relay list, passed to the core as AETHER_API_RELAY. A file
+#: ``relay_urls.json`` (JSON list of https URLs) in the app data dir overrides
+#: it, so a remotely refreshed list can be dropped in without a new build.
+RELAY_URLS_DEFAULT = ("https://dark-brook-3ef5.behroozuac5.workers.dev/",)
+RELAY_URLS_FILENAME = "relay_urls.json"
+
+
+def relay_urls(data_dir: Path | None = None) -> list[str]:
+    """Relay URLs for the key route: ``relay_urls.json`` if valid, else built-in."""
+    if data_dir is not None:
+        try:
+            raw = json.loads((Path(data_dir) / RELAY_URLS_FILENAME).read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                raw = raw.get("relays", [])
+            urls = [str(u).strip() for u in raw if str(u).strip().lower().startswith("https://")]
+            if urls:
+                return urls
+        except Exception:
+            pass
+    return list(RELAY_URLS_DEFAULT)
+
 #: Mobile default: race ECH, split ClientHello and the current network; the
 #: first TLS session that is ready claims the single register/enroll send.
 DEFAULT_KEY_FETCH = KEY_AUTO
-#: When the race fails, one more try on the route that works on Hamrah Aval.
-KEY_FETCH_FALLBACK = KEY_ECH
-#: Wall-clock budgets for ``aether --prepare-only`` (register + enroll). The
-#: core's own per-call timeouts are 6s connect / 8s TLS / 15s exchange.
-KEY_FETCH_TIMEOUT_S = 90
-KEY_FETCH_RETRY_TIMEOUT_S = 60
+#: When the race (OOB first, then the relay after a short head start) fails,
+#: one more try on the route that also works on Hamrah Aval:
+#: the Cloudflare Worker relay (the ECH handshake never passes on MCI). This
+#: also covers a network that was not ready yet right after Connect.
+KEY_FETCH_FALLBACK = KEY_RELAY
+#: ``aether --prepare-only`` (register + enroll). Mobile has no overall limit:
+#: the native prepare runs until it finishes or is cancelled. Desktop mirrors
+#: that: it keeps waiting while the core still reports progress, gives up after
+#: KEY_FETCH_IDLE_TIMEOUT_S with no output at all, and never runs longer than
+#: the KEY_FETCH_TIMEOUT_S safety cap. The core's own per-call timeouts are
+#: 6s connect / 8s TLS / 15s exchange.
+KEY_FETCH_TIMEOUT_S = 600
+KEY_FETCH_RETRY_TIMEOUT_S = 600
+KEY_FETCH_IDLE_TIMEOUT_S = 120
 
 OBFUSCATION_PROFILES = ("off", "light", "balanced", "aggressive")
 
@@ -127,6 +176,11 @@ REGION_PHASE_TIMEOUT_SECONDS = 25
 NEARBY_PHASE_TIMEOUT_SECONDS = 12
 #: Behind WARP the light protocols get a short first window before meek.
 CHAINED_LIGHT_TIMEOUT_SECONDS = 20
+#: How long the ladder waits for a strategy: that strategy's
+#: EstablishTunnelTimeoutSeconds plus this margin (mobile ``watchLadder``:
+#: +3 s for the nearby-country head start, +8 s for everything else).
+PSIPHON_WAIT_MARGIN_S = 8
+NEARBY_WAIT_MARGIN_S = 3
 #: Head start for the last server that worked (Psiphon default is 1s).
 SERVER_AFFINITY_GRACE_MS = 1_500
 #: Countries close to Iran and to the usual WARP exits, nearest first.
@@ -255,6 +309,12 @@ class PowSettings:
     irancell_h3: bool = False
     direct_psiphon_first: bool = False
     lowest_rtt_ip: bool = False
+    # MASQUE/H2 tuning, same switches and defaults as mobile PowEngineSettings.
+    quic_tuned: bool = False
+    h2_large_windows: bool = True
+    h2_socket_tuning: bool = True
+    h2_speed_pick: bool = True
+    h2_fragment_mode: str = "auto"
 
     def validated(self) -> "PowSettings":
         from .regions import normalize_region
@@ -275,11 +335,16 @@ class PowSettings:
             firewall_profile=firewall if firewall in FIREWALLS else FIREWALL_AUTO,
             link_recipe=recipe if recipe in RECIPES else RECIPE_AUTO,
             chain_psiphon=bool(self.chain_psiphon),
-            key_fetch=fetch if fetch in KEY_FETCHES else DEFAULT_KEY_FETCH,
+            key_fetch=fetch if fetch in KEY_FETCHES else DEFAULT_KEY_FETCH,  # doh -> auto
             parallel_masque=bool(self.parallel_masque),
             irancell_h3=bool(self.irancell_h3),
             direct_psiphon_first=bool(self.direct_psiphon_first),
             lowest_rtt_ip=bool(self.lowest_rtt_ip),
+            quic_tuned=bool(self.quic_tuned),
+            h2_large_windows=bool(self.h2_large_windows),
+            h2_socket_tuning=bool(self.h2_socket_tuning),
+            h2_speed_pick=bool(self.h2_speed_pick),
+            h2_fragment_mode=normalize_h2_fragment_mode(self.h2_fragment_mode),
         )
 
 
@@ -287,6 +352,17 @@ DEFAULT_SETTINGS = PowSettings()
 
 #: Class-level alias mirroring mobile ``PowEngineSettings.DEFAULT``.
 PowSettings.DEFAULT = DEFAULT_SETTINGS  # type: ignore[attr-defined]
+
+
+H2_FRAG_AUTO = "auto"
+H2_FRAG_ON = "on"
+H2_FRAG_OFF = "off"
+H2_FRAG_CHOICES = (H2_FRAG_AUTO, H2_FRAG_ON, H2_FRAG_OFF)
+
+
+def normalize_h2_fragment_mode(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    return value if value in H2_FRAG_CHOICES else H2_FRAG_AUTO
 
 
 def normalize_scan_mode(raw: str | None) -> str:
@@ -390,6 +466,15 @@ def outer_budget_ms(protocol: str, retune: bool = False, scan_mode: str = SCAN_B
     return {"masque": masque, "wireguard": wireguard}.get(protocol, gool)
 
 
+def attempt_scan_mode(protocol: str, offset: int, scan_mode: str, retune: bool = False) -> str:
+    """Scan depth for one outer attempt (mobile ``PowConnectionCoordinator``:
+    the first MASQUE attempt of a fresh connect always runs the thorough scan,
+    which also gets the 180 s budget; later attempts use the user's scan mode)."""
+    if not retune and offset == 0 and protocol == "masque":
+        return SCAN_THOROUGH
+    return normalize_scan_mode(scan_mode)
+
+
 # ---------------------------------------------------------------------------
 # JSON builders (mirror chainOuterJson / keyRequestJson / certRenewJson)
 # ---------------------------------------------------------------------------
@@ -411,6 +496,118 @@ def clean_h2_path(data_dir: Path) -> Path:
     return Path(data_dir) / "uac-pow-clean-h2.json"
 
 
+def adaptive_path(data_dir: Path) -> Path:
+    return Path(data_dir) / "uac-pow-adaptive.json"
+
+
+# ---------------------------------------------------------------------------
+# Adaptive H2 fragmentation (mirrors PowAdaptiveObfuscation + h2FragmentEffective)
+# ---------------------------------------------------------------------------
+
+#: Same thresholds as mobile PowQualityPolicy / PowAdaptiveObfuscation.
+JITTER_THRESHOLD_MS = 120
+ADAPTIVE_FAILS_TO_ENABLE = 2
+ADAPTIVE_STABLE_OFF_MS = 3 * 60_000
+#: Desktop probe cadence (mobile idle interval) and settle time.
+ADAPTIVE_PROBE_INTERVAL_S = 25
+ADAPTIVE_SETTLE_S = 10
+
+
+def is_jitter_high(samples_ms) -> bool:
+    clean = [int(s) for s in samples_ms or () if int(s or 0) > 0]
+    if len(clean) < 2:
+        return False
+    low, high = min(clean), max(clean)
+    return (high - low) >= JITTER_THRESHOLD_MS and high >= (low * 13 // 10)
+
+
+def adaptive_on(data_dir: Path) -> bool:
+    """Read at the next outer (re)connect; never forces a reconnect by itself."""
+    try:
+        return bool(json.loads(adaptive_path(data_dir).read_text(encoding="utf-8")).get("on", False))
+    except Exception:
+        return False
+
+
+class AdaptiveObfuscation:
+    """Turns H2 fragmentation on only when DPI is likely (RTT jitter + failures).
+
+    Kept in its own file so it never overwrites the user's H2 fragment choice
+    (mobile keeps it in a separate pref key for the same reason).
+    """
+
+    def __init__(self, data_dir: Path, log=None) -> None:
+        self._data_dir = Path(data_dir)
+        self._log = log or (lambda _message: None)
+        self.dpi_fails = 0
+
+    def adaptive_on(self) -> bool:
+        return adaptive_on(self._data_dir)
+
+    def _set(self, on: bool) -> None:
+        path = adaptive_path(self._data_dir)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"on": bool(on)}), encoding="utf-8")
+        except OSError:
+            pass
+
+    def reset(self) -> None:
+        """The user turned the HTTP/2 fragment switch off: back to plain auto."""
+        self.dpi_fails = 0
+        self._set(False)
+
+    def on_probe(self, success: bool, jitter_high: bool) -> None:
+        if not success or jitter_high:
+            self.dpi_fails += 1
+        else:
+            self.dpi_fails = max(0, self.dpi_fails - 1)
+
+    def should_enable(self, settings: "PowSettings", rtt_variance_high: bool) -> bool:
+        if normalize_h2_fragment_mode(settings.h2_fragment_mode) != H2_FRAG_AUTO:
+            return False
+        if self.adaptive_on():
+            return True
+        if rtt_variance_high and self.dpi_fails >= ADAPTIVE_FAILS_TO_ENABLE:
+            self._log(f"Adaptive H2 fragmentation ON (DPI suspected jitter+fails={self.dpi_fails})")
+            self._set(True)
+            return True
+        return False
+
+    def should_disable(self, settings: "PowSettings", stable_ms: int) -> bool:
+        if stable_ms <= 0:
+            return False
+        if normalize_h2_fragment_mode(settings.h2_fragment_mode) != H2_FRAG_AUTO:
+            return False
+        if not self.adaptive_on():
+            return False
+        if stable_ms > ADAPTIVE_STABLE_OFF_MS and self.dpi_fails == 0:
+            self._log("Adaptive H2 fragmentation OFF (stable)")
+            self._set(False)
+            return True
+        return False
+
+
+def h2_fragment_effective(
+    settings: "PowSettings",
+    protocol: str,
+    plan: "OuterPlan",
+    adaptive: bool = False,
+    masque_transport: str | None = None,
+) -> bool:
+    """H2 fragment: On/Off are the user's; Auto = recipe default OR the adaptive
+    DPI flag. MASQUE over HTTP/2 only (mobile ``h2FragmentEffective``)."""
+    transport = masque_transport or plan.masque_transport
+    if not (protocol == "masque" and transport == "h2"):
+        return False
+    mode = normalize_h2_fragment_mode(getattr(settings, "h2_fragment_mode", H2_FRAG_AUTO))
+    if mode == H2_FRAG_ON:
+        return True
+    if mode == H2_FRAG_OFF:
+        return False
+    return bool(plan.fragment or adaptive)
+
+
 def chain_outer_json(
     data_dir: Path,
     protocol: str,
@@ -419,9 +616,13 @@ def chain_outer_json(
     scan_mode: str = SCAN_BALANCED,
     mci: bool = False,
     masque_transport: str | None = None,
+    adaptive: bool | None = None,
 ) -> str:
     settings = settings.validated()
     plan = outer_plan(settings, mci)
+    transport = (masque_transport or plan.masque_transport) if protocol == "masque" else "h3"
+    if adaptive is None:
+        adaptive = adaptive_on(data_dir)
     payload = {
         "config_path": str(identity_path(data_dir)),
         "protocol": protocol,
@@ -430,15 +631,20 @@ def chain_outer_json(
         "ip_scan": plan.ip_for(protocol),
         "endpoint_cache_path": str(masque_cache_path(data_dir)),
         "endpoint_discovery": "clean" if settings.link_recipe == RECIPE_MASQUE_H2_SAVED else discovery,
-        "masque_transport": (masque_transport or plan.masque_transport) if protocol == "masque" else "h3",
+        "masque_transport": transport,
         "obfuscation_profile": settings.obfuscation_profile,
         "retry_obfuscation_profiles": True,
         "tls_curve_preset": "chrome",
         "wireguard_data_check": True,
         "log_level": "info",
         "perf_profile": "high",
-        "h2_fragmentation": bool(plan.fragment and protocol == "masque"),
+        "h2_fragmentation": h2_fragment_effective(settings, protocol, plan, bool(adaptive), transport),
+        "quic_tuned": settings.quic_tuned,
+        "h2_large_windows": settings.h2_large_windows,
+        "h2_socket_tuning": settings.h2_socket_tuning,
+        "h2_speed_pick": settings.h2_speed_pick,
         "api_camo": settings.key_fetch,
+        "api_relay": ",".join(relay_urls(data_dir)),
         "gateway": False,
     }
     return json.dumps(payload)
@@ -562,6 +768,19 @@ def psiphon_config(
     return json.dumps(config)
 
 
+def psiphon_wait_seconds(config_json: str, fallback_seconds: int, region_bias: bool = False) -> int:
+    """Ladder wait for one strategy: the EstablishTunnelTimeoutSeconds that this
+    strategy's config really carries, plus the mobile margin (+3 s nearby head
+    start, +8 s otherwise; PowConnectionCoordinator.watchLadder)."""
+    try:
+        establish = int(json.loads(config_json).get("EstablishTunnelTimeoutSeconds") or 0)
+    except (TypeError, ValueError):
+        establish = 0
+    if establish <= 0:
+        establish = int(fallback_seconds)
+    return establish + (NEARBY_WAIT_MARGIN_S if region_bias else PSIPHON_WAIT_MARGIN_S)
+
+
 # ---------------------------------------------------------------------------
 # Last-connect description (mirrors PowLastConnect.describe)
 # ---------------------------------------------------------------------------
@@ -636,6 +855,8 @@ EXIT_CHOICES = (
 )
 FETCH_CHOICES = (
     Choice(KEY_AUTO, "خودکار (مسابقه)", "Automatic (race)"),
+    Choice(KEY_OOB, "OOB", "OOB (disoob)"),
+    Choice(KEY_RELAY, "رله", "Relay"),
     Choice(KEY_ECH, "ECH", "ECH"),
     Choice(KEY_FRAGMENT, "قطع سلام", "Split hello"),
     Choice(KEY_EXTERNAL, "شبکه فعلی", "Current network"),

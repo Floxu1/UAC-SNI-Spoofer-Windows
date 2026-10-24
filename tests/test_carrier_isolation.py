@@ -278,7 +278,7 @@ def test_home_dashboard_has_no_scroll_and_fits_minimum_window(qapp, tmp_path, mo
             assert window.carrier.geometry().right() <= window.carrier_control.rect().right()
             assert window.status.font().pixelSize() == 38
             assert window.connection_hint.font().pixelSize() == 15
-            assert window.route_card.title.font().pixelSize() == 11
+            assert window.route_card.title.font().pixelSize() == 12  # captions >= ~9pt (font pass)
             assert window.route_card.value.font().pixelSize() == 22
     finally:
         window._force_quit = True
@@ -419,3 +419,58 @@ def test_sni_edge_is_bound_only_when_scanner_verified_the_exact_pair():
     assert bound.pattern_fake_sni == "verified.example"
     assert bound.pattern_connect_ip == "188.114.99.0"
     assert bound.pattern_fallback_ips.split(",") == ["188.114.98.0", "104.18.8.83"]
+
+
+def test_app_bypass_reconnects_pow_when_pow_engine_is_active(qapp):
+    events = SimpleNamespace(logs=[], disconnects=0, connects=0, activities=[])
+
+    class FakePow:
+        def __init__(self):
+            self.running = True
+            self.busy = False
+
+        def disconnect(self, quiet=False):
+            events.disconnects += 1
+            self.running = False
+
+        def connect(self):
+            events.connects += 1
+            self.running = True
+
+    storage = SimpleNamespace(settings={"bypass_processes": ["Telegram.exe"]}, save_settings=lambda: None)
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.setInterval(20)
+    pow_controller = FakePow()
+    dummy = SimpleNamespace(
+        storage=storage,
+        engine=SimpleNamespace(running=False),
+        connecting=False,
+        _closing=False,
+        engine_mode="pow",
+        pow_controller=pow_controller,
+        _bypass_apply_timer=timer,
+        selected_processes=lambda: ["Telegram.exe"],
+        _update_process_count=lambda: None,
+        _set_activity=lambda *args: events.activities.append(args),
+        _append_log=events.logs.append,
+        _set_state=lambda *_: None,
+        _cancel_connect_attempt=lambda **_: None,
+        toggle_connection=lambda: None,
+    )
+    # ENGINE_POW constant used inside method — patch via module attribute lookup on MainWindow
+    import uac_desktop.ui as ui_mod
+    original = getattr(ui_mod, "ENGINE_POW", "pow")
+    ui_mod.ENGINE_POW = "pow"
+    try:
+        timer.timeout.connect(lambda: MainWindow._apply_bypass_changes(dummy))
+        MainWindow._save_process_selection(dummy)
+        assert timer.isActive()
+        QTest.qWait(450)
+        qapp.processEvents()
+        assert events.disconnects == 1
+        assert events.connects == 1
+        assert any("UAC PoW" in line for line in events.logs)
+    finally:
+        ui_mod.ENGINE_POW = original
+
