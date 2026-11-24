@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,12 +14,16 @@ from .config import (
     KEY_FETCHES_RETIRED,
     FIREWALL_AUTO,
     OUTER_AUTO,
-    RECIPE_AUTO,
+    RECIPE_MASQUE_H2,
     SCAN_BALANCED,
     PowSettings,
     LastConnect,
+    clean_h2_path,
+    lastconn_path,
+    masque_cache_path,
     strategy_signature,
 )
+from .warmup import normalize_host
 
 SETTINGS_FILENAME = "pow_settings.json"
 
@@ -30,8 +35,9 @@ _KEY_MAP = (
     ("scan_mode", "scan_mode", SCAN_BALANCED),
     ("optimized_mode", "optimized_mode", True),
     ("firewall_profile", "firewall_profile", FIREWALL_AUTO),
-    ("link_recipe", "link_recipe", RECIPE_AUTO),
+    ("link_recipe", "link_recipe", RECIPE_MASQUE_H2),
     ("chain_psiphon", "chain_psiphon", True),
+    ("exit_mode", "exit_mode", ""),
     ("key_fetch", "key_fetch", DEFAULT_KEY_FETCH),
     ("parallel_masque", "speed_parallel_masque", False),
     ("irancell_h3", "speed_irancell_h3", False),
@@ -42,10 +48,28 @@ _KEY_MAP = (
     ("h2_socket_tuning", "h2_socket_tuning", True),
     ("h2_speed_pick", "h2_speed_pick", True),
     ("h2_fragment_mode", "h2_fragment_mode", "auto"),
+    ("h2_fingerprint", "h2_fingerprint", "default"),
+    ("masque_ip_version", "masque_ip_version", "auto"),
+    ("h2_obfuscation", "h2_obfuscation", "unchanged"),
+    ("tun_mtu", "tun_mtu", 1400),
+    ("tun_backend", "tun_backend", "stable"),
+    ("startup_speed_test", "startup_speed_test", False),
+    ("psiphon_tunnel_pool", "psiphon_tunnel_pool", False),
+    ("routing_mode", "routing_mode", "bypass"),
+    ("iran_direct", "iran_direct", True),
+    ("dns_sinkhole", "dns_sinkhole", True),
+    ("webrtc_block", "webrtc_block", True),
+    ("quic_block", "quic_block", False),
+    ("ipv6_block", "ipv6_block", True),
+    ("kill_switch", "kill_switch", False),
+    ("auto_connect", "auto_connect", False),
+    ("lan_share", "lan_share", False),
+    ("lan_share_mode", "lan_share_mode", "socks5"),
+    ("lan_share_port", "lan_share_port", 18080),
 )
 
 #: v2: key_fetch default moved from "ech" to the mobile "auto" race.
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 
 
 class PowStore:
@@ -61,23 +85,27 @@ class PowStore:
         """Older desktop builds saved the then-default "ech" on first save.
         Move those files to the mobile default ("auto") once."""
         with self._lock:
-            # The ECH-DoH key route was retired (blocked on MCI): fall back to auto.
-            if str(self._doc.get("key_fetch", "")).strip().lower() in KEY_FETCHES_RETIRED:
-                self._doc["key_fetch"] = DEFAULT_KEY_FETCH
-                try:
-                    self._write()
-                except OSError:
-                    pass
+            retired = str(self._doc.get("key_fetch", "")).strip().lower() in KEY_FETCHES_RETIRED
             try:
                 version = int(self._doc.get("settings_version", 1) or 1)
             except (TypeError, ValueError):
                 version = 1
             if version >= SETTINGS_VERSION:
+                if retired:
+                    self._doc["key_fetch"] = DEFAULT_KEY_FETCH
+                    self._write()
                 return
             if not self._doc:
                 return
-            if str(self._doc.get("key_fetch", "")).strip().lower() in ("", KEY_ECH):
+            try:
+                with self._path.with_suffix(".before-v3.json").open("xb") as backup:
+                    backup.write(self._path.read_bytes())
+            except FileExistsError:
+                pass
+            if retired or (version < 2 and str(self._doc.get("key_fetch", "")).strip().lower() in ("", KEY_ECH)):
                 self._doc["key_fetch"] = DEFAULT_KEY_FETCH
+            if "exit_mode" not in self._doc:
+                self._doc["exit_mode"] = "warp" if self._doc.get("chain_psiphon") is False else "chain"
             self._doc["settings_version"] = SETTINGS_VERSION
             try:
                 self._write()
@@ -87,8 +115,9 @@ class PowStore:
     # -- raw io -----------------------------------------------------------
     def _read(self) -> dict[str, Any]:
         try:
-            return json.loads(self._path.read_text(encoding="utf-8"))
-        except Exception:
+            doc = json.loads(self._path.read_text(encoding="utf-8"))
+            return doc if isinstance(doc, dict) else {}
+        except (OSError, ValueError):
             return {}
 
     def _write(self) -> None:
@@ -104,21 +133,72 @@ class PowStore:
                 pass
 
     # -- settings ---------------------------------------------------------
+    def saved_settings(self) -> dict:
+        with self._lock:
+            return self._doc.copy()
+
     def snapshot(self) -> PowSettings:
         with self._lock:
             kwargs: dict[str, Any] = {}
             for attr, key, default in _KEY_MAP:
-                kwargs[attr] = self._doc.get(key, default)
+                value = self._doc.get(key, default)
+                kwargs[attr] = value if type(value) is type(default) else default
             return PowSettings(**kwargs).validated()
 
-    def save(self, settings: PowSettings) -> PowSettings:
+    def save(self, settings: PowSettings, *, exclude=()) -> PowSettings:
         validated = settings.validated()
         with self._lock:
             for attr, key, _default in _KEY_MAP:
-                self._doc[key] = getattr(validated, attr)
+                if key not in exclude:
+                    self._doc[key] = getattr(validated, attr)
             self._doc["settings_version"] = SETTINGS_VERSION
             self._write()
         return validated
+
+    def user_stopped(self) -> bool:
+        with self._lock:
+            return self._doc.get("user_stopped") is True
+
+    def set_user_stopped(self, value: bool) -> None:
+        with self._lock:
+            if self._doc.get("user_stopped", False) != value:
+                self._doc["user_stopped"] = value
+                self._write()
+
+    def export_settings(self) -> dict:
+        with self._lock:
+            settings = self.snapshot()
+            return {
+                "settings_version": SETTINGS_VERSION,
+                "exit_proxy_mode": self.exit_proxy_mode(),
+                "proxy_http_port": self.proxy_http_port(),
+                "psiphon_socks_port": self.psiphon_socks_port(),
+                **{key: getattr(settings, attr) for attr, key, _ in _KEY_MAP},
+            }
+
+    def import_settings(self, document: dict, *, exclude=()) -> None:
+        if not isinstance(document, dict):
+            raise ValueError("Expected a PoW settings object")
+        with self._lock:
+            baseline = self._doc.copy()
+            try:
+                for _attr, key, default in _KEY_MAP:
+                    value = document.get(key)
+                    if key not in exclude and type(value) is type(default):
+                        self._doc[key] = value
+                if "exit_mode" not in document and type(document.get("chain_psiphon")) is bool:
+                    self._doc["exit_mode"] = "chain" if document["chain_psiphon"] else "warp"
+                settings = self.snapshot()
+                for key in ("proxy_http_port", "psiphon_socks_port"):
+                    port = document.get(key)
+                    if type(port) is int and 1 <= port <= 65535:
+                        self._doc[key] = port
+                if "exit_proxy_mode" not in exclude and type(document.get("exit_proxy_mode")) is bool:
+                    self._doc["exit_proxy_mode"] = document["exit_proxy_mode"]
+                self.save(settings, exclude=exclude)
+            except (OSError, ValueError):
+                self._doc = baseline
+                raise
 
     # -- exit mode (TUN vs Windows proxy) --------------------------------
     def exit_proxy_mode(self) -> bool:
@@ -327,11 +407,55 @@ class PowStore:
                 return region
         return None
 
+    def _path_cache_files(self) -> tuple[Path, ...]:
+        data = self._path.parent
+        return (
+            masque_cache_path(data), lastconn_path(data), clean_h2_path(data),
+            data / "uac-pow-gool-lastconn.toml",
+        )
+
+    def expire_path_cache(self, now: float | None = None) -> int:
+        cutoff = (time.time() if now is None else now) - 12 * 60
+        expired = 0
+        for path in self._path_cache_files():
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    expired += 1
+            except FileNotFoundError:
+                pass
+        return expired
+
     def forget_learned(self) -> None:
         with self._lock:
-            self._doc.pop("networks", None)
-            self._doc.pop("strategy_index", None)
-            self._doc.pop("strategy_shape", None)
+            for key in ("networks", "strategy_index", "strategy_shape", "outer_protocol", "dns_warm_hosts"):
+                self._doc.pop(key, None)
+            self._write()
+            self.forget_path_cache()
+
+    def forget_path_cache(self, *, keep_clean_h2: bool = False) -> None:
+        keep = clean_h2_path(self._path.parent) if keep_clean_h2 else None
+        for path in self._path_cache_files():
+            if path != keep:
+                path.unlink(missing_ok=True)
+
+    def dns_warm_hosts(self) -> list[str]:
+        with self._lock:
+            saved = self._doc.get("dns_warm_hosts", {})
+            if not isinstance(saved, dict):
+                return []
+            return [host for host in saved if normalize_host(host) == host][:20]
+
+    def save_dns_warm_hosts(self, observations: dict[str, int]) -> None:
+        with self._lock:
+            saved = self._doc.get("dns_warm_hosts", {})
+            counts = {}
+            if isinstance(saved, dict):
+                counts = {host: max(1, count // 2) for host, count in saved.items()
+                          if normalize_host(host) == host and type(count) is int and count > 0}
+            for host, count in observations.items():
+                counts[host] = counts.get(host, 0) + count
+            self._doc["dns_warm_hosts"] = dict(sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:20])
             self._write()
 
     # -- outer protocol memory --------------------------------------------

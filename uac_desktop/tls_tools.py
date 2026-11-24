@@ -44,6 +44,59 @@ def locate_sni(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+
+
+def rewrite_outer_sni(data: bytes, new_hostname: str) -> bytes:
+    """Replace outer SNI hostname and fix TLS length fields. Same-length preferred."""
+    loc = locate_sni(data)
+    if not loc or not new_hostname:
+        return data
+    start, length = loc
+    new_bytes = new_hostname.encode("ascii", "ignore")
+    if not new_bytes:
+        return data
+    if len(new_bytes) == length:
+        return data[:start] + new_bytes + data[start + length:]
+    # Length-changing rewrite: patch name_len, list_len, ext_len, handshake, record.
+    delta = len(new_bytes) - length
+    out = bytearray(data[:start] + new_bytes + data[start + length:])
+    # name_len at start-2
+    name_len_pos = start - 2
+    if name_len_pos >= 0:
+        out[name_len_pos:name_len_pos + 2] = struct.pack(">H", len(new_bytes))
+    # server_name list length at start-5 (2 bytes list len after ext header + name type)
+    list_len_pos = start - 5
+    if list_len_pos >= 2:
+        old_list = int.from_bytes(out[list_len_pos:list_len_pos + 2], "big")
+        out[list_len_pos:list_len_pos + 2] = struct.pack(">H", max(0, old_list + delta))
+    # extension length at start-9
+    ext_len_pos = start - 9
+    if ext_len_pos >= 0:
+        old_ext = int.from_bytes(out[ext_len_pos:ext_len_pos + 2], "big")
+        out[ext_len_pos:ext_len_pos + 2] = struct.pack(">H", max(0, old_ext + delta))
+    # handshake length at bytes 6..8 (record=5, hs_type=1, hs_len=3)
+    if len(out) >= 9 and out[0] == 0x16 and out[5] == 0x01:
+        old_hs = int.from_bytes(out[6:9], "big")
+        out[6:9] = struct.pack(">I", max(0, old_hs + delta))[1:]
+        old_rec = int.from_bytes(out[3:5], "big")
+        out[3:5] = struct.pack(">H", max(0, old_rec + delta))
+    return bytes(out)
+
+
+def caseflip_sni(data: bytes) -> bytes:
+    """Mixed-case outer SNI to defeat exact-match DPI (TLS accepts case-insensitive)."""
+    loc = locate_sni(data)
+    if not loc:
+        return data
+    start, length = loc
+    host = bytearray(data[start:start + length])
+    for i, b in enumerate(host):
+        if 97 <= b <= 122 and (i % 2 == 0):
+            host[i] = b - 32
+        elif 65 <= b <= 90 and (i % 2 == 1):
+            host[i] = b + 32
+    return data[:start] + bytes(host) + data[start + length:]
+
 def find_sni(data: bytes) -> str:
     located = locate_sni(data)
     if not located:
@@ -111,6 +164,41 @@ def fragments(data: bytes, strategy: str, chunk_size: int = 5, ops: list | None 
         if start + length < len(data):
             out.append(data[start + length:])
         return [x for x in out if x]
+    if strategy in {"sni_midcut", "sni_midcut3", "sni_hostcut"} and location:
+        start, length = location
+        if strategy == "sni_hostcut" and length >= 12:
+            cuts = [start + 5, start + 11]  # cloud|flare|-ech.com style
+        elif strategy == "sni_midcut3":
+            cuts = [start + max(1, length // 4), start + max(2, length // 2),
+                    start + max(3, (3 * length) // 4)]
+        else:
+            cuts = [start + max(1, length // 3), start + max(2, (2 * length) // 3)]
+        cuts = sorted({c for c in cuts if 0 < c < len(data)})
+        pieces = []
+        prev = 0
+        for cut in cuts:
+            pieces.append(data[prev:cut])
+            prev = cut
+        pieces.append(data[prev:])
+        return [p for p in pieces if p]
+    if strategy == "outer_rewrite":
+        # Applied in Pattern core before fragments; keep as plain here.
+        return [data]
+    # MCI-only coalesce / zero-length TLS records (scanner winners). Irancell never selects these.
+    if strategy in {"coal_2x_zero_v0304", "coal_zero_v0304", "coal_zero_v0303", "coal_5x_zero_v0302", "coal_zero_v0302"}:
+        pre = {
+            "coal_2x_zero_v0304": bytes.fromhex("16030400001603040000"),
+            "coal_zero_v0304": bytes.fromhex("1603040000"),
+            "coal_zero_v0303": bytes.fromhex("1603030000"),
+            "coal_zero_v0302": bytes.fromhex("1603020000"),
+            "coal_5x_zero_v0302": bytes.fromhex("1603020000") * 5,
+        }[strategy]
+        # Single send: empty record(s) + original ClientHello (matches scanner 1xSend).
+        return [pre + data]
+    if strategy == "coal_2x_zero_then_split" and data[0] == 0x16 and len(data) > 10:
+        pre = bytes.fromhex("16030400001603040000")
+        cut = max(1, len(data) // 2)
+        return [pre + data[:cut], data[cut:]]
     if strategy in {"tls_record_frag", "tls_sni_records"} and data[0] == 0x16 and len(data) > 5:
         payload = data[5:]
         version = data[1:3]

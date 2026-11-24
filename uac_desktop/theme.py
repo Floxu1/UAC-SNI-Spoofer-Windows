@@ -15,6 +15,18 @@ import colorsys
 import re
 from functools import lru_cache
 
+XRAY_BLUE = "#2cc7ff"
+XRAY_HUD_BLUE = "#79B5FF"
+XRAY_DASHBOARD = {
+    "surface": "#0A1B30",
+    "gradient": "#0C2338",
+    "border": "#17445C",
+    "accent": "#46DCE8",
+    "secondary": "#91ADC4",
+    "icon_tile": "#12364C",
+    "active_track": "#176D7F",
+}
+
 # Single source of truth for the UAC PoW look. Change values here, or call
 # set_palette(...), to retune the whole PoW UI.
 POW_PALETTE: dict = {
@@ -45,15 +57,56 @@ POW_PALETTE: dict = {
     "cube_hole": "#0e3a2e",
 }
 
-_STATE = {"pow": False, "version": 0}
+DIRECT_PALETTE = {
+    "background": "#0d0e10",
+    "surface": "#17191c",
+    "border": "#2b2d31",
+    "primary": "#f67b36",
+    "accent": "#ffad6e",
+    "text": "#f2f2f4",
+    "secondary": "#95979e",
+    "sidebar": "#121315",
+    "raised": "#202225",
+    "selected": "#2b211b",
+    "ember_border": "#574031",
+    "steel": "#9b9089",
+}
+
+NETWORK_METRICS = {
+    # Panel, surface gradient, matte edge, icon tile, accent, text, dim text.
+    "xray": (XRAY_DASHBOARD["surface"], XRAY_DASHBOARD["gradient"], XRAY_DASHBOARD["surface"],
+             XRAY_DASHBOARD["border"], XRAY_DASHBOARD["icon_tile"], XRAY_DASHBOARD["accent"], "#F1F4F9",
+             XRAY_DASHBOARD["secondary"]),
+    "pow": ("#0C1921", "#172832", "#11212B", "#29404C", "#173039", "#43DCBB", "#F0F6F8", "#A7B9C2"),
+    "direct": ("#111214", "#202224", "#191C1E", "#303236", "#302720", DIRECT_PALETTE["primary"],
+               DIRECT_PALETTE["text"], "#ABB0B8"),
+}
+
+def connection_wave_colors(engine):
+    if engine == "pow":
+        return POW_PALETTE["accent2"], POW_PALETTE["accent"]
+    if engine == "xray":
+        return XRAY_BLUE, XRAY_HUD_BLUE
+    return ()
+
+
+_STATE = {"engine": "xray", "version": 0}
+
+
+def set_engine(engine: str) -> None:
+    _STATE["engine"] = engine
 
 
 def set_pow(enabled: bool) -> None:
-    _STATE["pow"] = bool(enabled)
+    set_engine("pow" if enabled else "xray")
 
 
 def is_pow() -> bool:
-    return _STATE["pow"]
+    return _STATE["engine"] == "pow"
+
+
+def is_direct() -> bool:
+    return _STATE["engine"] == "direct"
 
 
 def palette_version() -> int:
@@ -115,11 +168,30 @@ def map_rgb(r: int, g: int, b: int) -> tuple[int, int, int]:
     return map_rgba(r, g, b, 255)
 
 
+@lru_cache(maxsize=8192)
+def direct_rgba(r: int, g: int, b: int, alpha: int = 255) -> tuple[int, int, int]:
+    """Translate the shared chrome's color roles to graphite and ember."""
+    h, light, saturation = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+    if saturation < .10 or h * 360 < 74 or h * 360 > 326:
+        return r, g, b
+    if light < .27:
+        shade = min(42, round(11 + 109 * light))
+        return shade, shade + 1, shade + 3
+    if light > .86:
+        return _hex_rgb(DIRECT_PALETTE["text"])
+    if saturation >= .52 and .39 <= light <= .83:
+        if alpha < 115:
+            return _hex_rgb(DIRECT_PALETTE["steel"])
+        role = "primary" if light < .65 else "accent"
+        return _hex_rgb(DIRECT_PALETTE[role])
+    return _hex_rgb(DIRECT_PALETTE["secondary"])
+
+
 def _hex(rgb: tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 
-def map_hex(value: str) -> str:
+def map_hex(value: str, direct: bool = False) -> str:
     text = value.strip()
     if not text.startswith("#"):
         return value
@@ -132,13 +204,14 @@ def map_hex(value: str) -> str:
         rgb = _hex_rgb(digits)
     except ValueError:
         return value
-    return _hex(map_rgba(*rgb))
+    mapper = direct_rgba if direct else map_rgba
+    return _hex(mapper(*rgb))
 
 
 def themed(value):
     """Colour string for the active theme (non-strings pass through)."""
-    if isinstance(value, str) and is_pow():
-        return map_hex(value)
+    if isinstance(value, str) and (is_pow() or is_direct()):
+        return map_hex(value, direct=is_direct())
     return value
 
 
@@ -146,20 +219,21 @@ _HEX_RE = re.compile(r"(?<=[\s:,(])#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
 _RGB_RE = re.compile(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*([\d.]+)\s*)?\)")
 
 
-def map_css(text: str) -> str:
-    """Remap every literal colour in a Qt stylesheet to the PoW palette."""
+def map_css(text: str, direct: bool = False) -> str:
+    """Remap literal colors in the shared Qt stylesheet to an engine palette."""
+    mapper = direct_rgba if direct else map_rgba
 
     def _hex_sub(match: re.Match) -> str:
-        return map_hex("#" + match.group(1))
+        return map_hex("#" + match.group(1), direct=direct)
 
     def _rgb_sub(match: re.Match) -> str:
         r, g, b = (min(255, int(match.group(i))) for i in (1, 2, 3))
         alpha_text = match.group(4)
         if alpha_text is None:
-            return "rgb({},{},{})".format(*map_rgba(r, g, b))
+            return "rgb({},{},{})".format(*mapper(r, g, b))
         alpha = float(alpha_text)
         alpha_255 = round(alpha * 255) if alpha <= 1.0 else round(alpha)
-        nr, ng, nb = map_rgba(r, g, b, max(0, min(255, alpha_255)))
+        nr, ng, nb = mapper(r, g, b, max(0, min(255, alpha_255)))
         return f"rgba({nr},{ng},{nb},{alpha_text})"
 
     return _RGB_RE.sub(_rgb_sub, _HEX_RE.sub(_hex_sub, text))

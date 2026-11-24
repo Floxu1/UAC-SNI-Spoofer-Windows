@@ -5,13 +5,31 @@ import pytest
 from tools import prepare_github_release as release
 
 
-def test_release_runtime_manifest_covers_tun_assets():
+def test_release_runtime_manifest_covers_tun_and_pow_assets():
     assert set(release.PORTABLE_RUNTIME_FILES) == {
         Path("UAC-Spoofer-Desktop.exe"),
         Path("_internal/bin/xray.exe"),
         Path("_internal/bin/sing-box.exe"),
         Path("_internal/bin/libcronet.dll"),
         Path("_internal/bin/sing-box-LICENSE"),
+        Path("_internal/bin/geoip.dat"),
+        Path("_internal/bin/geosite.dat"),
+        Path("_internal/bin/aether.exe"),
+        Path("_internal/bin/keyfetch-net.ps1"),
+        Path("_internal/bin/uac-psiphon.exe"),
+        Path("_internal/bin/uac-pow-guard.exe"),
+        Path("_internal/bin/uac-direct.exe"),
+        Path("_internal/bin/uac-direct-xray.exe"),
+        Path("_internal/licenses/direct-xray/uac-direct-xray-LICENSE"),
+        Path("_internal/bin/uac-direct-mask.exe"),
+        Path("_internal/bin/uac-direct-guard.exe"),
+        Path("_internal/licenses/direct/SOURCE.json"),
+        Path("_internal/licenses/direct/LICENSE"),
+        Path("_internal/licenses/direct/BYEDPI-LICENSE"),
+        Path("_internal/licenses/aether/SOURCE.json"),
+        Path("_internal/licenses/aether/LICENSE"),
+        Path("_internal/licenses/quiche/COPYING"),
+        Path("_internal/assets/pow_server_entries.txt"),
     }
 
 

@@ -36,8 +36,25 @@ TrafficFn = Callable[[int, int], None]
 IP_UNICAST_IF = 31
 TLS_FRAGMENT_STRATEGIES = frozenset({
     "plain", "tls_sni_records", "full5", "full10", "full20", "multi64",
-    "sni_boundary", "sni_split", "primitive",
+    "sni_boundary", "sni_split", "sni_chars", "primitive",
+    "sni_midcut", "sni_midcut3", "sni_hostcut", "outer_rewrite",
+    # MCI scanner/FragmentProxy winners (tls_tools.fragments); no WinDivert.
+    "coal_2x_zero_v0304", "coal_zero_v0304", "coal_zero_v0303",
+    "coal_zero_v0302", "coal_5x_zero_v0302", "coal_2x_zero_then_split",
 })
+# MCI kills contiguous outer SNI cloudflare-ech.com. TCP urgent-data (OOB) with a
+# TTL=1 decoy byte bypasses that filter (proven PASS on AS197207). No WinDivert.
+OOB_STRATEGIES = frozenset({
+    "disoob_byte0", "disoob", "ech_disoob", "oob_insni5", "oob_insni",
+    "ech_oob", "ech_oob_insni", "oob_byte0_ttl1", "oob_insni5_ttl1",
+    # ultra-kossher PASS_SH winners (MCI)
+    "oob2_snitag_host4", "oob2_snitag_host4_1ms", "oob_rec_hdr_b5",
+    "oob2_snilen_namelen", "oob_host_char_04",
+})
+ECH_OUTER_ALIASES = frozenset({
+    "ech_mci", "wrong_seq_frag", "ech_hybrid", "ttl_desync",
+    "ech_mci2", "ech_ttl_rewrite", "ech_outer_rewrite",
+}) | OOB_STRATEGIES
 
 
 def default_interface_ipv4(destination: str) -> str:
@@ -144,12 +161,14 @@ class PacketInjector:
     """Stoppable WinDivert implementation of upstream's FakeTcpInjector."""
 
     def __init__(self, packet_filter: str, connections: dict, registry_lock: threading.Lock,
-                 inject_delay_ms: int, fake_repeat: int, log: LogFn) -> None:
+                 inject_delay_ms: int, fake_repeat: int, log: LogFn,
+                 decoy_ttl: int = 0) -> None:
         self.packet_filter = packet_filter
         self.connections = connections
         self.registry_lock = registry_lock
         self.inject_delay_ms = inject_delay_ms
         self.fake_repeat = max(1, int(fake_repeat))
+        self.decoy_ttl = max(0, min(64, int(decoy_ttl or 0)))
         self.log = log
         self.stop_event = threading.Event()
         self.ready_event = threading.Event()
@@ -238,7 +257,12 @@ class PacketInjector:
             packet.tcp.payload = connection.fake_data
             if packet.ipv4:
                 packet.ipv4.ident = (packet.ipv4.ident + 1) & 0xFFFF
-            packet.tcp.seq_num = (connection.syn_seq + 1 - len(connection.fake_data)) & 0xFFFFFFFF
+            if self.decoy_ttl > 0:
+                packet.tcp.seq_num = (connection.syn_seq + 1) & 0xFFFFFFFF
+                if packet.ipv4:
+                    packet.ipv4.ttl = self.decoy_ttl
+            else:
+                packet.tcp.seq_num = (connection.syn_seq + 1 - len(connection.fake_data)) & 0xFFFFFFFF
             for index in range(self.fake_repeat):
                 if not connection.monitor or self.stop_event.is_set():
                     return
@@ -246,6 +270,9 @@ class PacketInjector:
                 if index + 1 < self.fake_repeat and self.inject_delay_ms:
                     time.sleep(self.inject_delay_ms / 1000)
             connection.fake_sent = True
+            if self.decoy_ttl > 0:
+                connection.monitor = False
+                connection.signal("ttl_decoy_sent")
 
     def _inbound(self, packet: Packet, connection: InjectiveConnection) -> None:
         tcp = packet.tcp
@@ -327,6 +354,129 @@ class PacketInjector:
                 pass
 
 
+
+
+def _oob_offset(data: bytes, mode: str) -> int:
+    """Byte index for the urgent-data decoy (never past last byte)."""
+    mode = (mode or "").strip().lower()
+    if mode in {"oob_insni5", "oob_insni", "ech_oob_insni", "oob_insni5_ttl1"}:
+        from ..tls_tools import locate_sni
+        loc = locate_sni(data)
+        if loc:
+            start, length = loc
+            return min(len(data) - 1, start + min(5, max(0, length - 1)))
+        needle = b"cloudflare-ech.com"
+        at = data.find(needle)
+        if at >= 0:
+            return min(len(data) - 1, at + 5)
+    return 0
+
+
+def send_oob_client_hello(sock: socket.socket, data: bytes, mode: str, log: LogFn | None = None) -> str:
+    """Send ClientHello with MCI OOB desync. Supports ultra-kossher multi-offset winners."""
+    if not data:
+        return "empty"
+    mode = (mode or "disoob_byte0").strip().lower()
+    if mode in {"ech_oob", "ech_disoob", "disoob", "oob_byte0_ttl1"}:
+        mode = "disoob_byte0"
+    if mode in {"oob_insni", "ech_oob_insni"}:
+        mode = "oob_insni5"
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setblocking(True)
+    except OSError:
+        pass
+
+    def _send_oob_injections(payload: bytes, pts: list[tuple[int, int]], delay_ms: float = 0.0) -> None:
+        """ultra-kossher LowLevelSocketTransmitter.send_oob_at_offsets."""
+        sorted_pts = sorted(pts, key=lambda x: x[0])
+        cursor = 0
+        for offset, ghost in sorted_pts:
+            if offset <= cursor or offset > len(payload):
+                continue
+            # Exact ultra-kossher send_oob_at_offsets (no TTL kill on data bytes).
+            chunk = payload[cursor:offset] + bytes([ghost & 0xFF])
+            sock.send(chunk, socket.MSG_OOB)
+            if delay_ms > 0:
+                time.sleep(delay_ms / 1000.0)
+            cursor = offset
+        if cursor < len(payload):
+            sock.sendall(payload[cursor:])
+
+    used = mode
+    from ..tls_tools import locate_sni
+    loc = locate_sni(data)
+
+    if mode in {"oob2_snitag_host4", "oob2_snitag_host4_1ms"} and loc:
+        name_off, name_len = loc
+        sni_ext = name_off - 9  # type(2)+len(2)+list(2)+ntype(1)+nlen(2)
+        pts = [(sni_ext + 1, 0x78), (name_off + 4, 0x2D)]
+        delay = 1.0 if mode.endswith("_1ms") else 0.0
+        _send_oob_injections(data, pts, delay)
+        used = mode
+        if log:
+            log(f"PATTERN OOB desync mode={used} pts={pts} bytes={len(data)}")
+    elif mode == "oob2_snilen_namelen" and loc:
+        name_off, _ = loc
+        # sni_length_offset+1 ~= name_off-6 (ext_len lo), name_len+1 ~= name_off-1
+        pts = [(name_off - 6, 0xFF), (name_off - 1, 0xFF)]
+        _send_oob_injections(data, pts, 0.0)
+        used = mode
+        if log:
+            log(f"PATTERN OOB desync mode={used} pts={pts} bytes={len(data)}")
+    elif mode == "oob_rec_hdr_b5":
+        # MSG_OOB at hs_type index 5 with ghost; then rest
+        _send_oob_injections(data, [(5, 0x16)], 0.0)
+        used = mode
+        if log:
+            log(f"PATTERN OOB desync mode={used} off=5 bytes={len(data)}")
+    elif mode == "oob_host_char_04" and loc:
+        name_off, _ = loc
+        _send_oob_injections(data, [(name_off + 4, 0x2D)], 0.0)
+        used = mode
+        if log:
+            log(f"PATTERN OOB desync mode={used} off={name_off + 4} bytes={len(data)}")
+    else:
+        off = _oob_offset(data, mode)
+        if off <= 0:
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 1)
+                sock.send(data[0:1], socket.MSG_OOB)
+            finally:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 64)
+                except OSError:
+                    pass
+            time.sleep(0.05)
+            sock.sendall(data)
+            used = "disoob_byte0"
+        else:
+            if off:
+                sock.sendall(data[:off])
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 1)
+                sock.send(data[off:off + 1], socket.MSG_OOB)
+            finally:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 64)
+                except OSError:
+                    pass
+            time.sleep(0.03)
+            sock.sendall(data[off:])
+            used = "oob_insni5"
+        if log:
+            log(f"PATTERN OOB desync mode={used} off={off if mode != 'disoob_byte0' else 0} bytes={len(data)}")
+
+    try:
+        sock.setblocking(False)
+    except OSError:
+        pass
+    return used
+
+
 class PatternSniCore:
     """Local 127.0.0.1 TLS forwarder powered by Patterniha wrong-seq injection."""
 
@@ -356,20 +506,30 @@ class PatternSniCore:
         self._fake_sni = "chatgpt.com"
         self._strategy_override = "wrong_seq"
         self._handshake_failover = False
+        self._decoy_ttl = 0
+        self._ttl_desync = False
         self._hybrid_fake_fragment = False
         self._fragment_delay_s = 0.0
         self._post_fake_delay_s = 0.0
+        self._oob_mode = ""
         self._session_sem: asyncio.Semaphore | None = None
         self._edge_lock: asyncio.Lock | None = None
 
     @property
     def running(self) -> bool:
         injection_required = (
-            self._strategy_override == "wrong_seq" or self._hybrid_fake_fragment
+            (self._strategy_override == "wrong_seq" or self._hybrid_fake_fragment
+             or getattr(self, "_ttl_desync", False))
+            and self._strategy_override not in OOB_STRATEGIES
+            and not getattr(self, "_oob_mode", "")
         )
         transport_ready = (
             bool(self._injector) if injection_required
-            else self._strategy_override in TLS_FRAGMENT_STRATEGIES
+            else (
+                self._strategy_override in TLS_FRAGMENT_STRATEGIES
+                or self._strategy_override in OOB_STRATEGIES
+                or bool(getattr(self, "_oob_mode", ""))
+            )
         )
         return bool(self._server_sock) and not self._stop.is_set() and transport_ready
 
@@ -430,22 +590,73 @@ class PatternSniCore:
             raise RuntimeError("Pattern core currently requires Windows/WinDivert")
         self._profile = profile
         self._strategy_override = str(forced_strategy or "wrong_seq").strip().lower()
-        if self._strategy_override not in ({"wrong_seq"} | TLS_FRAGMENT_STRATEGIES):
+        # ECH-on-MCI: outer SNI cloudflare-ech.com is filtered. Prefer TCP OOB+TTL=1
+        # (disoob_byte0 / oob_insni5) which PASS on AS197207; legacy wrong_seq/TTL
+        # decoy/fragment aliases remain for fallback experiments.
+        self._oob_mode = ""
+        ech_hybrid = self._strategy_override in ECH_OUTER_ALIASES
+        self._decoy_ttl = 0
+        if self._strategy_override in OOB_STRATEGIES or self._strategy_override in {
+                "ech_mci", "ech_mci2", "ech_oob"}:
+            # Keep an explicit OOB method if the caller forced one; only aliases
+            # (ech_mci / ech_oob) fall back to tuning / disoob_byte0.
+            concrete = {"disoob_byte0", "oob_insni5", "oob_byte0_ttl1", "oob_insni5_ttl1",
+                        "disoob", "oob_insni", "ech_disoob", "ech_oob_insni",
+                        "oob2_snitag_host4", "oob2_snitag_host4_1ms", "oob_rec_hdr_b5",
+                        "oob2_snilen_namelen", "oob_host_char_04"}
+            if self._strategy_override in concrete:
+                if self._strategy_override in {"disoob", "ech_disoob", "oob_byte0_ttl1"}:
+                    self._strategy_override = "disoob_byte0"
+                elif self._strategy_override in {"oob_insni", "ech_oob_insni", "oob_insni5_ttl1"}:
+                    self._strategy_override = "oob_insni5"
+            else:
+                pref = str(getattr(tuning, "pattern_ech_fragment", "") or "").strip().lower()
+                if pref in OOB_STRATEGIES:
+                    self._strategy_override = pref
+                elif pref in {"oob_insni5", "insni", "sni"}:
+                    self._strategy_override = "oob_insni5"
+                else:
+                    self._strategy_override = "disoob_byte0"
+            self._oob_mode = self._strategy_override
+            ech_hybrid = False
+        elif ech_hybrid or self._strategy_override == "ttl_desync":
+            self._decoy_ttl = max(0, min(64, int(getattr(tuning, "pattern_decoy_ttl", 5) or 5)))
+        if ech_hybrid and self._strategy_override != "ttl_desync":
+            frag = str(getattr(tuning, "pattern_ech_fragment", "") or "none").strip().lower()
+            if frag in OOB_STRATEGIES:
+                self._strategy_override = frag
+                self._oob_mode = frag
+                self._decoy_ttl = 0
+                ech_hybrid = False
+            elif frag in {"", "none", "off", "wrong_seq"}:
+                self._strategy_override = "wrong_seq"
+            elif frag in TLS_FRAGMENT_STRATEGIES and frag != "plain":
+                self._strategy_override = frag
+            else:
+                self._strategy_override = "wrong_seq"
+        if self._strategy_override == "ttl_desync":
+            self._strategy_override = "wrong_seq"
+        if self._strategy_override not in ({"wrong_seq"} | TLS_FRAGMENT_STRATEGIES | OOB_STRATEGIES):
             self._strategy_override = "wrong_seq"
         self._quality = Quality.from_tuning(tuning)
         self._handshake_failover = (
             getattr(profile, "origin", "") == "builtin"
             and str(getattr(tuning, "carrier_mode", "")).lower() == "mci"
         )
+        self._ttl_desync = self._decoy_ttl > 0
         self._hybrid_fake_fragment = (
-            self._handshake_failover and self._strategy_override == "full5"
+            (ech_hybrid and self._strategy_override in TLS_FRAGMENT_STRATEGIES)
+            or (self._handshake_failover and self._strategy_override == "full5")
         )
-        if self._handshake_failover:
+        if self._handshake_failover or self._hybrid_fake_fragment:
             self._fragment_delay_s = {
                 "full20": 0.003,
                 "full5": 0.015,
-                "tls_sni_records": 0.010,
-            }.get(self._strategy_override, 0.0)
+                "tls_sni_records": 0.012,
+                "sni_split": 0.008,
+                "sni_boundary": 0.008,
+                "sni_chars": 0.004,
+            }.get(self._strategy_override, 0.008 if self._hybrid_fake_fragment else 0.0)
         else:
             self._fragment_delay_s = 0.0
         if self._fragment_delay_s <= 0 and self._strategy_override in TLS_FRAGMENT_STRATEGIES:
@@ -486,12 +697,16 @@ class PatternSniCore:
 
         self._injector = None
         try:
-            if self._strategy_override == "wrong_seq" or self._hybrid_fake_fragment:
+            if ((self._strategy_override == "wrong_seq" or self._hybrid_fake_fragment
+                    or getattr(self, "_ttl_desync", False))
+                    and self._strategy_override not in OOB_STRATEGIES
+                    and not getattr(self, "_oob_mode", "")):
                 self._injector = PacketInjector(
                     self._packet_filter(), self._connections,
                     self._registry_lock, self._quality.inject_delay_ms,
                     getattr(tuning, "pattern_fake_repeat", 1),
                     self.log,
+                    decoy_ttl=getattr(self, "_decoy_ttl", 0),
                 )
                 self._injector.start()
             self._server_thread = threading.Thread(target=self._server_runner, name="pattern-core", daemon=True)
@@ -503,8 +718,11 @@ class PatternSniCore:
         except Exception:
             self.stop()
             raise
+        hybrid = " hybridFake+frag" if self._hybrid_fake_fragment else ""
+        ttl_note = f" decoyTTL={self._decoy_ttl}" if getattr(self, "_ttl_desync", False) else ""
+        oob_note = f" oob={self._oob_mode}" if getattr(self, "_oob_mode", "") else ""
         self.log(f"PATTERN CORE ready 127.0.0.1:{profile.config_port} "
-                 f"{self._strategy_override} fakeSni={self._fake_sni}")
+                 f"{self._strategy_override}{hybrid}{ttl_note}{oob_note} fakeSni={self._fake_sni}")
         self.log(f"PATTERN QUALITY preset={getattr(tuning, 'pattern_quality_preset', 'upload')} "
                  f"relay={self._quality.relay_buffer_kb}KiB socket={self._quality.socket_buffer_kb}KiB "
                  f"handshakes={self._quality.max_sessions} edges={','.join(self._edges)}")
@@ -645,7 +863,9 @@ class PatternSniCore:
 
 
 
-        if (self._strategy_override in TLS_FRAGMENT_STRATEGIES
+        if ((self._strategy_override in TLS_FRAGMENT_STRATEGIES
+                or self._strategy_override in OOB_STRATEGIES
+                or bool(getattr(self, "_oob_mode", "")))
                 and not self._hybrid_fake_fragment):
             for edge in candidates:
                 outgoing = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -692,7 +912,7 @@ class PatternSniCore:
                 await asyncio.wait_for(loop.sock_connect(outgoing, (edge, int(self._profile.port))),
                                        self._quality.connect_timeout_ms / 1000)
                 await asyncio.wait_for(connection.event.wait(), self._quality.ack_timeout_ms / 1000)
-                if connection.result != "fake_data_ack_recv":
+                if connection.result not in {"fake_data_ack_recv", "ttl_decoy_sent"}:
                     raise ConnectionError(connection.result or "wrong-seq acknowledgement failed")
                 self._unregister(connection)
                 previous_edge = self._preferred_edge
@@ -723,9 +943,59 @@ class PatternSniCore:
                 outgoing = await self._connect_edge(incoming)
                 if not outgoing:
                     return
-                if self._strategy_override in TLS_FRAGMENT_STRATEGIES:
+                if (self._strategy_override in OOB_STRATEGIES
+                        or bool(getattr(self, "_oob_mode", ""))):
                     loop = asyncio.get_running_loop()
                     try:
+                        try:
+                            outgoing.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        except OSError:
+                            pass
+                        first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
+                        if not first:
+                            return
+                        expected = (5 + int.from_bytes(first[3:5], "big")
+                                    if len(first) >= 5 and first[0] == 0x16 else len(first))
+                        while len(first) < expected:
+                            chunk = await asyncio.wait_for(
+                                loop.sock_recv(incoming, expected - len(first)), 1.0
+                            )
+                            if not chunk:
+                                break
+                            first += chunk
+                        mode = getattr(self, "_oob_mode", "") or self._strategy_override
+                        await loop.run_in_executor(
+                            None, send_oob_client_hello, outgoing, first, mode, self.log
+                        )
+                        self.upload += len(first)
+                        self._emit_traffic()
+                        # Short peek only to confirm SH, then relay (ios/517B path).
+                        try:
+                            peek = await asyncio.wait_for(loop.sock_recv(outgoing, 65535), 3.0)
+                        except (OSError, asyncio.TimeoutError):
+                            peek = b""
+                        if peek:
+                            sh = len(peek) > 5 and peek[0] == 0x16 and peek[5] == 0x02
+                            self.log(
+                                f"PATTERN OOB peek {len(peek)} head={peek[:8].hex()} "
+                                f"sh={'yes' if sh else 'no'}"
+                            )
+                            await loop.sock_sendall(incoming, peek)
+                            self.download += len(peek)
+                            self._emit_traffic()
+                        else:
+                            self.log("PATTERN OOB peek empty; relay")
+                    except (OSError, asyncio.TimeoutError) as exc:
+                        self.log(f"PATTERN OOB handshake error: {type(exc).__name__}")
+                        return
+                elif self._strategy_override in TLS_FRAGMENT_STRATEGIES:
+                    loop = asyncio.get_running_loop()
+                    try:
+                        if self._hybrid_fake_fragment or self._fragment_delay_s > 0:
+                            try:
+                                outgoing.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                            except OSError:
+                                pass
                         if self._post_fake_delay_s:
                             await asyncio.sleep(self._post_fake_delay_s)
                         first = await asyncio.wait_for(loop.sock_recv(incoming, 65535), 2.0)
@@ -868,7 +1138,9 @@ class PatternSniCore:
 
 
             if pending:
-                done2, pending = await asyncio.wait(pending, timeout=3.0)
+                # ECH/OOB tunnels need a longer drain; 3s was cutting proxied HTTP.
+                drain = 12.0 if getattr(self, "_oob_mode", "") else 3.0
+                done2, pending = await asyncio.wait(pending, timeout=drain)
                 for task in done2:
                     try:
                         await task

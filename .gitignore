@@ -13,12 +13,19 @@ github_release_stage/
 *.sys
 *.zip
 
-bin/
+/bin/
+/core/**/target/
+/configs/
+/ca.psiphon.PsiphonTunnel.tunnel-core/
+/artifacts/
+/dist-*/
 
 qa_artifacts*/
 codex_backups/
 nav_alignment_probe.png
 *.bak
+*.bak-*
+*.bak_*
 .last_*
 
 *.log

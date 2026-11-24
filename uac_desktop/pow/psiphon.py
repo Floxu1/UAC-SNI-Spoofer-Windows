@@ -76,7 +76,6 @@ class PsiphonProcess:
         if entries is None:
             raise RuntimeError("PoW server entries are missing from the app assets")
         self.stop()
-        self.connected.clear()
         data_dir = Path(data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         config_path = data_dir / "pow-psiphon-config.json"
@@ -93,6 +92,8 @@ class PsiphonProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             cwd=str(data_dir),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -103,12 +104,19 @@ class PsiphonProcess:
             attach_kill_on_close_job(process)
         except Exception:
             pass
-        with self._lock:
-            self._process = process
-        self._reader = threading.Thread(
+        reader = threading.Thread(
             target=self._drain, args=(process,), name="pow-psiphon-log", daemon=True
         )
-        self._reader.start()
+        with self._lock:
+            self._process = process
+            self._reader = reader
+            self.connected.clear()
+            self.socks_port = None
+            self.server_region = self.client_region = ""
+            self.available_regions = []
+            self.bytes_sent = self.bytes_received = 0
+            self.last_diagnostic = ""
+        reader.start()
 
     def _drain(self, process: subprocess.Popen) -> None:
         try:
@@ -118,7 +126,7 @@ class PsiphonProcess:
                 if not line:
                     continue
                 if line.startswith("PSIPHON "):
-                    self._handle_notice_line(line[len("PSIPHON ") :])
+                    self._handle_notice_line(line[len("PSIPHON ") :], source=process)
                 elif line.startswith("PSIPHON"):
                     continue
                 else:
@@ -126,7 +134,7 @@ class PsiphonProcess:
         except Exception:
             pass
 
-    def _handle_notice_line(self, payload: str) -> None:
+    def _handle_notice_line(self, payload: str, *, source: subprocess.Popen | None = None) -> None:
         try:
             notice = json.loads(payload)
         except ValueError:
@@ -138,36 +146,42 @@ class PsiphonProcess:
         data = notice.get("data")
         if not isinstance(data, dict):
             data = {}
-        if kind == "Tunnels":
-            try:
-                if int(data.get("count", 0)) >= 1:
-                    self.connected.set()
-            except (TypeError, ValueError):
-                pass
-        elif kind == "ListeningSocksProxyPort":
-            try:
-                self.socks_port = int(data.get("port", 0)) or None
-            except (TypeError, ValueError):
-                pass
-        elif kind == "ConnectedServerRegion":
-            self.server_region = str(data.get("region", ""))
-        elif kind == "ClientRegion":
-            self.client_region = str(data.get("region", ""))
-        elif kind == "AvailableEgressRegions":
-            regions = data.get("regions") or data.get("region") or []
-            if isinstance(regions, str):
-                regions = [regions]
-            self.available_regions = [str(region) for region in regions]
-        elif kind == "BytesTransferred":
-            try:
-                self.bytes_sent = int(data.get("sent", self.bytes_sent))
-                self.bytes_received = int(data.get("received", self.bytes_received))
-            except (TypeError, ValueError):
-                pass
-        elif kind in ("Diagnostic", "ActiveTunnel", "ClientUpgradeAvailable"):
-            text = json.dumps(data, ensure_ascii=False)[:300]
-            if text and text != "{}":
-                self.last_diagnostic = f"{kind}: {text}"
+        with self._lock:
+            if source is not None and self._process is not source:
+                return
+            if kind == "Tunnels":
+                try:
+                    if int(data.get("count", 0)) >= 1:
+                        self.connected.set()
+                    else:
+                        self.connected.clear()
+                except (TypeError, ValueError):
+                    pass
+            elif kind == "ListeningSocksProxyPort":
+                try:
+                    self.socks_port = int(data.get("port", 0)) or None
+                except (TypeError, ValueError):
+                    pass
+            elif kind == "ConnectedServerRegion":
+                self.server_region = str(data.get("region", ""))
+            elif kind == "ClientRegion":
+                self.client_region = str(data.get("region", ""))
+            elif kind == "AvailableEgressRegions":
+                regions = data.get("regions") or data.get("region") or []
+                if isinstance(regions, str):
+                    regions = [regions]
+                if isinstance(regions, list):
+                    self.available_regions = [str(region) for region in regions]
+            elif kind == "BytesTransferred":
+                try:
+                    self.bytes_sent = int(data.get("sent", self.bytes_sent))
+                    self.bytes_received = int(data.get("received", self.bytes_received))
+                except (TypeError, ValueError):
+                    pass
+            elif kind in ("Diagnostic", "ActiveTunnel", "ClientUpgradeAvailable"):
+                text = json.dumps(data, ensure_ascii=False)[:300]
+                if text and text != "{}":
+                    self.last_diagnostic = f"{kind}: {text}"
         self._emit(kind, data)
 
     def _emit(self, kind: str, data: dict) -> None:
@@ -181,19 +195,19 @@ class PsiphonProcess:
     def wait_connected(self, timeout_seconds: float, stop: threading.Event) -> bool:
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            if stop.is_set():
+            if stop.is_set() or not self.running:
                 return False
             if self.connected.is_set():
                 return True
-            if not self.running:
-                return False
-            time.sleep(0.3)
-        return self.connected.is_set()
+            stop.wait(0.3)
+        return self.connected.is_set() and self.running and not stop.is_set()
 
     def stop(self) -> None:
         with self._lock:
-            process = self._process
-            self._process = None
+            process, self._process = self._process, None
+            reader, self._reader = self._reader, None
+            self.connected.clear()
+            self.socks_port = None
         if process is None:
             return
         pid = getattr(process, "pid", None)
@@ -217,7 +231,5 @@ class PsiphonProcess:
                 unregister_helper_pid(pid)
             except Exception:
                 pass
-        reader = self._reader
-        self._reader = None
         if reader is not None and reader.is_alive():
             reader.join(timeout=2)

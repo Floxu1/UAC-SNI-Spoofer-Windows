@@ -786,108 +786,48 @@ def test_rapid_profile_switch_uses_last_click_and_starts_once(monkeypatch):
     assert started == [True]
 
 
-def test_latency_card_shows_8888_tunnel_latency():
-    class LabelStub:
-        def __init__(self):
-            self.text = ""
+@pytest.mark.parametrize("engine", ("xray", "pow"))
+def test_network_hud_probes_dns_on_active_engine_route(monkeypatch, engine):
+    from uac_desktop.direct import probe
 
-        def setText(self, value):
-            self.text = value
-
-    class SparklineStub:
-        def __init__(self):
-            self.values = []
-
-        def add_value(self, value):
-            self.values.append(value)
-
-    secondary = []
-    label = LabelStub()
-    sparkline = SparklineStub()
-    dummy = SimpleNamespace(
-        ping_label=label,
-        latency_card=SimpleNamespace(
-            set_secondary=secondary.append,
-            sparkline=sparkline,
-        ),
-        engine=SimpleNamespace(tun_running=True),
-        _target_latency_generation=3,
-        _target_latency_busy=True,
-        _target_latency_pending=False,
-    )
-
-    MainWindow._set_latency(dummy, 0.0, "testing")
-    assert label.text == "…"
-    assert secondary[-1] == "8.8.8.8 • Checking…"
-
-    MainWindow._target_latency_finished(dummy, 87.6, "tun", 3)
-    assert label.text == "88 ms"
-    assert secondary[-1] == "8.8.8.8 • TUN TLS"
-    assert sparkline.values == [87.6]
-
-
-def test_latency_card_falls_back_to_direct_8888_ping():
-    label = SimpleNamespace(text="", setText=lambda value: setattr(label, "text", value))
-    secondary = []
-    sparkline = []
-    dummy = SimpleNamespace(
-        ping_label=label,
-        latency_card=SimpleNamespace(
-            set_secondary=secondary.append,
-            sparkline=SimpleNamespace(add_value=sparkline.append),
-        ),
-        engine=SimpleNamespace(tun_running=True),
-        _target_latency_generation=8,
-        _target_latency_busy=True,
-        _target_latency_pending=False,
-    )
-
-    MainWindow._target_latency_finished(dummy, 62.0, "direct-fallback", 8)
-
-    assert label.text == "62 ms"
-    assert secondary[-1] == "8.8.8.8 • Direct fallback"
-    assert sparkline == [62.0]
-
-
-def test_latency_card_shows_active_proxy_config_delay():
-    label = SimpleNamespace(text="", setText=lambda value: setattr(label, "text", value))
-    secondary = []
-    sparkline = []
-    dummy = SimpleNamespace(
-        ping_label=label,
-        latency_card=SimpleNamespace(
-            set_secondary=secondary.append,
-            sparkline=SimpleNamespace(add_value=sparkline.append),
-        ),
-        engine=SimpleNamespace(
-            tun_running=False,
-            running=True,
-            _proxy_enabled=True,
-            run_id=12,
-        ),
+    queries, readings = [], []
+    monkeypatch.setattr(probe, "verify_dns",
+                        lambda port, server, timeout: queries.append((port, server, timeout))
+                        or SimpleNamespace(ok=True))
+    monkeypatch.setattr(ui_module.threading, "Thread",
+                        lambda target, **_: SimpleNamespace(start=target))
+    window = SimpleNamespace(
+        network_metrics=SimpleNamespace(connection_state="connected", set_latency=lambda *args: readings.append(args)),
+        engine_mode=engine,
+        engine=SimpleNamespace(running=True, socks_port=10851, run_id=12),
+        pow_controller=SimpleNamespace(coordinator=SimpleNamespace(running=True, exit_port=10852)),
+        _closing=False, _target_latency_busy=False, _target_latency_generation=4,
         tr=lambda fa, en: en,
-        _target_latency_generation=9,
-        _target_latency_busy=True,
-        _target_latency_pending=False,
     )
+    window._dns_probe_route = lambda: MainWindow._dns_probe_route(window)
+    window.bridge = SimpleNamespace(target_latency=SimpleNamespace(
+        emit=lambda *args: MainWindow._target_latency_finished(window, *args)
+    ))
 
-    MainWindow._target_latency_finished(dummy, 143.4, "proxy|12", 9)
+    MainWindow._queue_target_latency_probe(window)
+    assert queries == [(10851 if engine == "xray" else 10852, "8.8.8.8", 2.0)]
+    assert readings[0][0] > 0 and "DNS" in readings[0][1]
+    assert not window._target_latency_busy
 
-    assert label.text == "143 ms"
-    assert secondary[-1] == "Active config • Live delay"
-    assert sparkline == [143.4]
 
-
-@pytest.mark.parametrize(
-    ("output", "expected"),
-    [
-        ("Reply from 8.8.8.8: bytes=32 time=62ms TTL=117", 62.0),
-        ("Reply from 8.8.8.8: bytes=32 time<1ms TTL=117", 1.0),
-        ("Request timed out.", None),
-    ],
-)
-def test_parse_direct_8888_ping(output, expected):
-    assert ui_module._parse_ping_latency(output) == expected
+def test_network_hud_drops_stale_dns_and_clears_on_timeout():
+    readings = []
+    route = ("xray", 10851, 7)
+    window = SimpleNamespace(
+        network_metrics=SimpleNamespace(set_latency=lambda *args: readings.append(args)),
+        _dns_probe_route=lambda: route, _target_latency_generation=5, _target_latency_busy=True,
+        tr=lambda fa, en: en,
+    )
+    MainWindow._target_latency_finished(window, 13, route, 4)
+    MainWindow._target_latency_finished(window, 13, ("pow", 10851, None), 5)
+    assert readings == []
+    MainWindow._target_latency_finished(window, None, route, 5)
+    assert readings == [(None, "No DNS response")]
 
 
 def test_close_event_hides_window_when_user_chooses_system_tray():
@@ -983,6 +923,9 @@ def test_proxy_mode_off_keeps_engine_running_and_restores_only_windows_proxy(mon
         ),
         _save_flag=lambda key, value: (
             storage.settings.__setitem__(key, value), storage.save_settings()
+        ),
+        _set_xray_output=lambda mode: (
+            storage.settings.__setitem__("proxy_mode", mode == "proxy"), storage.save_settings()
         ),
         _set_activity=lambda *args: activity.append(args),
         _queue_proxy_mode_apply=lambda: queued.append(True),
@@ -1309,7 +1252,7 @@ def test_failed_tun_stop_ui_reflects_still_running_runtime(monkeypatch):
         tun_option=tun_option,
         proxy_option=proxy_option,
         _tun_mode_enabled=lambda: bool(settings["tun_mode"]),
-        _save_flag=lambda key, value: settings.__setitem__(key, value),
+        _set_xray_output=lambda mode: settings.__setitem__("tun_mode", mode == "vpn"),
         _handle_error=errors.append,
     )
     monkeypatch.setattr(ui_module, "_restyle", lambda _widget: None)

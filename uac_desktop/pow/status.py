@@ -19,6 +19,7 @@ class PowPhase(str, Enum):
     INNER = "inner"
     BRIDGING = "bridging"
     CONNECTED = "connected"
+    PAUSED = "paused"
     FAILED = "failed"
 
 

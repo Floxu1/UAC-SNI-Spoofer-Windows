@@ -115,7 +115,7 @@
 
 ## ساخت از سورس
 
-**پیش‌نیازها:** ویندوز ۱۰ یا ۱۱ نسخه x64، پایتون <code>3.11</code> یا <code>3.12</code>، <code>git</code>، <code>Go 1.26+</code>، <code>Rust 1.88+</code> (‏<code>cargo</code>) به‌همراه <code>cmake</code> و <code>NASM</code>.
+**پیش‌نیازها:** ویندوز ۱۰ یا ۱۱ نسخه x64، پایتون <code>3.11</code> یا <code>3.12</code>، Git، <code>Go 1.26+</code>، <code>Rust 1.88+</code>، ابزار ساخت Visual Studio با MSVC و Windows SDK، به‌همراه CMake، NASM و LLVM/libclang. دستورهای زیر را در Developer PowerShell نسخهٔ x64 اجرا کنید.
 
 </div>
 
@@ -135,7 +135,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | <code>xray.exe</code>، <code>geoip.dat</code>، <code>geosite.dat</code> | ریلیز <code>Xray-core 26.3.27</code> با هش SHA-256 ثابت |
 | <code>sing-box.exe</code>، <code>libcronet.dll</code> | ریلیز <code>sing-box 1.13.14</code> با هش SHA-256 ثابت |
 | <code>uac-psiphon.exe</code> | ساخت با <code>go build</code> از پوشه <code>pow_helper</code> (وابستگی‌ها با <code>go.sum</code>) |
-| <code>aether.exe</code> | ساخت با <code>cargo build</code> از <code>core/aether</code> مخزن [UAC-SNI-Spoofer-Android](https://github.com/Floxu1/UAC-SNI-Spoofer-Android) در یک کامیت ثابت (یا مسیر <code>UAC_AETHER_SRC</code>) |
+| <code>aether.exe</code> | ساخت بومی ویندوز از نسخهٔ ثابت PoW اندروید در <code>core/aether</code> و <code>core/quiche</code>، شامل مسیرهای H3 و پشتیبانی از مخزن گواهی ویندوز |
+| <code>uac-direct.exe</code>، <code>uac-direct-xray.exe</code>، <code>uac-direct-mask.exe</code> | ساخت بومی از <code>core/direct</code> و دریافت Xray و ByeDPI با بررسی هش |
+| <code>uac-pow-guard.exe</code>، <code>uac-direct-guard.exe</code> | ساخت helper فیلترینگ ویندوز از <code>tools/pow-guard.c</code> با MSVC |
 
 اجرای مستقیم از سورس: <code>pip install -r requirements.txt</code>، سپس <code>install-engine.ps1</code> و در آخر <code>python main.py</code>.
 

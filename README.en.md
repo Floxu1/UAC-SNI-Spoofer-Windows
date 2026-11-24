@@ -115,7 +115,7 @@ No Python install is required. Full illustrated guide: **[floxu1.github.io/UAC-S
 
 ## Build from source
 
-**Requirements:** Windows 10/11 x64 · Python 3.11/3.12 · `git` · Go 1.26+ · Rust 1.88+ (`cargo`) with `cmake` and `NASM` (for `boring-sys`).
+**Requirements:** Windows 10/11 x64 · Python 3.11/3.12 · Git · Go 1.26+ · Rust 1.88+ (`cargo`) · Visual Studio Build Tools with MSVC and the Windows SDK · CMake, NASM and LLVM/libclang. Run the commands below from an x64 Developer PowerShell.
 
 ```powershell
 git clone https://github.com/Floxu1/UAC-SNI-Spoofer-Windows.git
@@ -131,7 +131,9 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | `xray.exe`, `geoip.dat`, `geosite.dat` | Xray-core `26.3.27` release, SHA-256 pinned |
 | `sing-box.exe`, `libcronet.dll` | sing-box `1.13.14` release, SHA-256 pinned |
 | `uac-psiphon.exe` | `go build` of `pow_helper/` (Psiphon tunnel-core, pinned by `go.sum`) |
-| `aether.exe` | `cargo build` of `core/aether` from [UAC-SNI-Spoofer-Android](https://github.com/Floxu1/UAC-SNI-Spoofer-Android) at a pinned commit (or `UAC_AETHER_SRC`) |
+| `aether.exe` | Native Windows build from the pinned Android PoW snapshot in `core/aether` and `core/quiche`, including H3 and Windows trust-store support |
+| `uac-direct.exe`, `uac-direct-xray.exe`, `uac-direct-mask.exe` | Native build from `core/direct` and checksum-verified Xray and ByeDPI downloads |
+| `uac-pow-guard.exe`, `uac-direct-guard.exe` | MSVC build of the Windows Filtering Platform helper in `tools/pow-guard.c` |
 
 Run from source without packaging: `python -m pip install -r requirements.txt`, `.\install-engine.ps1`, `python main.py`.
 

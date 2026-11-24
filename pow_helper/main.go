@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -96,7 +97,20 @@ func filterMeekEntries(path string) (string, error) {
 	return filtered.Name(), nil
 }
 
+func coreRevision() string {
+	info, ok := debug.ReadBuildInfo()
+	if ok {
+		for _, dep := range info.Deps {
+			if dep.Path == "github.com/Psiphon-Labs/psiphon-tunnel-core" && dep.Replace == nil {
+				return dep.Version
+			}
+		}
+	}
+	return ""
+}
+
 func main() {
+	revision := flag.Bool("revision", false, "print the embedded Psiphon tunnel-core module version")
 	var configFilename string
 	flag.StringVar(&configFilename, "config", "", "Psiphon config JSON file (same keys as mobile buildConfig)")
 	var entriesFilename string
@@ -104,6 +118,15 @@ func main() {
 	var meekOnly bool
 	flag.BoolVar(&meekOnly, "meekOnly", false, "keep only cloudflare/fastly fronted entries (direct meek mode)")
 	flag.Parse()
+	if *revision {
+		version := coreRevision()
+		if version == "" {
+			fmt.Fprintln(os.Stderr, "Psiphon tunnel-core revision is unavailable")
+			os.Exit(1)
+		}
+		fmt.Println(version)
+		return
+	}
 
 	psiphon.SetNoticeWriter(&prefixedWriter{target: os.Stdout})
 

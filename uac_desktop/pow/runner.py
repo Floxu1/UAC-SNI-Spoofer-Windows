@@ -18,6 +18,7 @@ import json
 import os
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -149,6 +150,25 @@ def _app_ech_env(data_dir: Path, api_camo: str, on_log: LogCallback | None = Non
     return {"AETHER_API_DOH": "1"}
 
 
+def _write_pow_config(payload: dict) -> Path:
+    # Each process owns its input, including parallel and replacement legs.
+    data_dir = Path(payload["config_path"]).parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+    config = dict(payload)
+    config.pop("api_relay", None)  # Existing Windows transport option consumed from the environment.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=data_dir, prefix="pow-session-", suffix=".json", delete=False
+    ) as stream:
+        path = Path(stream.name)
+        try:
+            json.dump(config, stream)
+        except Exception:
+            stream.close()
+            path.unlink(missing_ok=True)
+            raise
+    return path
+
+
 def _prepare_args(binary: Path, payload: dict, renew: bool) -> list[str]:
     args = [str(binary), "--prepare-only"]
     if renew:
@@ -241,17 +261,26 @@ def prepare_identity(
         )
         tail_thread.start()
 
-    process = subprocess.Popen(
-        args,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        session_config = _write_pow_config(payload)
+        try:
+            process = subprocess.Popen(
+                [*args, "--pow-config", str(session_config)],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except BaseException:
+            session_config.unlink(missing_ok=True)
+            raise
+    except BaseException:
+        tail_stop.set()
+        raise
     out_lines: list[str] = []
     err_lines: list[str] = []
 
@@ -284,6 +313,7 @@ def prepare_identity(
             time.sleep(0.3)
             tail_stop.set()
             tail_thread.join(timeout=2)
+        session_config.unlink(missing_ok=True)
 
     deadline = time.monotonic() + timeout
     while process.poll() is None:
@@ -389,6 +419,9 @@ class AetherProcess:
     def __init__(self, on_log: LogCallback | None = None) -> None:
         self._on_log = on_log
         self._process: subprocess.Popen | None = None
+        self._config: Path | None = None
+        self._ready = threading.Event()
+        self._verified_h2_peer = ""
         self._reader: threading.Thread | None = None
         self._tail: threading.Thread | None = None
         self._tail_stop = threading.Event()
@@ -417,19 +450,26 @@ class AetherProcess:
         env["AETHER_SCAN_ONCE"] = "1"
         if extra_env:
             env.update({str(k): str(v) for k, v in extra_env.items()})
-        if env.get("AETHER_PROTOCOL") == "masque" and env.get("AETHER_MASQUE_HTTP2") != "1":
-            # Mobile parity: the H3 path is QUIC; nothing extra to pass.
-            pass
-        args = [str(binary)]
-        process = subprocess.Popen(
-            args,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        forced_peer = (extra_env or {}).get("AETHER_MASQUE_H2_PEER")
+        if forced_peer:
+            payload["forced_peer"] = forced_peer
+        session_config = _write_pow_config(payload)
+        try:
+            process = subprocess.Popen(
+                [str(binary), "--pow-config", str(session_config)],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except BaseException:
+            session_config.unlink(missing_ok=True)
+            raise
         try:
             from ..process_win import attach_kill_on_close_job, register_helper_pid
             register_helper_pid(process.pid)
@@ -437,7 +477,10 @@ class AetherProcess:
         except Exception:
             pass
         with self._lock:
+            self._ready.clear()
+            self._verified_h2_peer = ""
             self._process = process
+            self._config = session_config
         self._reader = threading.Thread(
             target=self._drain, args=(process,), name="pow-aether-log", daemon=True
         )
@@ -492,11 +535,38 @@ class AetherProcess:
                 line = line.strip()
                 if not line:
                     continue
-                callback = self._on_log
-                if callback is not None:
-                    self._deliver(line)
-        except Exception:
-            pass
+                if line.startswith("AETHER_EVENT "):
+                    event = json.loads(line.removeprefix("AETHER_EVENT "))
+                    message = event.get("message")
+                    saved = "Saved clean HTTP/2 address "
+                    if event.get("type") == "log" and isinstance(message, str) and message.startswith(saved):
+                        with self._lock:
+                            if process is self._process:
+                                self._verified_h2_peer = message.removeprefix(saved).strip()
+                    if event.get("type") == "status":
+                        with self._lock:
+                            if process is self._process and event.get("status") == "connected":
+                                self._ready.set()
+                        if event.get("status") == "failed":
+                            self._deliver(f"Aether failed: {event.get('detail')}")
+                    continue
+                self._deliver(line)
+        except (OSError, ValueError):
+            self._deliver("Aether event stream ended unexpectedly")
+
+    def verified_h2_profile(self) -> tuple[str, dict] | None:
+        with self._lock:
+            peer = self._verified_h2_peer
+            path = self._config
+            if not peer or not path or not self._ready.is_set():
+                return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if payload.get("protocol") == "masque" and payload.get("masque_transport") == "h2":
+            return peer, payload
+        return None
 
     def wait_ready(self, port: int, budget_ms: int, stop: threading.Event) -> bool:
         deadline = time.monotonic() + budget_ms / 1000.0
@@ -505,13 +575,16 @@ class AetherProcess:
                 return False
             if not self.running:
                 return False
-            if tcp_accepts(port):
-                # Mobile grace: one accepted probe is not a ready tunnel;
-                # require it twice in a row before committing.
-                time.sleep(0.3)
-                if self.running and tcp_accepts(port):
-                    return True
-            time.sleep(0.3)
+            if self._ready.is_set():
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
+                        sock.sendall(b"\x05\x01\x00")
+                        with sock.makefile("rb") as reply:
+                            if reply.read(2) == b"\x05\x00" and self.running and not stop.is_set():
+                                return True
+                except OSError:
+                    pass
+            stop.wait(0.25)
         return False
 
     def stop(self) -> None:
@@ -519,6 +592,8 @@ class AetherProcess:
         with self._lock:
             process = self._process
             self._process = None
+            config, self._config = self._config, None
+            self._ready.clear()
         if process is None:
             return
         pid = getattr(process, "pid", None)
@@ -542,6 +617,8 @@ class AetherProcess:
                 unregister_helper_pid(pid)
             except Exception:
                 pass
+        if config is not None:
+            config.unlink(missing_ok=True)
         reader = self._reader
         self._reader = None
         if reader is not None and reader.is_alive():

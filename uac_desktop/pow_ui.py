@@ -15,15 +15,19 @@ the desktop look (cards, toggles, glow buttons, bilingual labels).
 
 from __future__ import annotations
 
+from dataclasses import replace
+
+import json
 import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QSignalBlocker, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -40,6 +44,10 @@ from PySide6.QtWidgets import (
 )
 
 from .paths import DATA_DIR
+from .settings_ui import (
+    SettingsCard, SettingsGrid, SettingsPage, SettingsRow, SettingsSelect,
+    engine_backup_card, settings_button,
+)
 from .pow import config as C
 from .pow.coordinator import PowCoordinator, PowEngineError
 from .pow.identity import (
@@ -72,18 +80,45 @@ _TRANSPORT_OPTIONS = (
     ("gool", "WoW", "WoW"),
     ("wireguard", "WireGuard", "WireGuard"),
 )
-_SPEED_OPTIONS = (('parallel', 'parallel_masque', 'MASQUE موازی', 'Parallel MASQUE', '۲ تا ۳ اتصال MASQUE هم\u200cزمان؛ هر سایت روی یک اتصال می\u200cماند', '2–3 MASQUE sessions at once; each site stays on one session'), ('h3', 'irancell_h3', 'HTTP/3 در ایرانسل', 'HTTP/3 on Irancell', 'فقط وقتی فایروال ایرانسل است؛ اگر نشد سریع به HTTP/2 برمی\u200cگردد', 'Only when firewall is Irancell; falls back to HTTP/2 quickly'), ('direct', 'direct_psiphon_first', 'اول سایفون مستقیم', 'Direct Psiphon first', 'اول کوتاه سایفون بدون وارپ؛ اگر وصل شد وارپ لازم نیست', 'Short try of Psiphon without WARP; if it connects, WARP is skipped'), ('lowrtt', 'lowest_rtt_ip', 'کم\u200cتأخیرترین آی\u200cپی تمیز', 'Lowest-latency clean IP', 'آی\u200cپی تمیز سریع\u200cتر اول؛ هر چند دقیقه دوباره سنجیده می\u200cشود', 'Fastest saved clean IP first; re-measured every few minutes'))
+_SPEED_OPTIONS = (('parallel', 'parallel_masque', 'MASQUE موازی', 'Parallel MASQUE', '۲ تا ۳ اتصال MASQUE هم\u200cزمان؛ هر سایت روی یک اتصال می\u200cماند', '2–3 MASQUE sessions at once; each site stays on one session'), ('h3', 'irancell_h3', 'HTTP/3 در ایرانسل', 'HTTP/3 on Irancell', 'فقط وقتی فایروال ایرانسل است؛ اگر نشد سریع به HTTP/2 برمی\u200cگردد', 'Only when firewall is Irancell; falls back to HTTP/2 quickly'), ('direct', 'direct_psiphon_first', 'اول سایفون مستقیم', 'Direct Psiphon first', 'اول کوتاه سایفون بدون وارپ؛ اگر وصل شد وارپ لازم نیست', 'Short try of Psiphon without WARP; if it connects, WARP is skipped'), ('lowrtt', 'lowest_rtt_ip', 'کم\u200cتأخیرترین آی\u200cپی تمیز', 'Lowest-latency clean IP', 'آی\u200cپی تمیز سریع\u200cتر اول؛ هر چند دقیقه دوباره سنجیده می\u200cشود', 'Fastest saved clean IP first; re-measured every few minutes'),
+    ('pool', 'psiphon_tunnel_pool', 'سایفون دوم', 'Second Psiphon tunnel',
+     'در حالت VPN از دو نشست مستقل استفاده می‌کند', 'Distribute VPN traffic across two independent sessions'),
+    ('startup', 'startup_speed_test', 'آزمون دانلود هنگام اتصال', 'Startup download test',
+     'پیش از اتصال نهایی، مسیرهای H2 و سایفون را مقایسه می‌کند',
+     'Compare H2 and Psiphon routes before establishing the final connection'),
+)
 _SPEED_TOGGLES = tuple(f"speed_{key}_toggle" for key, *_rest in _SPEED_OPTIONS)
 _RECIPE_OPTIONS = (
     ("auto", "خودکار", "Auto"),
     ("masque-h2", "MASQUE H2", "MASQUE H2"),
     ("masque-h3", "MASQUE H3", "MASQUE H3"),
+    ("masque-h3-experimental", "MASQUE H3 آزمایشی", "MASQUE H3 experimental"),
+    ("masque-h3-over-h2", "MASQUE H3 روی H2", "MASQUE H3 over H2"),
     ("masque-h2-split", "MASQUE H2 شکافته", "MASQUE H2 split"),
     ("masque-h2-saved", "MASQUE H2 ذخیره‌شده", "MASQUE H2 saved"),
     ("warp-any", "WARP هر IP", "WARP any"),
     ("warp-v6", "WARP نسخه ۶", "WARP v6"),
     ("wow-any", "WoW هر IP", "WoW any"),
     ("wow-v6", "WoW نسخه ۶", "WoW v6"),
+)
+_POW_EXIT_OPTIONS = (
+    ("chain", "سایفون روی وارپ", "Psiphon over WARP"),
+    ("warp", "فقط وارپ", "WARP only"),
+    ("psiphon", "فقط سایفون", "Psiphon only"),
+)
+_ADVANCED_CHOICES = (
+    ("h2_fingerprint", "اثر انگشت H2", "H2 fingerprint",
+     tuple((value, value, value) for value in C.H2_FINGERPRINTS)),
+    ("masque_ip_version", "نسخه IP ماسک", "MASQUE IP family",
+     tuple((value, value, value) for value in C.MASQUE_IP_VERSIONS)),
+    ("h2_fragment_mode", "تقسیم H2", "H2 fragmentation",
+     (("auto", "خودکار", "Auto"), ("on", "روشن", "On"), ("off", "خاموش", "Off"))),
+    ("h2_obfuscation", "مبهم‌سازی H2", "H2 obfuscation",
+     (("unchanged", "طبق دستور اتصال", "Use recipe"), ("light", "سبک", "Light"), ("off", "خاموش", "Off"))),
+    ("tun_backend", "پردازش TUN", "TUN stack",
+     (("stable", "پایدار", "Stable"), ("gvisor", "gVisor آزمایشی", "gVisor experimental"))),
+    ("tun_mtu", "MTU تونل", "Tunnel MTU", tuple((str(value), str(value), str(value))
+                                                    for value in (1280, 1350, 1400))),
 )
 _KEY_FETCH_OPTIONS = (
     ("auto", "خودکار", "Auto"),
@@ -140,6 +175,9 @@ class PowSegmented(QFrame):
         if index == 0:
             button.setChecked(True)
 
+    def setItemText(self, index: int, text: str) -> None:
+        self._group.button(index).setText(text)
+
     def count(self) -> int:
         return len(self._data)
 
@@ -165,58 +203,6 @@ class PowSegmented(QFrame):
             self.currentIndexChanged.emit(index)
 
 
-class PowSection(QFrame):
-    """Settings group: small caps header, optional collapse chevron, rows."""
-
-    def __init__(self, window, persian: str, english: str, icon_name: str,
-                 collapsible: bool = False, expanded: bool = True,
-                 trailing: QWidget | None = None) -> None:
-        from uac_desktop.ui import cyber_pixmap
-
-        super().__init__()
-        self.setObjectName("powSection")
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(8)
-        header = QHBoxLayout()
-        header.setSpacing(8)
-        icon = QLabel()
-        icon.setPixmap(cyber_pixmap(icon_name, "#67e8f9", 15))
-        icon.setFixedSize(18, 18)
-        title = window._bind_text(QLabel(), persian, english.upper())
-        title.setObjectName("powSectionTitle")
-        header.addWidget(icon)
-        header.addWidget(title)
-        header.addStretch()
-        if trailing is not None:
-            header.addWidget(trailing)
-        self._toggle = None
-        if collapsible:
-            self._toggle = QToolButton()
-            self._toggle.setObjectName("powSectionToggle")
-            self._toggle.setCursor(Qt.PointingHandCursor)
-            self._toggle.setFixedSize(26, 22)
-            self._toggle.clicked.connect(lambda: self.set_expanded(not self.body.isVisible()))
-            header.addWidget(self._toggle)
-        root.addLayout(header)
-        self.body = QWidget()
-        self.body.setObjectName("powSectionBody")
-        self.body_layout = QVBoxLayout(self.body)
-        self.body_layout.setContentsMargins(0, 4, 0, 0)
-        self.body_layout.setSpacing(4)
-        root.addWidget(self.body)
-        self.set_expanded(expanded or not collapsible)
-
-    def set_expanded(self, expanded: bool) -> None:
-        self.body.setVisible(bool(expanded))
-        if self._toggle is not None:
-            self._toggle.setText("\u25be" if expanded else "\u25b8")
-
-    def add(self, widget: QWidget) -> None:
-        self.body_layout.addWidget(widget)
-
-
 def _airy(label: QLabel, window) -> None:
     """Taller line height for wrapped help text (Qt labels have no QSS line-height)."""
     from uac_desktop.fonts import airy_html
@@ -227,34 +213,11 @@ def _airy(label: QLabel, window) -> None:
         label.setText(airy_html(text, getattr(window, "language", "fa") == "fa"))
 
 
-def _setting_row(window, fa_title: str, en_title: str, fa_desc: str, en_desc: str,
-                 control: QWidget) -> QFrame:
-    row = QFrame()
-    row.setObjectName("powSettingRow")
-    row.setAttribute(Qt.WA_Hover, True)
-    row.setAttribute(Qt.WA_StyledBackground, True)
-    layout = QHBoxLayout(row)
-    layout.setContentsMargins(12, 10, 12, 10)
-    layout.setSpacing(18)
-    copy = QVBoxLayout()
-    copy.setSpacing(4)
-    title = window._bind_text(QLabel(), fa_title, en_title)
-    title.setObjectName("powRowTitle")
-    desc = window._bind_text(QLabel(), fa_desc, en_desc)
-    desc.setObjectName("powRowDesc")
-    desc.setWordWrap(True)
-    _airy(desc, window)
-    copy.addWidget(title)
-    copy.addWidget(desc)
-    layout.addLayout(copy, 1)
-    layout.addWidget(control, 0, Qt.AlignVCenter)
-    return row
-
-
 def _dialog_header(dialog: QDialog, window, fa_title: str, en_title: str,
                    fa_sub: str, en_sub: str, icon_name: str) -> QFrame:
     from uac_desktop.ui import cyber_pixmap
 
+    dialog.setLayoutDirection(window.layoutDirection())
     header = QFrame()
     header.setObjectName("powDialogHeader")
     header.setAttribute(Qt.WA_StyledBackground, True)
@@ -293,9 +256,6 @@ class PowExitSelector(QPushButton):
     """Card-like exit selector: round flag/bolt badge, two-line text, chevron."""
 
     def __init__(self, parent=None) -> None:
-        from PySide6.QtGui import QTransform
-        from uac_desktop.ui import cyber_pixmap
-
         super().__init__(parent)
         self.setObjectName("powExitSelector")
         self.setCursor(Qt.PointingHandCursor)
@@ -324,12 +284,21 @@ class PowExitSelector(QPushButton):
         self.chevron.setObjectName("powExitChevron")
         self.chevron.setFixedSize(26, 26)
         self.chevron.setAlignment(Qt.AlignCenter)
-        self.chevron.setPixmap(cyber_pixmap("chevron-right", "#8fdcf0", 16).transformed(QTransform().rotate(90)))
+        self.refresh_chevron()
         layout.addWidget(self.badge)
         layout.addLayout(copy, 1)
         layout.addWidget(self.chevron)
         for widget in (self.badge, self.title_label, self.subtitle_label, self.chevron):
             widget.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+    def refresh_chevron(self, direct=False):
+        from PySide6.QtGui import QTransform
+        from .ui import cyber_pixmap
+
+        if direct:
+            self.chevron.setPixmap(cyber_pixmap("chevron-down", "#ffad6e", 16))
+        else:
+            self.chevron.setPixmap(cyber_pixmap("chevron-right", "#8fdcf0", 16).transformed(QTransform().rotate(90)))
 
     def set_value(self, pixmap, title: str, subtitle: str) -> None:
         self.badge.setPixmap(pixmap)
@@ -341,58 +310,11 @@ class PowExitSelector(QPushButton):
         return f"{self.title_label.text()} \u00b7 {self.subtitle_label.text()}"
 
 
-class PowSettingsDialog(QDialog):
-    """Advanced PoW options. Everyday switches (exit country, firewall,
-    Psiphon over WARP, optimized, HTTP/2 fragmentation, proxy/TUN) live on
-    Home only; both write the same PowStore, so there is one source of truth."""
-
-    def __init__(self, window, controller: "PowController") -> None:
-        super().__init__(window)
-        self.setObjectName("powSettingsDialog")
-        self.setWindowTitle(window.tr("تنظیمات UAC PoW", "UAC PoW Settings"))
-        self.setMinimumSize(620, 460)
-        self.resize(700, 640)
-        self.setModal(True)
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(_dialog_header(
-            self, window,
-            "تنظیمات UAC PoW", "UAC PoW Settings",
-            "گزینه‌های پیشرفته. کلیدهای روزمره در صفحه اصلی هستند.",
-            "Advanced options. Everyday switches live on Home.",
-            "settings",
-        ))
-        scroll = QScrollArea()
-        scroll.setObjectName("powDialogScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        body = QWidget()
-        body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(16, 14, 16, 16)
-        body_layout.setSpacing(12)
-        # Widgets emit while they are being filled. Ignore those signals until
-        # the stored settings have been applied, or the first empty control
-        # overwrites pow_settings.json.
-        controller._editing = False
-        body_layout.addWidget(controller._build_proxy_ports_section())
-        body_layout.addWidget(controller._build_tunnel_section())
-        body_layout.addWidget(controller._build_speed_section())
-        body_layout.addWidget(controller._build_identity_card())
-        body_layout.addWidget(controller._build_learned_section())
-        controller._load_settings_into_widgets()
-        controller._refresh_identity()
-        controller._editing = True
-        body_layout.addStretch()
-        scroll.setWidget(body)
-        root.addWidget(scroll, 1)
-
-
 class PowCountryPicker(QDialog):
-    """One picker for the PoW exit: Automatic (nearby first) or a country."""
+    """Searchable exit picker shared by PoW and Direct."""
 
-    def __init__(self, window, selected: str = "", remembered: str | None = None) -> None:
+    def __init__(self, window, selected: str = "", remembered: str | None = None,
+                 *, countries: dict[str, str] | None = None, nearby: bool = True) -> None:
         from uac_desktop.ui import country_flag_icon, cyber_icon
 
         super().__init__(window)
@@ -404,11 +326,12 @@ class PowCountryPicker(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        count = len(ALL_NAMES)
+        countries = ALL_NAMES if countries is None else countries
+        count = len(countries)
         root.addWidget(_dialog_header(
             self, window, "کشور خروجی", "Exit country",
-            f"{count} کشور · خودکار اول کشور نزدیک را امتحان می‌کند",
-            f"{count} countries · Automatic tries a nearby country first",
+            f"{count} کشور · خودکار اول کشور نزدیک را امتحان می‌کند" if nearby else "خودکار از خروجی وارپ استفاده می‌کند.",
+            f"{count} countries · Automatic tries a nearby country first" if nearby else "Automatic uses the WARP exit.",
             "globe",
         ))
         body = QVBoxLayout()
@@ -427,24 +350,24 @@ class PowCountryPicker(QDialog):
         self.list.setLayoutDirection(Qt.LeftToRight)
         self.list.setUniformItemSizes(False)
         remembered = (remembered or "").strip().upper()
-        if remembered:
+        if not nearby:
+            auto_sub = window.tr("خروجی وارپ", "WARP exit")
+        elif remembered:
             auto_sub = window.tr(
                 f"اول {ALL_NAMES.get(remembered, remembered)} ({remembered})، بعد هر کشوری",
                 f"{ALL_NAMES.get(remembered, remembered)} ({remembered}) first, then any country",
             )
         else:
             auto_sub = window.tr("اول یک کشور نزدیک، بعد هر کشوری", "A nearby country first, then any country")
-        auto = QListWidgetItem(
-            cyber_icon("zap", "#78fff0", 18),
-            window.tr("خودکار (سریع‌ترین کشور نزدیک)", "Automatic (fastest nearby)") + "\n" + auto_sub,
-        )
+        automatic = window.tr("خودکار (سریع‌ترین کشور نزدیک)", "Automatic (fastest nearby)") if nearby else window.tr("خودکار", "Automatic")
+        auto = QListWidgetItem(cyber_icon("zap", "#78fff0", 18), f"{automatic}\n{auto_sub}")
         auto.setData(Qt.UserRole, "")
         auto.setSizeHint(QSize(0, 50))
         self.list.addItem(auto)
         wanted = (selected or "").strip().upper()
         current = auto
-        for code in sorted(ALL_NAMES, key=lambda c: ALL_NAMES[c].lower()):
-            item = QListWidgetItem(country_flag_icon(code), f"{ALL_NAMES[code]}   {code}")
+        for code in sorted(countries, key=lambda c: countries[c].lower()):
+            item = QListWidgetItem(country_flag_icon(code), f"{countries[code]}   {code}")
             item.setData(Qt.UserRole, code.lower())
             item.setSizeHint(QSize(0, 38))
             self.list.addItem(item)
@@ -493,16 +416,12 @@ class PowController:
         )
         self._thread: threading.Thread | None = None
         self._connecting = False
+        self._disconnecting = False
+        self._connect_cancel = threading.Event()
         self._failed_message = ""
-        # TUN by default: the whole PC goes through the tunnel; the
-        # coordinator falls back to the Windows proxy when TUN cannot work.
-        # The choice is saved so it survives a restart.
-        try:
-            self._exit_proxy_mode = bool(self.store.exit_proxy_mode())
-        except Exception:
-            self._exit_proxy_mode = False
         # Requested exit while a live switch runs (None when idle).
         self._switch_target: bool | None = None
+        self._startup_switch_target: bool | None = None
         self._switch_token = None
         # The connection/identity cards live inside the settings dialog and are
         # built on demand; the page itself only needs the launcher summary.
@@ -511,6 +430,7 @@ class PowController:
         self.firewall_combo = None
         self.scan_combo = None
         self.recipe_combo = None
+        self.pow_exit_combo = None
         self.obfuscation_combo = None
         self.key_fetch_combo = None
         self.chain_toggle = None
@@ -526,9 +446,15 @@ class PowController:
         self.learned_box = None
         self.learned_count = None
         self._editing = False
+        self._settings_choices = {}
         self._attempt_open = False
         self._activity_kind = ""
         self._steps_signature: tuple | None = None
+        self._auto_next = 0.0
+        self._auto_attempt_network = ""
+        self._auto_network = None
+        self._auto_check = None
+        self._lan_update_lock = threading.Lock()
         self._poll = QTimer(window)
         self._poll.setInterval(600)
         self._poll.timeout.connect(self._refresh)
@@ -576,7 +502,7 @@ class PowController:
         return frame
 
     def _build_proxy_ports_section(self) -> QFrame:
-        """HTTP + Psiphon SOCKS inside PowSettingsDialog (تنظیمات PoW)."""
+        """HTTP and Psiphon SOCKS ports for the PoW settings page."""
         from .proxy_port_panel import build_pow_ports_section
         return build_pow_ports_section(self._window, self)
 
@@ -608,31 +534,37 @@ class PowController:
         return card
 
     def _open_settings(self) -> None:
-        dialog = PowSettingsDialog(self._window, self)
-        dialog.exec()
-        # Drop the widgets before they are destroyed so a teardown signal
-        # cannot write the unchecked defaults back over the saved settings.
-        self._editing = False
-        self._release_setting_widgets()
-        self._refresh_identity()
-        self._update_settings_summary()
-        refresh_exit = getattr(self._window, "_update_pow_country_selector", None)
-        if refresh_exit is not None and getattr(self._window, "engine_mode", "") == ENGINE_POW:
-            try:
-                refresh_exit()
-            except Exception:
-                pass
+        self._window.show_page(self._window.POW_SETTINGS_PAGE)
 
-    def _release_setting_widgets(self) -> None:
-        for name in (
-            "country_combo", "transport_combo", "firewall_combo", "scan_combo",
-            "recipe_combo", "obfuscation_combo", "key_fetch_combo",
-            "chain_toggle", "optimized_toggle", "h2_toggle",
-            "proxy_toggle", "tun_toggle", "identity_state", "identity_detail",
-            "learned_box", "learned_count", *_SPEED_TOGGLES,
-            "pow_http_port_input", "pow_socks_port_input", "proxy_port_editor",
-        ):
-            setattr(self, name, None)
+    def build_settings_page(self) -> QWidget:
+        window = self._window
+        page = SettingsPage(window, "تنظیمات PoW", "PoW Settings",
+                            "مسیرهای WARP و سایفون، عملکرد اتصال و هویت را تنظیم کنید.",
+                            "Configure WARP and Psiphon routes, connection performance, and identity.",
+                            categories=(("اتصال", "Connection"), ("پیشرفته", "Advanced"),
+                                        ("نگه‌داری", "Maintenance")))
+        connection = self._build_connection_cards(self._build_proxy_ports_section())
+        advanced = self._build_advanced_cards()
+        backup = engine_backup_card(window, lambda: self._exchange_settings(page, False),
+                                    lambda: self._exchange_settings(page, True))
+        maintenance = (self._build_identity_card(), self._build_learned_section(), backup)
+        for index, cards in enumerate((connection, advanced, maintenance)):
+            layout = page.category(index)
+            layout.addWidget(SettingsGrid(cards))
+            layout.addStretch(1)
+        self.refresh_settings_page()
+        self._editing = True
+        return page
+
+    def refresh_settings_page(self) -> None:
+        window = self._window
+        for control, choices in self._settings_choices.values():
+            with QSignalBlocker(control):
+                for index, (_value, fa, en) in enumerate(choices):
+                    control.setItemText(index, window._ui_text(fa, en))
+        self._load_settings_into_widgets()
+        self._refresh_identity()
+        self._refresh_learned()
 
     def _update_settings_summary(self) -> None:
         summary = getattr(self, "settings_summary", None)
@@ -647,8 +579,13 @@ class PowController:
         firewall = _fa_label(window, self.firewall_combo, _FIREWALL_OPTIONS, settings.firewall_profile)
         scan = _fa_label(window, self.scan_combo, _SCAN_OPTIONS, settings.scan_mode)
         country = _fa_label(window, self.country_combo, [], settings.exit_country_code) or window.tr("خودکار", "Automatic")
-        chain = window.tr("سایفون روی وارپ", "Psiphon over WARP") if settings.chain_psiphon else window.tr("فقط وارپ", "WARP only")
-        exit_mode = window.tr("پروکسی ویندوز", "Windows Proxy") if self._exit_proxy_mode else window.tr("حالت TUN", "TUN Mode")
+        chain = _fa_label(window, self.pow_exit_combo, _POW_EXIT_OPTIONS, settings.exit_mode)
+        fa, en = {
+            True: ("پروکسی ویندوز", "Windows Proxy"),
+            False: ("حالت TUN", "TUN Mode"),
+            None: ("خروجی خاموش", "Output off"),
+        }[self.requested_proxy_mode]
+        exit_mode = window.tr(fa, en)
         summary.setText(
             f"{country} · {transport} · {firewall} · {scan} · {chain} · {exit_mode}"
         )
@@ -703,152 +640,136 @@ class PowController:
         window = self._window
         control = PowSegmented()
         for key, fa_option, en_option in options:
-            control.addItem(fa_option if window.language != "en" else en_option, key)
+            control.addItem(window._ui_text(fa_option, en_option), key)
         control.currentIndexChanged.connect(lambda _index, name=attr: self._field_changed(name))
         setattr(self, f"{attr}_combo", control)
+        self._settings_choices[attr] = (control, options)
         return control
 
     def _compact_combo(self, options, attr: str) -> QComboBox:
         window = self._window
-        combo = QComboBox()
-        combo.setObjectName("powComboCompact")
-        combo.setCursor(Qt.PointingHandCursor)
-        combo.setFixedWidth(210)
+        combo = SettingsSelect()
         for key, fa_option, en_option in options:
-            combo.addItem(fa_option if window.language != "en" else en_option, key)
+            combo.addItem(window._ui_text(fa_option, en_option), key)
         combo.currentIndexChanged.connect(lambda _index, name=attr: self._field_changed(name))
         setattr(self, f"{attr}_combo", combo)
+        self._settings_choices[attr] = (combo, options)
         return combo
 
-    def _build_tunnel_section(self) -> QFrame:
-        window = self._window
-        section = PowSection(window, "تونل WARP", "WARP tunnel", "route")
-        section.add(_setting_row(
-            window, "انتقال", "Transport",
-            "اول کدام مسیر WARP امتحان شود", "Which WARP leg is tried first",
-            self._segmented(_TRANSPORT_OPTIONS, "transport")))
-        section.add(_setting_row(
-            window, "مسیر لینک", "Link path",
-            "دستور دقیق اتصال WARP؛ خودکار برای بیشتر شبکه‌ها", "Exact WARP recipe; Auto suits most networks",
-            self._compact_combo(_RECIPE_OPTIONS, "recipe")))
-        section.add(_setting_row(
-            window, "جستجو", "Search",
-            "مدت جستجوی آدرس تمیز", "How long to hunt for a clean edge",
-            self._segmented(_SCAN_OPTIONS, "scan")))
-        section.add(_setting_row(
-            window, "مبهم‌سازی", "Obfuscation",
-            "نویز روی دست‌دهی WARP", "Noise added to the WARP handshake",
-            self._segmented(_OBFUSCATION_OPTIONS, "obfuscation")))
-        from uac_desktop.ui import ToggleSwitch
+    def _build_connection_cards(self, ports):
+        from .ui import ToggleSwitch
 
+        window = self._window
+        tunnel = SettingsCard(window, "تونل WARP", "WARP tunnel", icon="route")
+        for title, hint, control in (
+            (("انتقال", "Transport"), ("اول کدام مسیر WARP امتحان شود", "Which WARP leg is tried first"),
+             self._segmented(_TRANSPORT_OPTIONS, "transport")),
+            (("مسیر لینک", "Link path"), ("دستور اتصال WARP برای نشست بعدی.", "WARP recipe for the next connection."),
+             self._compact_combo(_RECIPE_OPTIONS, "recipe")),
+            (("جستجو", "Search"), ("مدت جستجوی آدرس تمیز", "How long to hunt for a clean edge"),
+             self._segmented(_SCAN_OPTIONS, "scan")),
+            (("مبهم‌سازی", "Obfuscation"), ("نویز روی دست‌دهی WARP", "Noise added to the WARP handshake"),
+             self._segmented(_OBFUSCATION_OPTIONS, "obfuscation")),
+        ):
+            tunnel.add(SettingsRow(window, title, hint, control, stacked=True))
+
+        exit_card = SettingsCard(window, "خروجی و فایروال", "Exit and firewall", icon="shield")
+        exit_card.add(SettingsRow(window, ("خروجی اتصال", "PoW exit"),
+                                  ("مسیر خروجی نشست بعدی.", "Egress used on the next connection."),
+                                  self._compact_combo(_POW_EXIT_OPTIONS, "pow_exit"), stacked=True))
+        exit_card.add(SettingsRow(window, ("اپراتور", "Firewall profile"), ("", ""),
+                                  self._compact_combo(_FIREWALL_OPTIONS, "firewall"), stacked=True))
         self.optimized_toggle = ToggleSwitch()
-        self.optimized_toggle.setCursor(Qt.PointingHandCursor)
         self.optimized_toggle.toggled.connect(lambda _on: self._field_changed("optimized"))
-        section.add(_setting_row(
-            window, "حالت بهینه", "Optimized mode",
-            "تنظیم سایفون برای اتصال سریع‌تر و پایدارتر", "Tunes Psiphon workers and DNS for faster, steadier connects",
-            self.optimized_toggle))
-        return section
+        exit_card.add(SettingsRow(
+            window, ("حالت بهینه", "Optimized mode"),
+            ("تنظیم سایفون برای اتصال سریع‌تر و پایدارتر.", "Tunes Psiphon workers and DNS for steadier connects."),
+            self.optimized_toggle,
+        ))
+        output = QWidget()
+        cards = QVBoxLayout(output)
+        cards.setContentsMargins(0, 0, 0, 0)
+        cards.setSpacing(12)
+        cards.addWidget(exit_card)
+        cards.addWidget(ports)
+        return tunnel, output
 
-    def _build_speed_section(self) -> QFrame:
-        from uac_desktop.ui import ToggleSwitch
+    def _build_advanced_cards(self):
+        from .ui import ToggleSwitch
 
         window = self._window
-        section = PowSection(window, "سرعت", "Speed", "zap")
+        tunnel = SettingsCard(window, "تنظیم تونل", "Tunnel tuning", icon="sliders")
+        for field, fa, en, choices in _ADVANCED_CHOICES:
+            tunnel.add(SettingsRow(window, (fa, en), ("", ""), self._compact_combo(choices, field), stacked=True))
+        performance = SettingsCard(window, "عملکرد اتصال", "Connection performance", icon="gauge")
         for key, _field, fa_title, en_title, fa_hint, en_hint in _SPEED_OPTIONS:
             toggle = ToggleSwitch()
-            toggle.setCursor(Qt.PointingHandCursor)
             toggle.toggled.connect(lambda _on, name=key: self._field_changed("speed_" + name))
             setattr(self, f"speed_{key}_toggle", toggle)
-            section.add(_setting_row(window, fa_title, en_title, fa_hint, en_hint, toggle))
-        return section
+            performance.add(SettingsRow(window, (fa_title, en_title), (fa_hint, en_hint), toggle))
+        return tunnel, performance
 
     def _build_identity_card(self) -> QFrame:
         window = self._window
-        section = PowSection(window, "کلید و هویت", "Key & Identity", "lock",
-                             collapsible=True, expanded=True)
-        status = QFrame()
-        status.setObjectName("powSettingRow")
-        status.setAttribute(Qt.WA_StyledBackground, True)
+        section = SettingsCard(window, "هویت WARP", "WARP identity", icon="lock")
+        status = QWidget()
         status_layout = QVBoxLayout(status)
-        status_layout.setContentsMargins(10, 6, 10, 6)
-        status_layout.setSpacing(2)
-        self.identity_state = QLabel("")
-        self.identity_state.setObjectName("powRowTitle")
+        status_layout.setContentsMargins(6, 7, 6, 7)
+        status_layout.setSpacing(3)
+        self.identity_state = QLabel()
+        self.identity_state.setObjectName("settingsRowTitle")
         self.identity_state.setWordWrap(True)
-        self.identity_detail = QLabel("")
-        self.identity_detail.setObjectName("powRowDesc")
+        self.identity_detail = QLabel()
+        self.identity_detail.setObjectName("settingsRowHelp")
         self.identity_detail.setWordWrap(True)
         self.identity_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
         status_layout.addWidget(self.identity_state)
         status_layout.addWidget(self.identity_detail)
         section.add(status)
-        section.add(_setting_row(
-            window, "دریافت کلید", "Key fetch",
-            "روش درخواست کلید جدید WARP", "How a new WARP key is requested",
-            self._segmented(_KEY_FETCH_OPTIONS, "key_fetch")))
-        buttons = QHBoxLayout()
-        buttons.setContentsMargins(10, 6, 10, 2)
-        buttons.setSpacing(8)
-        self.key_button = self._compact_button("دریافت کلید", "Get Key", "zap")
+        section.add(SettingsRow(
+            window, ("دریافت کلید", "Key fetch"),
+            ("روش درخواست کلید جدید WARP.", "How a new WARP key is requested."),
+            self._compact_combo(_KEY_FETCH_OPTIONS, "key_fetch"), stacked=True,
+        ))
+        self.key_button = settings_button(window, ("دریافت کلید", "Get key"), icon="zap")
         self.key_button.clicked.connect(self._fetch_key)
-        self.cert_button = self._compact_button("گواهی تازه", "Fresh Certificate", "refresh")
+        self.cert_button = settings_button(window, ("گواهی تازه", "Renew certificate"), icon="refresh")
         self.cert_button.clicked.connect(self._renew_cert)
-        self.forget_button = self._compact_button("حذف کلید", "Forget Key", "trash")
-        self.forget_button.setProperty("danger", True)
+        self.forget_button = settings_button(window, ("حذف کلید", "Forget key"), icon="trash", destructive=True)
         self.forget_button.clicked.connect(self._forget_key)
-        buttons.addWidget(self.key_button)
-        buttons.addWidget(self.cert_button)
-        buttons.addStretch()
-        buttons.addWidget(self.forget_button)
-        holder = QWidget()
-        holder.setLayout(buttons)
-        section.add(holder)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(6, 6, 6, 2)
+        actions.addWidget(self.key_button)
+        actions.addWidget(self.cert_button)
+        actions.addStretch()
+        section.body.addLayout(actions)
+        section.body.addWidget(self.forget_button, alignment=Qt.AlignLeading)
         return section
-
-    def _compact_button(self, persian: str, english: str, icon_name: str) -> QPushButton:
-        from uac_desktop.ui import cyber_icon
-
-        window = self._window
-        button = QPushButton()
-        button.setObjectName("powCompactAction")
-        button.setIcon(cyber_icon(icon_name, "#bfefff", 15))
-        button.setIconSize(QSize(15, 15))
-        button.setCursor(Qt.PointingHandCursor)
-        window._bind_text(button, persian, english)
-        return button
 
     def _build_learned_section(self) -> QFrame:
         window = self._window
-        self.learned_count = QLabel("")
+        self.learned_count = QLabel()
         self.learned_count.setObjectName("powPickerCount")
-        section = PowSection(window, "مسیرهای آموخته", "Learned routes", "map-pin",
-                             collapsible=True, expanded=False, trailing=self.learned_count)
+        section = SettingsCard(window, "مسیرهای آموخته", "Learned routes", icon="map-pin",
+                               trailing=self.learned_count)
         intro = window._bind_text(
             QLabel(),
-            "بعد از هر اتصال موفق، روش سایفون، تأخیر و کشور نزدیک برای همان شبکه ذخیره می‌شود و دفعه بعد اول امتحان می‌شود.",
-            "After each successful connect the Psiphon method, its latency and the nearby exit are saved for that network and tried first next time.",
+            "بعد از هر اتصال موفق، روش سایفون، تأخیر و کشور نزدیک برای همان شبکه ذخیره می‌شود و دفعهٔ بعد اول امتحان می‌شود.",
+            "PoW saves the Psiphon method, latency, and nearby exit for each network and tries them first next time.",
         )
-        intro.setObjectName("powRowDesc")
+        intro.setObjectName("settingsRowHelp")
         intro.setWordWrap(True)
-        intro.setContentsMargins(10, 0, 10, 4)
-        section.add(intro)
-        self.learned_box = QVBoxLayout()
-        self.learned_box.setContentsMargins(10, 0, 10, 0)
-        self.learned_box.setSpacing(3)
+        intro.setContentsMargins(6, 6, 6, 5)
+        section.body.addWidget(intro)
         holder = QWidget()
-        holder.setLayout(self.learned_box)
-        section.add(holder)
-        actions = QHBoxLayout()
-        actions.setContentsMargins(10, 6, 10, 2)
-        actions.addStretch()
-        forget = self._compact_button("فراموش کردن مسیرها", "Forget learned routes", "trash")
-        forget.setProperty("danger", True)
+        self.learned_box = QVBoxLayout(holder)
+        self.learned_box.setContentsMargins(6, 0, 6, 5)
+        self.learned_box.setSpacing(4)
+        section.body.addWidget(holder)
+        forget = settings_button(window, ("فراموش کردن مسیرها", "Forget learned routes"),
+                                 icon="trash", destructive=True)
         forget.clicked.connect(self._forget_learned)
-        actions.addWidget(forget)
-        action_holder = QWidget()
-        action_holder.setLayout(actions)
-        section.add(action_holder)
+        section.body.addWidget(forget, alignment=Qt.AlignLeading)
         self._refresh_learned()
         return section
 
@@ -903,12 +824,13 @@ class PowController:
                 parts.append(ago)
             line = QLabel("\u2022  " + "  \u00b7  ".join(parts))
             line.setObjectName("powLearnedLine")
+            line.setWordWrap(True)
             line.setLayoutDirection(Qt.LeftToRight)
             box.addWidget(line)
 
     def _forget_learned(self) -> None:
         try:
-            self.store.forget_learned()
+            self.coordinator.forget_learned()
         except Exception as exc:
             self._window.show_toast(str(exc)[:200], "error")
             return
@@ -954,14 +876,17 @@ class PowController:
         self._set_combo(self.firewall_combo, settings.firewall_profile)
         self._set_combo(self.scan_combo, settings.scan_mode)
         self._set_combo(self.recipe_combo, settings.link_recipe)
+        self._set_combo(self.pow_exit_combo, settings.exit_mode)
+        for field, _fa, _en, _choices in _ADVANCED_CHOICES:
+            self._set_combo(getattr(self, f"{field}_combo", None), str(getattr(settings, field)))
         self._set_combo(self.obfuscation_combo, settings.obfuscation_profile)
         self._set_combo(self.key_fetch_combo, settings.key_fetch)
         for toggle, value in (
             (self.chain_toggle, settings.chain_psiphon),
             (self.optimized_toggle, settings.optimized_mode),
             (self.h2_toggle, settings.h2_fragmentation),
-            (self.proxy_toggle, self._exit_proxy_mode),
-            (self.tun_toggle, not self._exit_proxy_mode),
+            (self.proxy_toggle, self.requested_proxy_mode is True),
+            (self.tun_toggle, self.requested_proxy_mode is False),
             *(
                 (getattr(self, f"speed_{key}_toggle", None), getattr(settings, field))
                 for key, field, *_rest in _SPEED_OPTIONS
@@ -976,78 +901,64 @@ class PowController:
             if hasattr(toggle, "_set_thumb_position"):
                 toggle._set_thumb_position(1.0 if value else 0.0)
 
-    def _collect_settings(self) -> C.PowSettings:
-        """Start from the stored settings and apply only the controls that are
-        on screen. Home owns country/firewall/toggles and writes them straight
-        to the store, so the dialog never overwrites them."""
-        from dataclasses import replace
+    def _exchange_settings(self, parent: QWidget, restore: bool) -> None:
+        picker = QFileDialog.getOpenFileName if restore else QFileDialog.getSaveFileName
+        window = self._window
+        caption = window.tr("ورود تنظیمات", "Import settings") if restore else window.tr(
+            "خروجی تنظیمات", "Export settings"
+        )
+        name, _filter = picker(parent, caption, "pow-settings.json", "JSON (*.json)")
+        if not name:
+            return
+        path = Path(name)
+        try:
+            if restore:
+                document = json.loads(path.read_text(encoding="utf-8-sig"))
+                self.store.import_settings(document, exclude=window.global_settings.pow_legacy_fields)
+                self._load_settings_into_widgets()
+                self._update_settings_summary()
+                window._load_pow_home_controls()
+            else:
+                document = {key: value for key, value in self.store.export_settings().items()
+                            if key not in window.global_settings.pow_legacy_fields}
+                path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+            window.bridge.log.emit(caption)
+        except (OSError, ValueError) as exc:
+            window.bridge.log.emit(f"{caption}: {exc}")
 
-        settings = self.store.snapshot()
-
-        def _value(control, fallback: str) -> str:
-            data = control.currentData()
-            return str(data) if data else fallback
-
-        changes = {}
-        for attr, field, fallback in (
-            ("transport_combo", "outer_transport", C.OUTER_AUTO),
-            ("scan_combo", "scan_mode", C.SCAN_BALANCED),
-            ("recipe_combo", "link_recipe", C.RECIPE_AUTO),
-            ("obfuscation_combo", "obfuscation_profile", "balanced"),
-            ("key_fetch_combo", "key_fetch", C.DEFAULT_KEY_FETCH),
-            ("country_combo", "exit_country_code", ""),
-            ("firewall_combo", "firewall_profile", C.FIREWALL_AUTO),
-        ):
-            control = getattr(self, attr, None)
-            if control is not None:
-                changes[field] = _value(control, fallback)
-        for attr, field in (
-            ("chain_toggle", "chain_psiphon"),
-            ("optimized_toggle", "optimized_mode"),
-            ("h2_toggle", "h2_fragmentation"),
-            *((f"speed_{key}_toggle", field) for key, field, *_rest in _SPEED_OPTIONS),
-        ):
-            toggle = getattr(self, attr, None)
-            if toggle is not None:
-                changes[field] = bool(toggle.isChecked())
-        return replace(settings, **changes) if changes else settings
-
-    def _field_changed(self, _name: str) -> None:
+    def _field_changed(self, name: str) -> None:
         if not self._editing:
             return
+        if name == "optimized":
+            field, value = "optimized_mode", self.optimized_toggle.isChecked()
+        elif name.startswith("speed_"):
+            key = name.removeprefix("speed_")
+            field = next(field for identifier, field, *_ in _SPEED_OPTIONS if identifier == key)
+            value = getattr(self, name + "_toggle").isChecked()
+        else:
+            fields = {"transport": "outer_transport", "firewall": "firewall_profile",
+                      "recipe": "link_recipe", "pow_exit": "exit_mode", "scan": "scan_mode",
+                      "obfuscation": "obfuscation_profile"}
+            field = fields.get(name, name)
+            value = self._settings_choices[name][0].currentData()
+            if value is None:
+                return
+            if field == "tun_mtu":
+                value = int(value)
+        before = self.store.snapshot()
+        changes = {field: value}
+        if field == "h2_fragment_mode":
+            changes["h2_fragmentation"] = value == C.H2_FRAG_ON
         try:
-            before = self.store.snapshot()
-            after = self._collect_settings()
-            self.store.save(after)
-            logger = getattr(self._window, "_log_pow_setting_changes", None)
-            if logger is not None:
-                try:
-                    logger(before, after)
-                except Exception:
-                    pass
-        except Exception as exc:
-            self._window.bridge.log.emit(f"PoW settings save failed: {exc}")
-        try:
-            self._update_settings_summary()
-        except Exception:
-            pass
-
-    def _exit_mode_changed(self, proxy: bool, on: bool) -> None:
-        if not on:
-            # Keep one exit mode always selected.
-            (self.proxy_toggle if proxy else self.tun_toggle).blockSignals(True)
-            (self.proxy_toggle if proxy else self.tun_toggle).setChecked(True)
-            (self.proxy_toggle if proxy else self.tun_toggle).blockSignals(False)
+            after = self.store.save(replace(before, **changes),
+                                    exclude=self._window.global_settings.pow_legacy_fields)
+            self._window._log_pow_setting_changes(before, after)
+        except OSError as exc:
+            self._thread_log(f"PoW settings save failed: {exc}")
+            self._load_settings_into_widgets()
             return
-        self._exit_proxy_mode = proxy
-        other = self.tun_toggle if proxy else self.proxy_toggle
-        other.blockSignals(True)
-        other.setChecked(False)
-        other.blockSignals(False)
-        try:
-            self._update_settings_summary()
-        except Exception:
-            pass
+        self._update_settings_summary()
+        self._window._load_pow_home_controls()
 
     # -- identity ---------------------------------------------------------------
     def _refresh_identity(self) -> None:
@@ -1154,10 +1065,10 @@ class PowController:
 
     @property
     def busy(self) -> bool:
-        return self._connecting or self.running
+        return self._connecting or self._disconnecting or self.running or self.coordinator.protected
 
     def toggle(self) -> None:
-        if self._connecting or self.running:
+        if self.busy:
             # The button turns into Disconnect as soon as the click lands.
             # Ignore that same double-click so it cannot cancel the attempt.
             started = getattr(self, "_connect_started", 0.0)
@@ -1167,16 +1078,39 @@ class PowController:
         else:
             self.connect()
 
+    def toggle_paused(self) -> None:
+        snapshot = self.status.snapshot()
+        if (self.coordinator.session_proxy_mode is not True
+                or snapshot.phase not in (PowPhase.CONNECTED, PowPhase.PAUSED)):
+            return
+        paused = snapshot.phase == PowPhase.CONNECTED
+
+        def apply():
+            try:
+                self.coordinator.set_paused(paused, proxy_only=True)
+            except Exception as exc:
+                self._thread_log(f"PoW pause/resume failed: {exc}")
+
+        threading.Thread(target=apply, name="pow-pause", daemon=True).start()
+
     def connect(self) -> None:
         window = self._window
-        if self._connecting or self.running:
+        if self.busy:
+            return
+        proxy_mode = self.requested_proxy_mode
+        if proxy_mode is None:
+            window.show_toast(window.tr("برای اتصال، پروکسی ویندوز یا TUN را روشن کنید.",
+                                        "Turn on Windows Proxy or TUN to connect."), "warning")
             return
         self._stop_xray_first()
-        # Connect from the saved file. The settings dialog is the only writer,
-        # and only while it is open.
-        settings = self.store.snapshot()
-        proxy_mode = self._exit_proxy_mode
-        bypass = list(window.storage.settings.get("bypass_processes", []) or [])
+        try:
+            self.store.set_user_stopped(False)
+        except OSError as exc:
+            window.bridge.log.emit(f"PoW auto-connect state could not be saved: {exc}")
+        preferences = window.global_settings.snapshot()
+        settings = preferences.for_pow(self.store.snapshot())
+        self._startup_switch_target = None
+        bypass = list(window.global_settings.processes())
         self._connecting = True
         self._attempt_open = True
         self._connect_started = time.time()
@@ -1186,25 +1120,27 @@ class PowController:
         self._note_activity("progress")
         token = object()
         self._connect_token = token
+        cancel = self._connect_cancel = threading.Event()
 
         def _work() -> None:
             try:
                 message = self.coordinator.connect(
-                    settings, proxy_mode=proxy_mode, bypass_processes=bypass
+                    settings, proxy_mode=proxy_mode, bypass_processes=bypass, cancel=cancel
                 )
-                window.bridge.log.emit(message)
-                if self._exit_proxy_mode != proxy_mode:
-                    # The exit switch was flipped while connecting: apply it now.
-                    self.coordinator.switch_exit_mode(lambda: self._exit_proxy_mode)
+                self._thread_log(message)
+                if self._startup_switch_target is not None and not cancel.is_set():
+                    self.coordinator.switch_exit_mode(
+                        lambda: None if cancel.is_set() else self._startup_switch_target
+                    )
             except PowEngineError as exc:
                 self._failed_message = "" if str(exc) == "stopped" else str(exc)
                 if str(exc) != "stopped":
-                    window.bridge.log.emit(f"UAC PoW failed: {exc}")
+                    self._thread_log(f"UAC PoW failed: {exc}")
                 else:
-                    window.bridge.log.emit("UAC PoW cancelled")
+                    self._thread_log("UAC PoW cancelled")
             except Exception as exc:  # never crash the worker silently
                 self._failed_message = str(exc) or repr(exc)
-                window.bridge.log.emit(f"UAC PoW error: {exc}")
+                self._thread_log(f"UAC PoW error: {exc}")
             finally:
                 # An older attempt that unwinds late must not mark a newer
                 # connect as finished.
@@ -1216,12 +1152,24 @@ class PowController:
 
     def disconnect(self, quiet: bool = False) -> None:
         window = self._window
-        if not self._connecting and not self.running:
+        if self._disconnecting or not self.busy:
             return
+        self._disconnecting = True
+        self._connect_cancel.set()
+        self.coordinator.request_stop()
+        self._startup_switch_target = self._switch_target = self._switch_token = None
         self._attempt_open = False
         self._failed_message = ""
+        self._activity_kind = ""
+        if not quiet:
+            try:
+                self.store.set_user_stopped(True)
+            except OSError as exc:
+                window.bridge.log.emit(f"PoW stop preference could not be saved: {exc}")
         self._window._set_activity(
             "در حال قطع UAC PoW…", "Disconnecting UAC PoW…")
+        if window.engine_mode == ENGINE_POW and not quiet:
+            window._set_connection_visual("disconnecting")
 
         def _work() -> None:
             try:
@@ -1229,7 +1177,7 @@ class PowController:
             except Exception as exc:
                 window.bridge.log.emit(f"UAC PoW disconnect failed: {exc}")
             finally:
-                self._connecting = False
+                self._disconnecting = False
 
         thread = threading.Thread(target=_work, name="pow-disconnect", daemon=True)
         thread.start()
@@ -1264,6 +1212,7 @@ class PowController:
             pass
 
     def shutdown(self) -> None:
+        self._connect_cancel.set()
         try:
             self._poll.stop()
         except Exception:
@@ -1296,32 +1245,44 @@ class PowController:
 
     # -- refresh (GUI thread) ------------------------------------------------------
     # -- exit mode / HTTP/2 fragment (Home switches) ----------------------------
-    def effective_exit_proxy(self) -> bool:
+    def effective_exit_proxy(self) -> bool | None:
         """What the Home switches show: the running session's real exit, the
         requested one while a switch is applying, else the saved choice."""
+        requested = self.requested_proxy_mode
+        if self._disconnecting:
+            return requested
         if self._switch_target is not None:
-            return bool(self._switch_target)
+            return self._switch_target
         try:
             actual = self.coordinator.actual_proxy_mode
         except Exception:
             actual = None
-        return bool(self._exit_proxy_mode if actual is None else actual)
+        if actual is None and self.coordinator.paused:
+            actual = self.coordinator.session_proxy_mode
+        return requested if actual is None else actual
 
-    def set_exit_mode(self, proxy: bool) -> None:
-        """Save the exit choice; when connected, really switch the running exit."""
-        proxy = bool(proxy)
-        self._exit_proxy_mode = proxy
-        try:
-            self.store.save_exit_proxy_mode(proxy)
-        except Exception:
-            pass
+    @property
+    def requested_proxy_mode(self) -> bool | None:
+        mode = self._window.global_settings.snapshot().connection_mode
+        return None if mode == "local" else mode == "proxy"
+
+    def set_exit_mode(self, proxy: bool | None) -> None:
+        mode = {True: "proxy", False: "vpn", None: "local"}[proxy]
+        if not self._window._change_global_settings(connection_mode=mode):
+            return
         try:
             self._update_settings_summary()
         except Exception:
             pass
+        if proxy is None:
+            self.disconnect()
+            return
         window = self._window
+        if self._disconnecting or self.coordinator.paused:
+            return
         if not self.coordinator.running:
             if self._connecting:
+                self._startup_switch_target = proxy
                 window.bridge.log.emit(
                     "Exit mode saved; it is applied as soon as the current connect finishes")
             return
@@ -1333,7 +1294,9 @@ class PowController:
 
         def _work() -> None:
             try:
-                self.coordinator.switch_exit_mode(lambda: self._exit_proxy_mode)
+                self.coordinator.switch_exit_mode(
+                    lambda: self._switch_target if self._switch_token is token else None
+                )
             except Exception as exc:
                 window.bridge.log.emit(f"UAC PoW exit switch failed: {exc}")
             finally:
@@ -1370,13 +1333,60 @@ class PowController:
             setter(**changes)
         else:
             from dataclasses import replace
-            self.store.save(replace(self.store.snapshot(), **changes))
+            self.store.save(replace(self.store.snapshot(), **changes),
+                            exclude=self._window.global_settings.pow_legacy_fields)
 
     def _thread_log(self, message: str) -> None:
         try:
-            self._window.bridge.log.emit(str(message))
+            self._window.bridge.engine_log.emit(str(message), ENGINE_POW)
         except Exception:
             pass
+
+    def reset_auto_connect(self) -> None:
+        try:
+            self.store.set_user_stopped(False)
+        except OSError as exc:
+            self._thread_log(f"PoW auto-connect state could not be saved: {exc}")
+        self._auto_attempt_network = ""
+        self._auto_next = 0
+
+    def apply_global_lan_share(self) -> None:
+        if not self.running:
+            return
+
+        def apply():
+            with self._lan_update_lock:
+                preferences = self._window.global_settings.snapshot()
+                self.coordinator.apply_lan_share(preferences.for_pow(self.store.snapshot()))
+
+        threading.Thread(target=apply, name="pow-lan-settings", daemon=True).start()
+
+    def _auto_connect(self) -> None:
+        preferences = self._window.global_settings.snapshot()
+        if (
+            getattr(self._window, "engine_mode", None) != ENGINE_POW or self.busy
+            or not preferences.auto_connect or preferences.connection_mode == "local" or self.store.user_stopped()
+        ):
+            return
+        key, self._auto_network = self._auto_network, None
+        if key == "default":
+            self._auto_attempt_network = ""
+        elif key and key != self._auto_attempt_network:
+            self._auto_attempt_network = key
+            self.connect()
+            return
+        now = time.monotonic()
+        if now < self._auto_next or (self._auto_check and self._auto_check.is_alive()):
+            return
+        self._auto_next = now + 15
+
+        def check():
+            from .pow.coordinator import detect_network
+            key, _ = detect_network()
+            self._auto_network = key
+
+        self._auto_check = threading.Thread(target=check, name="pow-auto-network", daemon=True)
+        self._auto_check.start()
 
     def _refresh(self) -> None:
         window = self._window
@@ -1394,6 +1404,9 @@ class PowController:
                 pass
         try:
             self._render_snapshot(snapshot)
+            if window.engine_mode == ENGINE_POW:
+                window._sync_pause_action()
+            self._auto_connect()
         except RuntimeError:
             # Widgets already destroyed during shutdown.
             try:
@@ -1447,7 +1460,6 @@ class PowController:
                 flag.setVisible(False)
                 badge.setVisible(False)
                 badge._signature = None
-                window.ip_card.set_tight(False)
                 window.ip_label.setText("—")
                 window.ip_card.set_secondary("")
                 try:
@@ -1486,19 +1498,15 @@ class PowController:
             badge.set_sessions(sessions, fa)
             badge.setVisible(True)
             window.ip_card.set_secondary("")
-            window.ip_card.set_tight(True)
         elif note:
             badge.set_note(note, fa)
             badge.setVisible(True)
-            window.ip_card.set_tight(True)
             window.ip_card.set_secondary("")
         else:
-            window.ip_card.set_tight(False)
             badge.setVisible(False)
             badge._signature = None
             exit_kind = window.tr("خروجی سایفون", "Psiphon exit") if self.coordinator.exit_port == getattr(self.coordinator, "psiphon_socks_port", C.PSIPHON_SOCKS_PORT) else window.tr("خروجی WARP", "WARP exit")
             name = ALL_NAMES.get(code, code) if code else ""
-            secondary = window.ip_card.secondary
             if fa:
                 try:
                     from uac_desktop.verified_configs import COUNTRIES as _countries
@@ -1507,13 +1515,13 @@ class PowController:
                 except Exception:
                     name = f"\u2068{name}\u2069" if name else ""
                 text = "\u200f" + "، ".join(part for part in (name, exit_kind) if part)
-                secondary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             else:
                 text = " · ".join(part for part in (name, exit_kind) if part)
-                secondary.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             window.ip_card.set_secondary(text)
 
     def _render_snapshot(self, snapshot) -> None:
+        if self._disconnecting:
+            return
         try:
             self._sync_ip_card(snapshot)
         except RuntimeError:
@@ -1547,6 +1555,12 @@ class PowController:
             pass
         if phase == PowPhase.CONNECTED and self.coordinator.running:
             self._render_connected(snapshot)
+        elif phase == PowPhase.PAUSED:
+            if self._activity_kind != "paused":
+                self._activity_kind = "paused"
+                if window.engine_mode == ENGINE_POW:
+                    window._set_connection_visual("paused")
+                    window._set_activity("توقف موقت · ترافیک مستقیم", "Paused · traffic goes directly")
         elif phase == PowPhase.FAILED:
             self._render_failed(snapshot)
         elif self._connecting or busy_phase or phase == PowPhase.BRIDGING:
@@ -1561,18 +1575,22 @@ class PowController:
         if getattr(window, "engine_mode", "") != ENGINE_POW:
             return
         label = getattr(window, "active_profile", None)
-        detail = getattr(window, "route_detail", None)
-        if label is None or detail is None:
+        card = getattr(window, "route_card", None)
+        if label is None or card is None:
             return
+        label.setToolTip("")
         if snapshot.phase == PowPhase.CONNECTED or self.running:
             label.setText(snapshot.outer_label or "UAC PoW")
-            detail.setText(snapshot.detail or snapshot.exit_region or "")
+            card.set_secondary(snapshot.detail or snapshot.exit_region or "")
+        elif snapshot.phase == PowPhase.FAILED and self.coordinator.protected:
+            label.setText(window.tr("کلید قطع اضطراری فعال است", "Kill switch active"))
+            card.set_secondary(window.tr("برای رفع محافظت، قطع اتصال را بزنید.", "Disconnect to release protection."))
         elif snapshot.phase in (PowPhase.STARTING, PowPhase.OUTER, PowPhase.INNER, PowPhase.BRIDGING):
             label.setText(snapshot.outer_label or "UAC PoW")
-            detail.setText(snapshot.detail or window.tr("در حال برقراری مسیر", "Bringing the route up"))
+            card.set_secondary(snapshot.detail or window.tr("در حال برقراری مسیر", "Bringing the route up"))
         else:
             label.setText("—")
-            detail.setText(window.tr("مسیر PoW هنوز برقرار نشده", "PoW route is not up yet"))
+            card.set_secondary(window.tr("مسیر PoW هنوز برقرار نشده", "PoW route is not up yet"))
 
     def _render_steps(self, snapshot) -> None:
         signature = tuple((step.text, str(step.state)) for step in snapshot.steps)
@@ -1652,9 +1670,13 @@ class PowController:
         self.state_label.setText(window.tr("خطای PoW", "PoW Error"))
         self.detail_label.setText(
             snapshot.detail or self._failed_message or window.tr("اتصال ناموفق بود", "Connection failed"))
-        self.connect_button.setText(window.tr("تلاش دوباره", "Retry"))
+        held = self.coordinator.protected
+        label = window.tr("رفع محافظت", "Release protection") if held else window.tr("تلاش دوباره", "Retry")
+        self.connect_button.setText(label)
         self._paint_connect_button("error")
-        self._note_activity("failed")
+        self._note_activity("protected" if held else "failed")
+        if held and getattr(window, "engine_mode", "") == ENGINE_POW:
+            window.connect_button.setText(label)
         try:
             self.progress.setBusy(False)
         except Exception:
@@ -1711,6 +1733,12 @@ class PowController:
         elif kind == "failed":
             window._set_activity(
                 "اتصال PoW ناموفق بود.", "PoW connection failed.", "warning", False)
+            window._set_connection_visual("error")
+        elif kind == "protected":
+            window._set_activity(
+                "اتصال قطع است و کلید قطع اضطراری فعال است.",
+                "PoW is disconnected. Kill switch protection is active.", "warning", False,
+            )
             window._set_connection_visual("error")
         elif kind == "progress":
             window._set_activity("در حال اتصال UAC PoW…", "Connecting UAC PoW…")

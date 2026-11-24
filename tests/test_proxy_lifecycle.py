@@ -54,16 +54,13 @@ def proxy_registry(monkeypatch, tmp_path):
     monkeypatch.setattr(engine_module.winreg, "SetValueEx", registry.set_value)
     monkeypatch.setattr(engine_module.winreg, "DeleteValue", registry.delete_value)
     monkeypatch.setattr(WindowsProxy, "_refresh", staticmethod(lambda: None))
-    launched = []
-    monkeypatch.setattr(WindowsProxy, "_launch_watchdog",
-                        staticmethod(lambda owner: launched.append(dict(owner))))
     monkeypatch.setattr(WindowsProxy, "_other_app_instance_alive",
                         staticmethod(lambda: False))
-    return registry, state_file, launched
+    return registry, state_file
 
 
 def test_proxy_round_trip_restores_exact_values_types_and_absence(proxy_registry):
-    registry, state_file, launched = proxy_registry
+    registry, state_file = proxy_registry
     original = {
         "ProxyEnable": (0, engine_module.winreg.REG_DWORD),
 
@@ -79,8 +76,8 @@ def test_proxy_round_trip_restores_exact_values_types_and_absence(proxy_registry
     assert state["version"] == 2
     assert state["values"]["ProxyOverride"] == {"exists": False}
     assert state["values"]["ProxyServer"]["type"] == engine_module.winreg.REG_EXPAND_SZ
-    assert len(launched) == 1
-    assert launched[0]["token"] == state["owner"]["token"]
+    assert state["owner"] == WindowsProxy.process_identity(state["owner"]["token"])
+    assert state["owner"]["token"]
 
     assert proxy.disable()
     assert registry.values == original
@@ -89,7 +86,7 @@ def test_proxy_round_trip_restores_exact_values_types_and_absence(proxy_registry
 
 
 def test_proxy_round_trip_re_deletes_all_originally_absent_values(proxy_registry):
-    registry, state_file, _launched = proxy_registry
+    registry, state_file = proxy_registry
     registry.values = {}
     proxy = WindowsProxy(lambda _message: None)
 
@@ -101,7 +98,7 @@ def test_proxy_round_trip_re_deletes_all_originally_absent_values(proxy_registry
 
 
 def test_proxy_suspend_and_resume_toggle_immediately_without_losing_snapshot(proxy_registry):
-    registry, state_file, launched = proxy_registry
+    registry, state_file = proxy_registry
     original = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("original-proxy", engine_module.winreg.REG_SZ),
@@ -122,7 +119,6 @@ def test_proxy_suspend_and_resume_toggle_immediately_without_losing_snapshot(pro
     proxy.resume()
     assert registry.values["ProxyEnable"][0] == 1
     assert registry.values["ProxyServer"][0].startswith("http=127.0.0.1:")
-    assert len(launched) == 1
 
     assert proxy.disable()
     assert registry.values == original
@@ -130,7 +126,7 @@ def test_proxy_suspend_and_resume_toggle_immediately_without_losing_snapshot(pro
 
 
 def test_proxy_tun_suspend_captures_and_restores_preexisting_proxy(proxy_registry):
-    registry, state_file, launched = proxy_registry
+    registry, state_file = proxy_registry
     original = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("original-proxy", engine_module.winreg.REG_SZ),
@@ -144,7 +140,6 @@ def test_proxy_tun_suspend_captures_and_restores_preexisting_proxy(proxy_registr
     assert registry.values["ProxyEnable"][0] == 0
     assert state_file.exists()
     assert proxy.has_pending_restore
-    assert len(launched) == 1
 
     assert proxy.disable()
     assert registry.values == original
@@ -152,7 +147,7 @@ def test_proxy_tun_suspend_captures_and_restores_preexisting_proxy(proxy_registr
 
 
 def test_partial_enable_failure_rolls_back_immediately(proxy_registry):
-    registry, state_file, _launched = proxy_registry
+    registry, state_file = proxy_registry
     original = {"ProxyEnable": (0, engine_module.winreg.REG_DWORD)}
     registry.values = dict(original)
 
@@ -168,7 +163,7 @@ def test_partial_enable_failure_rolls_back_immediately(proxy_registry):
 
 
 def test_partial_restore_keeps_snapshot_and_retries(proxy_registry):
-    registry, state_file, _launched = proxy_registry
+    registry, state_file = proxy_registry
     original = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("original-proxy", engine_module.winreg.REG_SZ),
@@ -192,7 +187,7 @@ def test_partial_restore_keeps_snapshot_and_retries(proxy_registry):
 
 
 def test_corrupt_disk_state_uses_valid_in_memory_snapshot(proxy_registry):
-    registry, state_file, _launched = proxy_registry
+    registry, state_file = proxy_registry
     original = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("original-proxy", engine_module.winreg.REG_EXPAND_SZ),
@@ -209,7 +204,7 @@ def test_corrupt_disk_state_uses_valid_in_memory_snapshot(proxy_registry):
 
 
 def test_legacy_flat_snapshot_is_backward_compatible(proxy_registry):
-    registry, state_file, _launched = proxy_registry
+    registry, state_file = proxy_registry
     registry.values = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("app-proxy", engine_module.winreg.REG_SZ),
@@ -230,7 +225,7 @@ def test_legacy_flat_snapshot_is_backward_compatible(proxy_registry):
 
 
 def test_legacy_snapshot_does_not_touch_a_running_old_instance(proxy_registry, monkeypatch):
-    registry, state_file, _launched = proxy_registry
+    registry, state_file = proxy_registry
     active = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("active-old-app", engine_module.winreg.REG_SZ),
@@ -245,8 +240,8 @@ def test_legacy_snapshot_does_not_touch_a_running_old_instance(proxy_registry, m
     assert state_file.exists()
 
 
-def test_watchdog_restores_only_matching_dead_owner(proxy_registry, monkeypatch):
-    registry, state_file, _launched = proxy_registry
+def test_owner_scoped_recovery_restores_only_matching_snapshot(proxy_registry, monkeypatch):
+    registry, state_file = proxy_registry
     registry.values = {
         "ProxyEnable": (1, engine_module.winreg.REG_DWORD),
         "ProxyServer": ("app-proxy", engine_module.winreg.REG_SZ),
@@ -264,37 +259,31 @@ def test_watchdog_restores_only_matching_dead_owner(proxy_registry, monkeypatch)
     }), encoding="utf-8")
     monkeypatch.setattr(WindowsProxy, "_owner_is_alive", classmethod(lambda cls, owner: False))
 
-    assert WindowsProxy.run_watchdog(321, 1234.5, "wrong-token", poll_interval=0.02) == 0
+    assert not WindowsProxy.recover_stale(expected_pid=321, expected_create_time=1234.5,
+                                          expected_token="wrong-token")
     assert state_file.exists()
     assert registry.values["ProxyEnable"][0] == 1
 
-    assert WindowsProxy.run_watchdog(321, 1234.5, "owner-token", poll_interval=0.02) == 0
+    assert WindowsProxy.recover_stale(expected_pid=321, expected_create_time=1234.5,
+                                      expected_token="owner-token")
     assert registry.values == {"ProxyEnable": (0, engine_module.winreg.REG_DWORD)}
     assert not state_file.exists()
 
 
-def test_watchdog_retries_transient_restore_failures(proxy_registry, monkeypatch):
-    _registry, state_file, _launched = proxy_registry
+def test_startup_recovery_preserves_snapshot_of_live_owner(proxy_registry):
+    registry, state_file = proxy_registry
     state = {
         "version": 2,
-        "owner": {"pid": 321, "create_time": 1234.5, "token": "retry-token"},
+        "owner": WindowsProxy.process_identity("live-owner"),
         "values": {"ProxyEnable": {"exists": True, "value": 0,
                                     "type": engine_module.winreg.REG_DWORD}},
     }
     state_file.write_text(json.dumps(state), encoding="utf-8")
-    monkeypatch.setattr(WindowsProxy, "_owner_is_alive", classmethod(lambda cls, owner: False))
-    outcomes = [OSError("busy"), False, True]
+    registry.values["ProxyEnable"] = (1, engine_module.winreg.REG_DWORD)
 
-    def recover(_cls, *_args, **_kwargs):
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(WindowsProxy, "recover_stale", classmethod(recover))
-
-    assert WindowsProxy.run_watchdog(321, 1234.5, "retry-token", poll_interval=0.02) == 0
-    assert outcomes == []
+    assert not WindowsProxy.recover_stale()
+    assert state_file.exists()
+    assert registry.values["ProxyEnable"][0] == 1
 
 
 class _PendingProxy:

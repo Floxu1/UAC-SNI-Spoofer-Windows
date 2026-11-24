@@ -27,6 +27,7 @@ CATEGORY_TAGS: dict[str, tuple[str, str]] = {
     "LOWLAT": ("LOW-RTT", "#e8c46a"),
     "H3": ("H3", "#e8c46a"),
     "DIRECT": ("DIRECT", "#e8c46a"),
+    "DIRECT_ENGINE": ("DIRECT", "#5fd4c8"),
     "SPEED": ("SPEED", "#e8c46a"),
     "NET": ("NET", "#8fb8d8"),
     "STATE": ("STATE", "#3cf0af"),
@@ -43,6 +44,7 @@ PHASES: dict[str, tuple[str, str]] = {
     "outer": ("Outer tunnel", "تونل بیرونی"),
     "psiphon": ("Psiphon", "سایفون"),
     "speed": ("Speed features", "قابلیت‌های سرعت"),
+    "direct": ("Direct route", "مسیر Direct"),
     "connected": ("Connected", "وصل"),
     "drop": ("Drops / reconnects", "قطعی و اتصال دوباره"),
     "app": ("App", "برنامه"),
@@ -52,6 +54,7 @@ _CATEGORY_PHASE = {
     "KEY": "key", "SCAN": "scan", "MASQUE": "outer", "WG": "outer", "WOW": "outer",
     "PSIPHON": "psiphon", "PARALLEL": "speed", "LOWLAT": "speed", "H3": "speed",
     "DIRECT": "speed", "SPEED": "speed", "STATE": "connected", "DROP": "drop",
+    "DIRECT_ENGINE": "direct",
     "NET": "connected", "SET": "app", "APP": "app", "XRAY": "app",
 }
 
@@ -75,6 +78,10 @@ _CATEGORY_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^Lowest-latency"), "LOWLAT"),
     (re.compile(r"^HTTP/3 on Irancell"), "H3"),
     (re.compile(r"^Direct Psiphon"), "DIRECT"),
+    (re.compile(r"^Direct (?:recovering:|failed:)"), "DROP"),
+    (re.compile(r"^Direct (?:connected|paused|stopped)$"), "STATE"),
+    (re.compile(r"^Direct IP (?:scan|sweep|\d)|^Direct range summary:"), "SCAN"),
+    (re.compile(r"^Direct[ :]"), "DIRECT_ENGINE"),
     (re.compile(r"^Speed options"), "SPEED"),
     (re.compile(r"^(?:Key|Cert)\b|^Key fetch|^Clean IP for key|^Clean-IP scan for the key|certificate", re.I), "KEY"),
     (re.compile(r"^Scan|^Rejected |^Accepted |^Saved clean|^Clean (?:HTTP|list)|clean address|^Trying saved clean", re.I), "SCAN"),
@@ -94,6 +101,8 @@ _NOISE_RULES: list[tuple[re.Pattern, str]] = [
                 r"|^Key: racing |^Key: probing |^Key: key request will use|^Key: account key (?:won|saved) via"), "KEY"),
     (re.compile(r"^MASQUE start via |^Windows system proxy →|^Clean HTTP/\d list: "), "ECHO"),
     (re.compile(r"^Psiphon: (?!server entries imported|filtered)"), "PSIPHON"),
+    (re.compile(r"^Direct IP (?:sweep \d|\S+ \S+ (?!selected\b))"), "SCAN"),
+    (re.compile(r"^Direct Xray: .*\b(?:accepted |rejected .* > EOF)"), "ECHO"),
 ]
 
 _PULSE_TEXT = {
@@ -104,6 +113,15 @@ _PULSE_TEXT = {
 
 # Plain-language rewrites: (regex, en, fa, level, event). {n} = group n.
 _REWRITES: list[tuple[re.Pattern, str, str, str, str]] = [
+    (re.compile(r"^Direct connecting: (.+)$"), "Direct connecting: {1}", "در حال اتصال Direct: {1}", "info", "start"),
+    (re.compile(r"^Direct connected$"), "Direct connected", "Direct متصل شد", "success", "connected"),
+    (re.compile(r"^Direct paused$"), "Direct paused", "Direct در حالت مکث است", "info", ""),
+    (re.compile(r"^Direct resumed$"), "Direct resumed", "اتصال Direct از سر گرفته شد", "success", "connected"),
+    (re.compile(r"^Direct disconnecting$"), "Direct disconnecting", "در حال قطع اتصال Direct", "info", ""),
+    (re.compile(r"^Direct stopped$"), "Direct disconnected", "اتصال Direct قطع شد", "info", "stopped"),
+    (re.compile(r"^Direct recovering: (.+)$"), "Direct recovering: {1}", "بازیابی اتصال Direct: {1}", "warning", "reconnect"),
+    (re.compile(r"^Direct failed: (.+)$"), "Direct failed: {1}", "اتصال Direct ناموفق بود: {1}", "error", "failed"),
+    (re.compile(r"^Direct IP scan (\d+)$"), "Direct scanning {1} addresses", "Direct در حال اسکن {1} آدرس", "info", ""),
     (re.compile(r"^TUN verified: DNS (\d+) ms, HTTPS (\d+) ms, exit (\S+) \((\S+)\)$"), "System tunnel verified ✔ (DNS {1} ms, HTTPS {2} ms, exit {3} {4})", "تونل سیستم بررسی شد ✔ (DNS {1} ms، HTTPS {2} ms، خروجی {3} {4})", "success", ""),
     (re.compile(r"^Another VPN is active: (.+)$"), "Another VPN is active ({1}); it can block the system tunnel. Turn it off for TUN", "یک VPN دیگر روشن است ({1}) و جلوی تونل سیستم را می‌گیرد؛ برای حالت TUN خاموشش کنید", "warning", ""),
     (re.compile(r"^UAC PoW leg lost: (.+)$"), "Tunnel leg lost: {1}", "یک بخش تونل قطع شد: {1}", "warning", ""),
@@ -179,10 +197,25 @@ class Entry:
     translated: bool = False
     pulse: bool = True
     extra: dict = field(default_factory=dict)
+    engine: str = ""
 
 
 def _fill(template: str, match: re.Match) -> str:
     return re.sub(r"\{(\d)\}", lambda m: match.group(int(m.group(1))) or "", template)
+
+
+_AUTHORIZATION = re.compile(r"(\b(?:proxy-)?authorization\s*:\s*(?:Bearer|Basic)\s+)\S+", re.I)
+_CREDENTIAL = re.compile(
+    r"""(["']?\b(?:password|private[_-]?key|access[_-]?token|client[_-]?secret|x-api-key|token)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)""",
+    re.I,
+)
+_URL_CREDENTIALS = re.compile(r"(\b(?:https?|socks5h?)://)[^/\s@]+:[^/\s@]+@", re.I)
+
+
+def redact_credentials(message: str) -> str:
+    message = _AUTHORIZATION.sub(r"\1[redacted]", str(message))
+    message = _CREDENTIAL.sub(r"\1[redacted]", message)
+    return _URL_CREDENTIALS.sub(r"\1[redacted]@", message)
 
 
 def classify(message: str, stamp: str = "") -> Entry:
@@ -259,33 +292,45 @@ class LogModel:
         self.limit = limit
         self.entries: list[Entry] = []
         self.state = LogState()
+        self._states = {"": self.state}
+        self._connected_entries = {}
 
-    def add(self, message: str, stamp: str = "", now: float | None = None) -> Entry:
+    def state_for(self, engine):
+        return self._states.get(engine) or (self.state if not engine else LogState())
+
+    def add(self, message: str, stamp: str = "", now: float | None = None, *, engine: str = "") -> Entry:
         entry = classify(message, stamp)
+        entry.engine = engine
         self.entries.append(entry)
         if len(self.entries) > self.limit:
             del self.entries[: len(self.entries) - self.limit]
-        self.state.feed(entry, now)
+        if engine not in self._states:
+            self._states[engine] = LogState()
+        state = self._states[engine]
+        state.feed(entry, now)
         if entry.event == "connected":
-            self._connected_entry = entry
+            self._connected_entries[engine] = entry
             entry.extra.update(parallel=0)
         elif entry.event in ("drop", "stopped", "failed") or entry.event == "start":
-            self._connected_entry = None
-        target = getattr(self, "_connected_entry", None)
+            self._connected_entries.pop(engine, None)
+        target = self._connected_entries.get(engine)
         if target is not None:
-            if entry.cat == "NET" and self.state.exit_ip and entry.raw.startswith(("Exit IP", "Public IP")):
-                target.extra.update(exit_ip=self.state.exit_ip, country=self.state.exit_country)
-            if entry.cat == "PARALLEL" and self.state.parallel:
-                target.extra.update(parallel=self.state.parallel)
+            if entry.cat == "NET" and state.exit_ip and entry.raw.startswith(("Exit IP", "Public IP")):
+                target.extra.update(exit_ip=state.exit_ip, country=state.exit_country)
+            if entry.cat == "PARALLEL" and state.parallel:
+                target.extra.update(parallel=state.parallel)
         return entry
 
     def clear(self) -> None:
         self.entries.clear()
 
-    def rows(self, details: bool = False, query: str = "", sections: bool = True, max_rows: int = 1500) -> list[Row]:
+    def rows(self, details: bool = False, query: str = "", sections: bool = True,
+             max_rows: int = 1500, *, engine: str | None = None) -> list[Row]:
         q = query.strip().lower()
         items: list[Row] = []
         for entry in self.entries:
+            if engine is not None and entry.engine and entry.engine != engine:
+                continue
             if q and q not in entry.raw.lower() and q not in entry.en.lower() and q not in entry.fa.lower():
                 continue
             last = items[-1] if items else None
@@ -332,8 +377,9 @@ class LogModel:
             out.append(row)
         return out
 
-    def plain_text(self) -> str:
-        return "\n".join(f"[{e.stamp}] {e.raw}" for e in self.entries)
+    def plain_text(self, *, engine: str | None = None) -> str:
+        return "\n".join(f"[{e.stamp}] {e.raw}" for e in self.entries
+                         if engine is None or e.engine in ("", engine))
 
 
 # -- summary state -------------------------------------------------------------------

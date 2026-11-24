@@ -168,6 +168,8 @@ class Tuning:
     pattern_gene_ops: str = ""
     pattern_fake_sni: str = "chatgpt.com"
     pattern_fake_repeat: int = 1
+    pattern_decoy_ttl: int = 0
+    pattern_ech_fragment: str = "none"
     pattern_inject_delay_ms: int = 1
     pattern_ack_timeout_ms: int = 3000
     pattern_connect_timeout_ms: int = 2500

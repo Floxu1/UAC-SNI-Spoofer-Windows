@@ -1,7 +1,7 @@
-"""Local-proxy port editors for engine settings dialogs (not Home).
+"""Local-proxy port editors for engine settings.
 
 Engine 1 (Xray): section inside TuningDialog (Advanced Settings).
-Engine 2 (PoW): section inside PowSettingsDialog (تنظیمات PoW).
+Engine 2 (PoW): card on the PoW settings page.
 
 Reuses :mod:`uac_desktop.proxy_ports` for validation and persistence.
 """
@@ -217,8 +217,8 @@ class ProxyPortPanel(PortEditor):
 
 
 def build_pow_ports_section(window, controller) -> QFrame:
-    """PowSection for PowSettingsDialog: HTTP + Psiphon SOCKS with Defaults."""
-    from uac_desktop.pow_ui import PowSection, _setting_row
+    """HTTP and Psiphon SOCKS ports with their existing validation and reset."""
+    from .settings_ui import SettingsCard, SettingsRow
 
     editor = PortEditor(window, mode="pow")
     controller.proxy_port_editor = editor
@@ -226,43 +226,36 @@ def build_pow_ports_section(window, controller) -> QFrame:
     controller.pow_http_port_input = editor.pow_http
     controller.pow_socks_port_input = editor.pow_socks
 
-    section = PowSection(
+    section = SettingsCard(
         window,
         "پورت پروکسی محلی",
         "Local proxy ports",
-        "globe",
+        icon="globe",
         trailing=editor.reset_btn,
     )
-    section.add(_setting_row(
+    section.add(SettingsRow(
         window,
-        "پورت HTTP",
-        "HTTP port",
-        f"پیش‌فرض {P.POW_HTTP_DEFAULT} · پروکسی سیستم ویندوز",
-        f"Default {P.POW_HTTP_DEFAULT} · Windows system proxy",
+        ("پورت HTTP", "HTTP port"),
+        (f"پیش‌فرض {P.POW_HTTP_DEFAULT} برای پروکسی سیستم ویندوز.",
+         f"Default {P.POW_HTTP_DEFAULT} for Windows system proxy."),
         editor.pow_http,
+        stacked=True,
     ))
-    section.add(_setting_row(
+    section.add(SettingsRow(
         window,
-        "پورت SOCKS5 (سایفون)",
-        "SOCKS5 port (Psiphon)",
-        f"پیش‌فرض {P.POW_SOCKS_DEFAULT} · فقط سایفون",
-        f"Default {P.POW_SOCKS_DEFAULT} · Psiphon only",
+        ("پورت SOCKS5 سایفون", "Psiphon SOCKS5 port"),
+        (f"پیش‌فرض {P.POW_SOCKS_DEFAULT} برای سایفون.",
+         f"Default {P.POW_SOCKS_DEFAULT} for Psiphon."),
         editor.pow_socks,
+        stacked=True,
     ))
-    # note + error under the rows
-    foot = QFrame()
-    foot.setObjectName("powSettingRow")
-    fl = QVBoxLayout(foot)
-    fl.setContentsMargins(12, 4, 12, 8)
-    fl.setSpacing(4)
-    fl.addWidget(editor.note)
-    fl.addWidget(editor.error)
-    section.add(foot)
+    section.body.addWidget(editor.note)
+    section.body.addWidget(editor.error)
     return section
 
 
-def install_xray_ports_into_tuning(dialog, window=None) -> PortEditor:
-    """Add a ports section to TuningDialog (simple layout, always visible)."""
+def install_xray_ports_into_tuning(dialog, window=None) -> PortEditor | None:
+    """Add the ports editor when the settings dialog has an app storage owner."""
     host = window
     if host is None:
         host = dialog.parent()
@@ -272,7 +265,7 @@ def install_xray_ports_into_tuning(dialog, window=None) -> PortEditor:
     if walk is not None:
         host = walk
     if host is None or not hasattr(host, "storage"):
-        raise RuntimeError("install_xray_ports_into_tuning: MainWindow not found")
+        return None
     editor = PortEditor(host, mode="xray", parent=dialog)
     dialog.proxy_port_editor = editor
     dialog.proxy_socks_input = editor.socks

@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 import zlib
+from collections import deque
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -231,15 +232,23 @@ class StickyRouter:
         self._down: dict[int, float] = {}
         self._stop = threading.Event()
         self._server: socket.socket | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._clients: set[socket.socket] = set()
+        self._latencies = deque(maxlen=64)
+        self._forwarded_bytes = 0
         self.counts = [0] * len(self.upstreams)
 
     def start(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("127.0.0.1", self.listen_port))
-        server.listen(128)
-        server.settimeout(0.5)
+        try:
+            server.bind(("127.0.0.1", self.listen_port))
+            server.listen(128)
+            server.settimeout(0.5)
+        except OSError:
+            server.close()
+            raise
+        self.listen_port = server.getsockname()[1]
         self._server = server
         threading.Thread(target=self._accept_loop, name="pow-sticky-router", daemon=True).start()
 
@@ -252,6 +261,21 @@ class StickyRouter:
             except OSError:
                 pass
 
+        with self._lock:
+            clients = tuple(self._clients)
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            client.close()
+
+    def sample_activity(self) -> tuple[int, int, list[int]]:
+        with self._lock:
+            samples = list(self._latencies)
+            self._latencies.clear()
+            return self._forwarded_bytes, len(self._clients), samples
+
     def _accept_loop(self) -> None:
         while not self._stop.is_set():
             server = self._server
@@ -263,6 +287,11 @@ class StickyRouter:
                 continue
             except OSError:
                 return
+            with self._lock:
+                if self._stop.is_set():
+                    client.close()
+                    return
+                self._clients.add(client)
             threading.Thread(target=self._serve, args=(client,), daemon=True).start()
 
     def add_upstream(self, port: int) -> None:
@@ -271,6 +300,15 @@ class StickyRouter:
             if port not in self.upstreams:
                 self.upstreams.append(port)
                 self.counts.append(0)
+
+    def set_upstreams(self, ports: list[int]) -> None:
+        """Change the destination for new streams. Open streams keep their sockets."""
+        if not ports:
+            raise ValueError("at least one SOCKS upstream is required")
+        with self._lock:
+            self.upstreams = list(ports)
+            self.counts = [0] * len(ports)
+            self._down.clear()
 
     def order_for(self, host: str) -> list[int]:
         with self._lock:
@@ -291,9 +329,12 @@ class StickyRouter:
             client.sendall(b"\x05\x00")
             request, host = _read_request(client)
             reply = b""
-            for index in self.order_for(host):
+            with self._lock:
+                upstreams = [(index, self.upstreams[index]) for index in self.order_for(host)]
+            for index, port in upstreams:
+                started = time.monotonic()
                 try:
-                    upstream = socket.create_connection(("127.0.0.1", self.upstreams[index]), timeout=10)
+                    upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
                     upstream.sendall(b"\x05\x01\x00")
                     if _recv_exact(upstream, 2) != b"\x05\x00":
                         raise OSError("upstream refused auth")
@@ -302,12 +343,14 @@ class StickyRouter:
                     if reply[1] != 0x00:
                         raise OSError(f"upstream connect failed ({reply[1]})")
                     with self._lock:
-                        self.counts[index] += 1
-                        self._down.pop(index, None)
+                        if index < len(self.upstreams) and self.upstreams[index] == port:
+                            self.counts[index] += 1
+                            self._down.pop(index, None)
                     break
                 except OSError:
                     with self._lock:
-                        self._down[index] = time.monotonic() + _DOWN_FOR_S
+                        if index < len(self.upstreams) and self.upstreams[index] == port:
+                            self._down[index] = time.monotonic() + _DOWN_FOR_S
                     if upstream is not None:
                         try:
                             upstream.close()
@@ -323,10 +366,12 @@ class StickyRouter:
             from .forwarder import make_long_lived
 
             make_long_lived(client, upstream)
-            self._pipe(client, upstream)
+            self._pipe(client, upstream, index, port, started)
         except Exception:
             pass
         finally:
+            with self._lock:
+                self._clients.discard(client)
             for sock in (client, upstream):
                 if sock is not None:
                     try:
@@ -334,14 +379,21 @@ class StickyRouter:
                     except OSError:
                         pass
 
-    def _pipe(self, a: socket.socket, b: socket.socket) -> None:
-        def _copy(src: socket.socket, dst: socket.socket) -> None:
+    def _pipe(self, a: socket.socket, b: socket.socket, index: int, port: int, started: float) -> None:
+        def _copy(src: socket.socket, dst: socket.socket, sample_first_byte: bool = False) -> None:
             try:
                 while not self._stop.is_set():
                     chunk = src.recv(_BUFFER)
                     if not chunk:
                         break
+                    if sample_first_byte:
+                        with self._lock:
+                            if index < len(self.upstreams) and self.upstreams[index] == port:
+                                self._latencies.append(max(1, int((time.monotonic() - started) * 1000)))
+                        sample_first_byte = False
                     dst.sendall(chunk)
+                    with self._lock:
+                        self._forwarded_bytes += len(chunk)
             except OSError:
                 pass
             finally:
@@ -350,7 +402,7 @@ class StickyRouter:
                 except OSError:
                     pass
 
-        other = threading.Thread(target=_copy, args=(b, a), daemon=True)
+        other = threading.Thread(target=_copy, args=(b, a, True), daemon=True)
         other.start()
         _copy(a, b)
         other.join()
@@ -440,3 +492,40 @@ def cf_trace(socks_port: int, timeout: float = 8.0) -> dict[str, str]:
             raw.close()
         except OSError:
             pass
+
+
+def startup_download_rate(port: int, deadline: float, stop: threading.Event) -> int:
+    """Measure tunneled bytes after warm-up, within the startup trial budget."""
+    import requests
+
+    maximum, warmup = 2 * 1024 * 1024, 128 * 1024
+    deadline = min(deadline, time.monotonic() + 7)
+    if stop.is_set() or deadline <= time.monotonic():
+        return 0
+    received = 0
+    measured_at = None
+    endpoint = f"socks5h://127.0.0.1:{port}"
+    url = f"https://speed.cloudflare.com/__down?bytes={maximum}&uac={time.monotonic_ns()}"
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            with session.get(
+                url, proxies={"https": endpoint}, stream=True, timeout=(2, 2),
+                allow_redirects=False, headers={"Accept-Encoding": "identity"},
+            ) as response:
+                if response.status_code != 200:
+                    return 0
+                for block in response.iter_content(16 * 1024):
+                    if stop.is_set():
+                        return 0
+                    received += len(block)
+                    now = time.monotonic()
+                    if measured_at is None and received >= warmup:
+                        measured_at = now
+                    if now >= deadline or received >= maximum or (measured_at and now - measured_at >= 2):
+                        break
+    except requests.exceptions.RequestException:
+        return 0
+    if measured_at is None or received <= warmup:
+        return 0
+    return int((received - warmup) * 8 / max(time.monotonic() - measured_at, 0.001))

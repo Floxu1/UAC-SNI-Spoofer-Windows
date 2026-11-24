@@ -168,12 +168,13 @@ class LogsPageMixin:
 
     # -- data in -----------------------------------------------------------------------
 
-    def _append_log(self, message):
+    def _append_log(self, message, engine=""):
+        message = logfmt.redact_credentials(message)
         stamp = datetime.datetime.now().strftime("%H:%M:%S"); line = f"[{stamp}] {message}"
         self._all_log_lines.append(line); self._all_log_lines = self._all_log_lines[-5000:]
         model = getattr(self, "log_model", None)
         if model is not None:
-            model.add(str(message), stamp)
+            model.add(message, stamp, engine=engine)
             if not self.log_pause.isChecked():
                 self._schedule_log_render()
         self._set_log_count(len(self._all_log_lines))
@@ -187,7 +188,7 @@ class LogsPageMixin:
 
     def _append_log_line(self, line):
         """Compatibility: route a preformatted '[HH:MM:SS] msg' line through the model."""
-        self.log_model.add(line)
+        self.log_model.add(logfmt.redact_credentials(line))
         self._schedule_log_render()
 
     # -- render ------------------------------------------------------------------------
@@ -199,7 +200,8 @@ class LogsPageMixin:
         if not hasattr(self, "logs") or not hasattr(self, "log_model") or self.log_pause.isChecked():
             return
         details = self.log_details.isChecked()
-        rows = self.log_model.rows(details=details, query=self.log_filter.text(), max_rows=900)
+        rows = self.log_model.rows(details=details, query=self.log_filter.text(), max_rows=900,
+                                   engine=self.engine_mode)
         fa = self._log_language() == "fa"
         self.logs.setLayoutDirection(Qt.RightToLeft if fa else Qt.LeftToRight)
         html = logfmt.render_html(rows, "fa" if fa else "en", details, flag_path=flag_path)
@@ -252,7 +254,7 @@ class LogsPageMixin:
         self.log_summary.setVisible(pow_on)
         if not pow_on:
             return
-        state = model.state
+        state = model.state_for("pow")
         fa = self._log_language() == "fa"
         fa_text, en_text, color = _STATE_TEXT.get(state.status, _STATE_TEXT["idle"])
         label, _icon = values["state"]
@@ -296,7 +298,8 @@ class LogsPageMixin:
 
     def _visible_log_text(self):
         details = self.log_details.isChecked()
-        rows = self.log_model.rows(details=details, query=self.log_filter.text(), max_rows=100000)
+        rows = self.log_model.rows(details=details, query=self.log_filter.text(), max_rows=100000,
+                                   engine=self.engine_mode)
         return logfmt.render_text(rows, self._log_language(), details)
 
     def _copy_logs(self):
@@ -311,8 +314,10 @@ class LogsPageMixin:
         self._write_log_export(Path(path))
 
     def _write_log_export(self, path: Path):
-        readable = logfmt.render_text(self.log_model.rows(details=False, max_rows=100000), "en", False)
-        raw = self.log_model.plain_text()
+        readable = logfmt.render_text(
+            self.log_model.rows(details=False, max_rows=100000, engine=self.engine_mode), "en", False
+        )
+        raw = self.log_model.plain_text(engine=self.engine_mode)
         try:
             path.write_text(
                 "UAC Spoofer Live Logs — readable view\n\n" + readable + "\n\n---- raw lines ----\n" + raw + "\n",
@@ -340,4 +345,4 @@ class LogsPageMixin:
         controller = getattr(self, "pow_controller", None)
         connected = bool(controller is not None and controller.busy)
         for line in logfmt.setting_changes(old, new, connected):
-            self.bridge.log.emit(line)
+            self.bridge.engine_log.emit(line, "pow")

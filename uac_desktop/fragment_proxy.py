@@ -151,7 +151,22 @@ class FragmentProxy:
         profile = self._profile
         carrier = self._tuning.carrier_mode
         if carrier == "mci":
-            return [("mci", ["104.18.8.83", "104.18.9.83"])]
+            hosts: list[str] = []
+            for candidate in (
+                getattr(profile, "address", "") or "",
+                getattr(profile, "fallback_address", "") or "",
+            ):
+                c = str(candidate).strip()
+                if c and c not in hosts and c not in {"127.0.0.1", "0.0.0.0", "localhost"}:
+                    hosts.append(c)
+            extra = getattr(self._tuning, "pattern_fallback_ips", "") or ""
+            for part in str(extra).replace(";", ",").split(","):
+                c = part.strip()
+                if c and c not in hosts and c not in {"127.0.0.1", "0.0.0.0", "localhost"}:
+                    hosts.append(c)
+            if not hosts:
+                hosts = ["104.18.8.83", "104.18.9.83"]
+            return [("mci", hosts[:8])]
         if carrier == "irancell":
 
 
@@ -167,7 +182,12 @@ class FragmentProxy:
                       "multi64": 0, "sni_boundary": 0,
                       "sni_split": max(1, t.sni_split_delay_ms),
                       "tls_record_frag": max(1, t.tls_record_delay_ms),
-                      "half": max(1, t.half_delay_ms)}
+                      "half": max(1, t.half_delay_ms),
+                      # MCI scanner winners (only selected from mci strategy list)
+                      "coal_2x_zero_v0304": 0, "coal_zero_v0304": 0, "coal_zero_v0303": 0,
+                      "coal_zero_v0302": 0, "coal_5x_zero_v0302": 0,
+                      "coal_2x_zero_then_split": 1,
+                      "oob_sni_tag": 0, "oob_rec_hdr_b3": 0}
             names = [self._forced_strategy]
 
 
@@ -180,8 +200,14 @@ class FragmentProxy:
         if carrier == "mci":
             sni_delay = max(t.sni_split_delay_ms, 3)
             record_delay = max(t.tls_record_delay_ms, 3)
-            base = [("full20", 1), ("full10", 2), ("full5", 5), ("full5", 15),
+            # Existing MCI strategies first (preserve current behavior), then
+            # scanner-backed zero-record / OOB fallbacks. Irancell list untouched.
+            # Coal/OOB first on MCI: scanner + live SH winners; classic frags as fallback.
+            base = [("coal_2x_zero_v0304", 0), ("coal_zero_v0303", 0), ("coal_zero_v0304", 0),
+                    ("coal_5x_zero_v0302", 0), ("coal_2x_zero_then_split", 1),
+                    ("oob_sni_tag", 0), ("oob_rec_hdr_b3", 0),
                     ("sni_boundary", max(1, sni_delay // 2)),
+                    ("full20", 1), ("full10", 2), ("full5", 5), ("full5", 15),
                     ("sni_split", sni_delay), ("tls_record_frag", record_delay),
                     ("tls_sni_records", record_delay), ("half", max(t.half_delay_ms, 3)), ("raw", 0)]
         elif carrier == "irancell":
@@ -236,10 +262,31 @@ class FragmentProxy:
                 gene_ops = None
         pieces = fragments(first, strategy, self._tuning.multi_fragment_size, ops=gene_ops)
         self._detail(f"FRAGMENT {strategy} {len(pieces)} pieces: " + ", ".join(f"{len(x)} B" for x in pieces[:12]))
-        for index, piece in enumerate(pieces):
-            remote.sendall(piece)
-            if index + 1 < len(pieces) and delay_ms:
-                time.sleep(delay_ms / 1000)
+        if strategy.startswith("oob_") and carrier == "mci":
+            # MSG_OOB ghost byte; server TLS stack ignores urgent data, some DPI does not.
+            payload = b"".join(pieces) if pieces else first
+            from .tls_tools import locate_sni
+            loc = locate_sni(first)
+            if strategy == "oob_rec_hdr_b3" and len(payload) > 3:
+                off, ghost = 3, 0x00
+            elif loc:
+                # near SNI extension tag
+                off = max(1, min(len(payload) - 1, loc[0] - 8))
+                ghost = 0xFF
+            else:
+                off, ghost = max(1, len(payload) // 3), 0xFF
+            head = payload[:off] + bytes([ghost & 0xFF])
+            try:
+                remote.send(head, socket.MSG_OOB)
+            except OSError:
+                remote.sendall(head)
+            if off < len(payload):
+                remote.sendall(payload[off:])
+        else:
+            for index, piece in enumerate(pieces):
+                remote.sendall(piece)
+                if index + 1 < len(pieces) and delay_ms:
+                    time.sleep(delay_ms / 1000)
         response = remote.recv(16384)
         if race_stop and race_stop.is_set():
             remote.close()

@@ -228,9 +228,6 @@ class ClickableCard(QObject):
         self.card = card; self.callback = callback
         card.setCursor(Qt.PointingHandCursor)
         card.setAttribute(Qt.WA_Hover, True)
-        extra = ('QFrame#metricCard[ipHot="true"] { border: 1px solid rgba(35,245,224,0.55);'
-                 ' background-color: rgba(35,245,224,0.055); }')
-        card.setStyleSheet((card.styleSheet() or "") + extra)
         card.installEventFilter(self)
 
     def _hot(self, on):

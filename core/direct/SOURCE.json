@@ -1,0 +1,13 @@
+{
+  "android_head": "d6540548d8d4673debc7ba47fca691aa541a28f6",
+  "origin": "Android working tree",
+  "files": {
+    "core/direct/Cargo.toml": "79567180afd4024477161610a8754dec1e5b50d919a1535709f0bad5d022b5ac",
+    "core/direct/Cargo.lock": "59aa92fd1d5e34b3a80dd66e0982eb494beafe114154a9fa5a08f0579c1bbd85",
+    "core/direct/README.md": "04b7ae84fb24df3d3cffad7cf0352dedeeac602d407409e5755c498d7529c1f5",
+    "core/direct/LICENSE": "8486a10c4393cee1c25392769ddd3b2d6c242d6ec7928e1414efff7dfb2f07ef",
+    "core/direct/src/lib.rs": "ae9f26b258e32b77eaaa45a7f42f2f4f00c0c9bf6d5b112f1d264f3d7d737d60",
+    "core/direct/src/route.rs": "8bd88d1c9041a0adf5deed46151d7267230b8343c05cae2325177621a219f505",
+    "core/direct/android/jni.cpp": "2d1847b0f2a26aea14e21858fa5129a3f7b38bb11411b1ff7c4da6a4ac98f01c"
+  }
+}

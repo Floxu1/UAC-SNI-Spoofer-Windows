@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtGui import QFont, QFontDatabase
+from PySide6.QtGui import QColor, QFont, QFontDatabase
 
 from .paths import ASSETS
 
@@ -24,6 +24,7 @@ FONT_FILES = (
     "Inter-Regular.ttf", "Inter-Medium.ttf", "Inter-SemiBold.ttf", "Inter-Bold.ttf",
     "vazirmatn_ui_fd_regular.ttf", "vazirmatn_ui_fd_medium.ttf",
     "vazirmatn_ui_fd_semibold.ttf", "vazirmatn_ui_fd_bold.ttf",
+    "vazirmatn_ui_fd_extrabold.ttf",
     "JetBrainsMono-Regular.ttf", "JetBrainsMono-Medium.ttf",
     # Legacy family kept registered for any code that still asks for it.
     "Vazirmatn-Regular.ttf", "Vazirmatn-Bold.ttf",
@@ -34,7 +35,34 @@ UI_STACK_EN = f'"{LATIN}", "{PERSIAN}", "Segoe UI"'
 UI_STACK_FA = f'"{PERSIAN}", "{LATIN}", "Segoe UI"'
 MONO_STACK = f'"{MONO}", "{PERSIAN}", "Consolas"'
 
+DASHBOARD_WEIGHT = QFont.Weight.DemiBold
+DASHBOARD_LABEL_QSS = f"font-size: 12px; font-weight: {DASHBOARD_WEIGHT.value};"
+DASHBOARD_HEADING_QSS = f"font-size: 13px; font-weight: {DASHBOARD_WEIGHT.value};"
+
+
+def dashboard_text_color(color):
+    red, green, blue, alpha = QColor(color).getRgbF()
+    lifted = tuple(channel + (1 - channel) * .12 for channel in (red, green, blue))
+    return QColor.fromRgbF(*lifted, alpha)
+
+
 _LOADED: dict[str, list[str]] = {}
+
+_PERSIAN_LETTER = re.compile(r"[ء-غف-يپچژکگۀهی]")
+_ASCII_WORD = r"[A-Za-z0-9]+(?:[-_./:+@&?=%#][A-Za-z0-9]+)*"
+_LTR_RUN = re.compile(rf"[\u2066-\u2068][^\u2069]*\u2069|{_ASCII_WORD}(?:(?:[ \t]+|[ \t]+/[ \t]+){_ASCII_WORD})*")
+_HTML_TAG = re.compile(r"</?[A-Za-z][^>]*>")
+
+
+def persian_ui_text(text: str) -> str:
+    """Give mixed Persian labels an RTL base and keep their Latin terms intact."""
+    if not _PERSIAN_LETTER.search(text) or _HTML_TAG.search(text) or not re.search(r"[A-Za-z]", text):
+        return text
+    text = text.removeprefix("\u200f")
+    return "\u200f" + _LTR_RUN.sub(
+        lambda match: match[0] if match[0].endswith("\u2069") else f"\u2066{match[0]}\u2069",
+        text,
+    )
 
 
 def font_dir():

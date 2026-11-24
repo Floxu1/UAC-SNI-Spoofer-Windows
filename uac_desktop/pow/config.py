@@ -60,6 +60,16 @@ RECIPE_WOW_V6 = "wow-v6"
 RECIPE_WOW_ANY = "wow-any"
 RECIPE_MASQUE_H2 = "masque-h2"
 RECIPE_MASQUE_H3 = "masque-h3"
+RECIPE_MASQUE_H3_EXPERIMENTAL = "masque-h3-experimental"
+RECIPE_MASQUE_H3_OVER_H2 = "masque-h3-over-h2"
+EXPERIMENTAL_H3_RECIPES = (RECIPE_MASQUE_H3_EXPERIMENTAL, RECIPE_MASQUE_H3_OVER_H2)
+EXIT_CHAIN, EXIT_WARP, EXIT_PSIPHON = "chain", "warp", "psiphon"
+EXIT_MODES = (EXIT_CHAIN, EXIT_WARP, EXIT_PSIPHON)
+H2_FINGERPRINTS = ("default", "chrome", "firefox", "safari", "android", "random")
+MASQUE_IP_VERSIONS = ("auto", "v4", "v6", "both")
+H2_OBFUSCATIONS = ("unchanged", "light", "off")
+TUN_BACKENDS = ("stable", "gvisor")
+
 RECIPE_MASQUE_H2_SPLIT = "masque-h2-split"
 RECIPE_MASQUE_H2_SAVED = "masque-h2-saved"
 RECIPES = (
@@ -70,6 +80,7 @@ RECIPES = (
     RECIPE_WOW_ANY,
     RECIPE_MASQUE_H2,
     RECIPE_MASQUE_H3,
+    *EXPERIMENTAL_H3_RECIPES,
     RECIPE_MASQUE_H2_SPLIT,
     RECIPE_MASQUE_H2_SAVED,
 )
@@ -303,6 +314,7 @@ class PowSettings:
     firewall_profile: str = FIREWALL_AUTO
     link_recipe: str = RECIPE_AUTO
     chain_psiphon: bool = True
+    exit_mode: str = ""
     key_fetch: str = DEFAULT_KEY_FETCH
     # Speed options (Settings > Speed). All off = the connect is unchanged.
     parallel_masque: bool = False
@@ -315,6 +327,24 @@ class PowSettings:
     h2_socket_tuning: bool = True
     h2_speed_pick: bool = True
     h2_fragment_mode: str = "auto"
+    h2_fingerprint: str = "default"
+    masque_ip_version: str = "auto"
+    h2_obfuscation: str = "unchanged"
+    tun_mtu: int = 1400
+    tun_backend: str = "stable"
+    startup_speed_test: bool = False
+    psiphon_tunnel_pool: bool = False
+    routing_mode: str = "bypass"
+    iran_direct: bool = True
+    dns_sinkhole: bool = True
+    webrtc_block: bool = True
+    quic_block: bool = False
+    ipv6_block: bool = True
+    kill_switch: bool = False
+    auto_connect: bool = False
+    lan_share: bool = False
+    lan_share_mode: str = "socks5"
+    lan_share_port: int = 18080
 
     def validated(self) -> "PowSettings":
         from .regions import normalize_region
@@ -325,6 +355,7 @@ class PowSettings:
         firewall = (self.firewall_profile or "").strip().lower()
         recipe = (self.link_recipe or "").strip().lower()
         fetch = (self.key_fetch or "").strip().lower()
+        exit_mode = _choice(self.exit_mode, EXIT_MODES, EXIT_CHAIN if self.chain_psiphon else EXIT_WARP)
         return PowSettings(
             exit_country_code=country,
             outer_transport=transport if (transport == OUTER_AUTO or transport in OUTER_LADDER) else OUTER_AUTO,
@@ -334,7 +365,8 @@ class PowSettings:
             optimized_mode=bool(self.optimized_mode),
             firewall_profile=firewall if firewall in FIREWALLS else FIREWALL_AUTO,
             link_recipe=recipe if recipe in RECIPES else RECIPE_AUTO,
-            chain_psiphon=bool(self.chain_psiphon),
+            chain_psiphon=exit_mode != EXIT_WARP,
+            exit_mode=exit_mode,
             key_fetch=fetch if fetch in KEY_FETCHES else DEFAULT_KEY_FETCH,  # doh -> auto
             parallel_masque=bool(self.parallel_masque),
             irancell_h3=bool(self.irancell_h3),
@@ -345,7 +377,30 @@ class PowSettings:
             h2_socket_tuning=bool(self.h2_socket_tuning),
             h2_speed_pick=bool(self.h2_speed_pick),
             h2_fragment_mode=normalize_h2_fragment_mode(self.h2_fragment_mode),
+            h2_fingerprint=_choice(self.h2_fingerprint, H2_FINGERPRINTS, "default"),
+            masque_ip_version=_choice(self.masque_ip_version, MASQUE_IP_VERSIONS, "auto"),
+            h2_obfuscation=_choice(self.h2_obfuscation, H2_OBFUSCATIONS, "unchanged"),
+            tun_mtu=self.tun_mtu if type(self.tun_mtu) is int and 1000 <= self.tun_mtu <= 1500 else 1400,
+            tun_backend=_choice(self.tun_backend, TUN_BACKENDS, "stable"),
+            startup_speed_test=bool(self.startup_speed_test),
+            psiphon_tunnel_pool=bool(self.psiphon_tunnel_pool),
+            routing_mode=_choice(self.routing_mode, ("all", "bypass", "only"), "bypass"),
+            iran_direct=bool(self.iran_direct),
+            dns_sinkhole=bool(self.dns_sinkhole),
+            webrtc_block=bool(self.webrtc_block),
+            quic_block=bool(self.quic_block),
+            ipv6_block=bool(self.ipv6_block),
+            kill_switch=bool(self.kill_switch),
+            auto_connect=bool(self.auto_connect),
+            lan_share=bool(self.lan_share),
+            lan_share_mode=_choice(self.lan_share_mode, ("socks5", "ps5"), "socks5"),
+            lan_share_port=self.lan_share_port if type(self.lan_share_port) is int and 1 <= self.lan_share_port <= 65535 else 18080,
         )
+
+
+def _choice(value: str, choices: tuple[str, ...], default: str) -> str:
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    return normalized if normalized in choices else default
 
 
 DEFAULT_SETTINGS = PowSettings()
@@ -416,6 +471,10 @@ def outer_plan(settings: PowSettings, mci: bool) -> OuterPlan:
         return OuterPlan(["masque"], "both", "h2", False, True, "MASQUE HTTP/2")
     if recipe == RECIPE_MASQUE_H3:
         return OuterPlan(["masque"], "v4", "h3", False, True, "MASQUE HTTP/3")
+    if recipe == RECIPE_MASQUE_H3_EXPERIMENTAL:
+        return OuterPlan(["masque"], "v4", "h3-experimental", False, True, "MASQUE HTTP/3 experimental")
+    if recipe == RECIPE_MASQUE_H3_OVER_H2:
+        return OuterPlan(["masque"], "v4", "h3-over-h2", False, True, "MASQUE HTTP/3 over HTTP/2")
     if recipe == RECIPE_MASQUE_H2_SPLIT:
         return OuterPlan(["masque"], "v4", "h2", True, True, "MASQUE HTTP/2 split hello")
     if recipe == RECIPE_MASQUE_H2_SAVED:
@@ -440,7 +499,8 @@ def candidates(settings: PowSettings, mci: bool = False) -> list[str]:
 def key_protocols(recipe: str) -> list[str]:
     if recipe in (RECIPE_WOW_V6, RECIPE_WOW_ANY):
         return ["wireguard", "gool"]
-    if recipe in (RECIPE_MASQUE_H2, RECIPE_MASQUE_H3, RECIPE_MASQUE_H2_SPLIT, RECIPE_MASQUE_H2_SAVED):
+    if recipe in (RECIPE_MASQUE_H2, RECIPE_MASQUE_H3, RECIPE_MASQUE_H2_SPLIT,
+                  RECIPE_MASQUE_H2_SAVED, *EXPERIMENTAL_H3_RECIPES):
         return ["masque"]
     if recipe in (RECIPE_WARP_V6, RECIPE_WARP_ANY):
         return ["wireguard"]
@@ -621,6 +681,8 @@ def chain_outer_json(
     settings = settings.validated()
     plan = outer_plan(settings, mci)
     transport = (masque_transport or plan.masque_transport) if protocol == "masque" else "h3"
+    strict_ip = protocol == "masque" and settings.masque_ip_version != "auto"
+    h2_obfuscation = protocol == "masque" and transport == "h2" and settings.h2_obfuscation != "unchanged"
     if adaptive is None:
         adaptive = adaptive_on(data_dir)
     payload = {
@@ -628,11 +690,12 @@ def chain_outer_json(
         "protocol": protocol,
         "listen": f"127.0.0.1:{CHAIN_SOCKS_PORT}",
         "scan_mode": normalize_scan_mode(scan_mode),
-        "ip_scan": plan.ip_for(protocol),
+        "ip_scan": settings.masque_ip_version if strict_ip else plan.ip_for(protocol),
+        "ip_scan_strict": strict_ip,
         "endpoint_cache_path": str(masque_cache_path(data_dir)),
         "endpoint_discovery": "clean" if settings.link_recipe == RECIPE_MASQUE_H2_SAVED else discovery,
         "masque_transport": transport,
-        "obfuscation_profile": settings.obfuscation_profile,
+        "obfuscation_profile": settings.h2_obfuscation if h2_obfuscation else settings.obfuscation_profile,
         "retry_obfuscation_profiles": True,
         "tls_curve_preset": "chrome",
         "wireguard_data_check": True,
@@ -643,6 +706,7 @@ def chain_outer_json(
         "h2_large_windows": settings.h2_large_windows,
         "h2_socket_tuning": settings.h2_socket_tuning,
         "h2_speed_pick": settings.h2_speed_pick,
+        "h2_fingerprint": settings.h2_fingerprint,
         "api_camo": settings.key_fetch,
         "api_relay": ",".join(relay_urls(data_dir)),
         "gateway": False,
@@ -682,6 +746,7 @@ def psiphon_config(
     server_entries_path: str = "",
     region_bias: bool = False,
     upstream_port: int = CHAIN_SOCKS_PORT,
+    iran_direct: bool = True,
 ) -> str:
     from .regions import egress_region as _egress_region
 
@@ -717,10 +782,13 @@ def psiphon_config(
         config["LimitTunnelProtocols"] = list(FRONTED)
         config["ConnectionWorkerPoolSize"] = 12
         config["NetworkLatencyMultiplier"] = 1.5
+        config["MeekTransformedHostName"] = "cdnjs.cloudflare.com"
+        config["MeekSNIServerName"] = "cdnjs.cloudflare.com"
     else:
+        config["LimitTunnelProtocols"] = list(FAST_DIRECT)
         config["InitialLimitTunnelProtocols"] = list(FAST_DIRECT)
         config["InitialLimitTunnelProtocolsCandidateCount"] = 16
-        config["ConnectionWorkerPoolSize"] = 16
+        config["ConnectionWorkerPoolSize"] = 6
         config["NetworkLatencyMultiplier"] = 1.0
     config["EstablishTunnelTimeoutSeconds"] = strategy.timeout_seconds
     if preferred_region:
@@ -733,9 +801,6 @@ def psiphon_config(
                 config["EstablishTunnelTimeoutSeconds"] = NEARBY_PHASE_TIMEOUT_SECONDS
             else:
                 config["EstablishTunnelTimeoutSeconds"] = REGION_PHASE_TIMEOUT_SECONDS
-                config.pop("InitialLimitTunnelProtocols", None)
-                config.pop("InitialLimitTunnelProtocolsCandidateCount", None)
-                config.pop("LimitTunnelProtocols", None)
     if direct:
         meek_only = all(p.startswith("FRONTED-") for p in strategy.preferred_protocols)
         if meek_only:
@@ -748,12 +813,12 @@ def psiphon_config(
         config["EstablishTunnelTimeoutSeconds"] = 90 if meek_only else 35
         config["ConnectionWorkerPoolSize"] = 8 if meek_only else 6
         config["DNSResolverPreferAlternateServerProbability"] = 0
+        if iran_direct:
+            config["SplitTunnelRegions"] = ["IR"]
         config.pop("DNSResolverPreferredAlternateServers", None)
         if meek_only:
             config["MeekTransformedHostName"] = "cdnjs.cloudflare.com"
             config["MeekSNIServerName"] = "cdnjs.cloudflare.com"
-    else:
-        config["LimitTunnelProtocols"] = list(CHAINABLE)
     preference = config.get("InitialLimitTunnelProtocols")
     if preference is not None:
         chainable = [p for p in preference if p in CHAINABLE]

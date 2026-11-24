@@ -8,8 +8,6 @@ import ipaddress
 import math
 import re
 import socket
-import ssl
-import subprocess
 import sys
 import threading
 import time
@@ -20,11 +18,11 @@ from dataclasses import replace
 import psutil
 import requests
 from PySide6.QtCore import (
-    QObject, Qt, QTimer, Signal, QSize, QRect, QRectF, QPointF, QPoint, QPropertyAnimation,
-    QEasingCurve, Property, QParallelAnimationGroup,
+    QEvent, QObject, Qt, QTimer, Signal, QSize, QRect, QRectF, QPointF, QPoint, QPropertyAnimation,
+    QEasingCurve, Property, QParallelAnimationGroup, QSignalBlocker, QVariantAnimation,
 )
 from PySide6.QtGui import (
-    QColor, QFont, QIcon, QPainter, QPen, QLinearGradient, QIntValidator,
+    QColor, QFont, QIcon, QImage, QPainter, QPen, QLinearGradient, QIntValidator,
     QRadialGradient, QPainterPath, QPixmap, QFontMetrics,
     QTextCursor, QTextCharFormat, QAction,
 )
@@ -35,8 +33,8 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QStackedWidget, QTableView,
     QTableWidget, QTableWidgetItem,
     QTabBar, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QGraphicsDropShadowEffect,
-    QGraphicsOpacityEffect, QBoxLayout, QStyle, QStyleOptionButton, QToolButton,
-    QSystemTrayIcon, QMenu,
+    QGraphicsOpacityEffect, QBoxLayout, QStyle, QStyleOptionButton, QStyleOptionComboBox, QToolButton,
+    QSystemTrayIcon, QMenu, QToolTip, QScrollBar,
 )
 
 from . import __version__
@@ -70,6 +68,7 @@ from .models import (
 from .network import (GeoLocation, ScanResult, current_ip, current_location,
                       profile_ping, profile_real_delay, scan_domains, tcp_ping)
 from .paths import ASSETS, DATA_DIR, LOG_FILE
+from .network_metrics import SharedNetworkMetrics
 from .sni_batch import LiveConfigResult, SniBatchTester
 from .models import is_direct_route as _is_direct_route, route_label as _route_label, is_ech_route as _is_ech_route
 from .sni_maker import (
@@ -80,7 +79,17 @@ from .sni_maker_widgets import (
     MakerResultsModel, MakerRoles, normalize_country_code,
 )
 from .storage import Storage
+from .velocity_flow import VelocityFlow
+from . import direct_theme as _direct_theme
+from . import desktop_layout as _layout
+from . import quick_controls as _quick_controls
+from .application_settings import ApplicationSettings
+from .settings_ui import (
+    GLOBAL_SETTINGS_STYLE, SettingsPage, SettingsRow, SettingsSelect, SharedGlobalSettings,
+    shared_global_settings_style,
+)
 from .pow_ui import ENGINE_POW, ENGINE_XRAY, PowController
+from .direct_ui import ENGINE_DIRECT, DirectPanel
 from .icons import icon as _raw_cyber_icon, pixmap as _raw_cyber_pixmap
 from . import theme as _theme
 from . import fonts as _fonts
@@ -94,8 +103,9 @@ def QColor(*args):
     switch with the engine without per-widget code. A factory (not a
     subclass) so Qt overload resolution stays exact."""
     color = _BaseQColor(*args)
-    if _theme.is_pow() and color.isValid():
-        r, g, b = _theme.map_rgba(color.red(), color.green(), color.blue(), color.alpha())
+    if (_theme.is_pow() or _theme.is_direct()) and color.isValid():
+        mapper = _theme.direct_rgba if _theme.is_direct() else _theme.map_rgba
+        r, g, b = mapper(color.red(), color.green(), color.blue(), color.alpha())
         color.setRgb(r, g, b, color.alpha())
     return color
 
@@ -113,14 +123,15 @@ _ART_CACHE: dict = {}
 
 def _cyber_art(kind, name, color, size, themed_color=None):
     themed_color = _theme.themed(color) if themed_color is None else themed_color
-    key = (kind, name, color, themed_color, size, _theme.palette_version())
+    lucide = _theme.is_direct()
+    key = (kind, name, color, themed_color, size, _theme.palette_version(), lucide)
     try:
         art = _ART_CACHE.get(key)
     except TypeError:  # unhashable colour object: render uncached
         key, art = None, None
     if art is None:
         render = _raw_cyber_pixmap if kind == "p" else _raw_cyber_icon
-        art = render(name, themed_color, size)
+        art = render(name, themed_color, size, lucide=lucide)
         if key is not None:
             _ART_CACHE[key] = art
         _THEMED_ART[(kind, art.cacheKey())] = (name, color, size)
@@ -144,7 +155,7 @@ def prewarm_themed_art(limit=None) -> int:
     for kind, _key in list(_THEMED_ART):
         name, color, size = _THEMED_ART[(kind, _key)]
         for themed_color in (color, _theme.map_hex(color) if isinstance(color, str) else color):
-            cache_key = (kind, name, color, themed_color, size, _theme.palette_version())
+            cache_key = (kind, name, color, themed_color, size, _theme.palette_version(), False)
             try:
                 if cache_key in _ART_CACHE:
                     continue
@@ -297,52 +308,6 @@ HIGH_QUALITY_RENDER_HINTS = (
 
 def _set_high_quality_rendering(painter):
     painter.setRenderHints(HIGH_QUALITY_RENDER_HINTS, True)
-
-
-def _parse_ping_latency(output: str) -> float | None:
-    matches = re.findall(r"(?:time|زمان)\s*[=<]\s*(\d+(?:\.\d+)?)\s*ms", output, re.IGNORECASE)
-    if not matches:
-        matches = re.findall(r"(\d+(?:\.\d+)?)\s*ms", output, re.IGNORECASE)
-    return max(1.0, float(matches[0])) if matches else None
-
-
-def _direct_ping_8888(timeout_ms: int = 1500) -> float | None:
-    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    command = ["ping", "-n", "1", "-w", str(timeout_ms), "8.8.8.8"]
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=max(2.0, timeout_ms / 1000 + 1.0),
-            creationflags=flags,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    return _parse_ping_latency(f"{result.stdout}\n{result.stderr}")
-
-
-def _tun_tls_latency_8888(timeout: float = 8.0) -> float | None:
-    started = time.perf_counter()
-    raw_socket = None
-    try:
-        raw_socket = socket.create_connection(("8.8.8.8", 443), timeout=timeout)
-        raw_socket.settimeout(timeout)
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        with context.wrap_socket(raw_socket, server_hostname="dns.google"):
-            return max(1.0, (time.perf_counter() - started) * 1000)
-    except (OSError, ssl.SSLError):
-        if raw_socket is not None:
-            try:
-                raw_socket.close()
-            except OSError:
-                pass
-        return None
 
 
 _FLAG_CACHE: dict = {}
@@ -533,10 +498,10 @@ EN_FA = {value: key for key, value in FA_EN.items()}
 
 class Bridge(QObject):
     log = Signal(str)
+    engine_log = Signal(str, str)
     state = Signal(bool)
     traffic = Signal(int, int)
-    latency = Signal(float, str)
-    target_latency = Signal(float, str, int)
+    target_latency = Signal(object, object, int)
     maker_imported = Signal(object, object, int)
     maker_batch = Signal(object, int, int, int)
     maker_done = Signal(object, int)
@@ -784,6 +749,8 @@ class CyberRoot(QWidget):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        if _theme.is_direct():
+            return
         painter = QPainter(self)
         _set_high_quality_rendering(painter)
         width, height = self.width(), self.height()
@@ -808,26 +775,111 @@ class CyberRoot(QWidget):
 
 
 class HeroCard(MotionFrame):
-    """Cinematic hero surface with a restrained data wave and dot field."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("heroCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self._phase = 0.0
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._tick)
-        if _animations_enabled():
-            self._timer.start(32)
+        self._wave_state = "disconnected"
+        self._direct = _theme.is_direct()
+        self._engine = ENGINE_DIRECT if self._direct else ENGINE_POW if _theme.is_pow() else ENGINE_XRAY
+        self._velocity_flow = None
+        self._edge_colors = self._edge_start = self._edge_target = _direct_theme.connection_edge_colors("disconnected")
+        self._edge_transition = QVariantAnimation(self)
+        self._edge_transition.setStartValue(0.0)
+        self._edge_transition.setEndValue(1.0)
+        self._edge_transition.setDuration(_direct_theme.CONNECTION_BORDER_MS)
+        self._edge_transition.setEasingCurve(QEasingCurve.InOutCubic)
+        self._edge_transition.valueChanged.connect(self._update_edge_colors)
+        self.orb = None
 
-    def _tick(self):
-        self._phase = (self._phase + .018) % (math.pi * 2)
+    def set_atmosphere(self, engine):
+        direct = engine == ENGINE_DIRECT
+        if direct != self._direct:
+            self._edge_transition.stop()
+            self._edge_colors = self._edge_start = self._edge_target = _direct_theme.connection_edge_colors("disconnected")
+        self._direct = direct
+        self._engine = engine
+        if self._velocity_flow is not None:
+            self._velocity_flow.set_engine(engine)
+        self._sync_atmosphere_motion(self.isVisible())
         self.update()
+
+    def _sync_atmosphere_motion(self, visible):
+        if visible and self._velocity_flow is None and QApplication.platformName() == "windows":
+            QTimer.singleShot(0, self, self._start_velocity_flow)
+        if self._velocity_flow is not None:
+            running = _animations_enabled() and not self.window().isMinimized()
+            self._velocity_flow.set_active(visible, running)
+
+    def _start_velocity_flow(self):
+        if self._velocity_flow is not None or not self.isVisible():
+            return
+        self._velocity_flow = VelocityFlow(self, self.orb, self._engine)
+        self.window().installEventFilter(self)
+        self._velocity_flow.set_connection_state(self._wave_state)
+        self._sync_atmosphere_motion(True)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.WindowStateChange and watched is self.window():
+            self._sync_atmosphere_motion(self.isVisible())
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._velocity_flow is not None:
+            self._velocity_flow.fit_card()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.LayoutDirectionChange:
+            self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._sync_atmosphere_motion(True)
+
+    def hideEvent(self, event):
+        self._sync_atmosphere_motion(False)
+        super().hideEvent(event)
+
+    def set_wave_state(self, state):
+        if self._direct:
+            target = _direct_theme.connection_edge_colors("connecting" if state == "disconnecting" else state)
+            if target != self._edge_target:
+                self._edge_transition.stop()
+                self._edge_start, self._edge_target = self._edge_colors, target
+                if _animations_enabled() and self.isVisible():
+                    self._edge_transition.start()
+                else:
+                    self._update_edge_colors(1.0)
+        self._wave_state = state
+        if self._velocity_flow is not None:
+            self._velocity_flow.set_connection_state(state)
+
+    def _update_edge_colors(self, progress):
+        self._edge_colors = tuple(
+            _BaseQColor.fromRgbF(*(start + (end - start) * progress
+                                  for start, end in zip(a.getRgbF()[:3], b.getRgbF()[:3])))
+            for a, b in zip(self._edge_start, self._edge_target)
+        )
+        self.update()
+
+    def set_wave_traffic(self, sent, received):
+        if self._velocity_flow is not None:
+            self._velocity_flow.set_traffic_counters(sent, received)
 
     def paintEvent(self, event):
         super().paintEvent(event)
         painter = QPainter(self)
         _set_high_quality_rendering(painter)
+        if self._direct:
+            painter.save()
+            _direct_theme.paint_card_wash(painter, QRectF(self.rect()))
+            if self._velocity_flow is not None:
+                self._velocity_flow.paint(painter)
+            painter.restore()
+            _direct_theme.paint_connection_edge(painter, QRectF(self.rect()), *self._edge_colors)
+            return
         width, height = self.width(), self.height()
 
         glow = QRadialGradient(QPointF(width * .74, height * .47), max(130, height * .92))
@@ -835,37 +887,8 @@ class HeroCard(MotionFrame):
         glow.setColorAt(.48, QColor(44, 199, 255, 9))
         glow.setColorAt(1, QColor(5, 11, 24, 0))
         painter.fillRect(self.rect(), glow)
-
-
-        beam_x = width * (.12 + (.5 + .5 * math.sin(self._phase * .72)) * .76)
-        beam = QLinearGradient(beam_x - 92, 0, beam_x + 92, height)
-        beam.setColorAt(0, QColor(44, 199, 255, 0))
-        beam.setColorAt(.48, QColor(105, 250, 239, 10))
-        beam.setColorAt(.52, QColor(198, 255, 249, 23))
-        beam.setColorAt(1, QColor(44, 199, 255, 0))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(beam)
-        painter.drawRoundedRect(QRectF(1, 1, width - 2, height - 2), 26, 26)
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(44, 199, 255, 24))
-        start_x = int(width * .48)
-        for x in range(start_x, width - 18, 20):
-            for y in range(20, height - 14, 20):
-                if ((x // 20) + (y // 20)) % 3 == 0:
-                    painter.drawEllipse(QPointF(x, y), 1.15, 1.15)
-
-        for index, alpha in enumerate((34, 20, 12)):
-            path = QPainterPath()
-            baseline = height * (.72 + index * .045)
-            amplitude = max(7, height * (.045 - index * .008))
-            path.moveTo(0, baseline)
-            for x in range(0, width + 8, 8):
-                wave = math.sin(x / 66 + self._phase + index * .7)
-                wave += .38 * math.sin(x / 23 - self._phase * .7)
-                path.lineTo(x, baseline + wave * amplitude)
-            painter.setPen(QPen(QColor(44, 199, 255, alpha), 1.1))
-            painter.drawPath(path)
+        if self._velocity_flow is not None:
+            self._velocity_flow.paint(painter)
 
 
 class NavButton(QPushButton):
@@ -896,7 +919,7 @@ class NavButton(QPushButton):
             self.icon().paint(painter, icon_x, icon_y, icon_size.width(), icon_size.height())
         else:
             super().paintEvent(event)
-        if self.isChecked():
+        if self.isChecked() and not _theme.is_direct():
             if self.layoutDirection() != Qt.RightToLeft:
                 painter = QPainter(self)
                 _set_high_quality_rendering(painter)
@@ -929,6 +952,68 @@ class ToggleOptionFrame(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class QuickControlsGrid(QGridLayout):
+    equal_columns = 0
+
+    def setGeometry(self, rect):
+        if self.equal_columns:
+            margins = self.contentsMargins()
+            gaps = (self.equal_columns - 1) * self.horizontalSpacing()
+            available = rect.width() - margins.left() - margins.right() - gaps
+            remainder = max(available, 0) % self.equal_columns
+            rect = rect.adjusted(remainder // 2, 0, -(remainder - remainder // 2), 0)
+        super().setGeometry(rect)
+
+
+class QuickCarrierCombo(QComboBox):
+    arrow_color = None
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.arrow_color:
+            option = QStyleOptionComboBox()
+            self.initStyleOption(option)
+            rect = self.style().subControlRect(QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxArrow, self)
+            arrow = _raw_cyber_pixmap("chevron-down", self.arrow_color, 11, lucide=True)
+            bounds = QStyle.alignedRect(option.direction, Qt.AlignCenter, QSize(11, 11), rect)
+            painter = QPainter(self)
+            painter.drawPixmap(bounds.topLeft(), arrow)
+
+
+class QuickSettingsButton(GlowButton):
+    quick_palette = None
+
+    def paintEvent(self, event):
+        if self.quick_palette is None:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        _set_high_quality_rendering(painter)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        option.text = ""
+        option.icon = QIcon()
+        self.style().drawControl(QStyle.CE_PushButton, option, painter, self)
+
+        direction = self.layoutDirection()
+        rtl = direction == Qt.RightToLeft
+        bounds = self.rect()
+        content = bounds.adjusted(11, 0, -11, 0)
+        icon = QRect(content.left(), (bounds.height() - 16) // 2, 16, 16)
+        chevron = QRect(content.right() - 12, (bounds.height() - 13) // 2, 13, 13)
+        label = content.adjusted(23, 0, -19, 0)
+        self.icon().paint(painter, QStyle.visualRect(direction, bounds, icon))
+        arrow = _raw_cyber_pixmap("chevron-left" if rtl else "chevron-right",
+                                 self.quick_palette["icon"], 13, lucide=True)
+        painter.drawPixmap(QStyle.visualRect(direction, bounds, chevron), arrow)
+        painter.setPen(option.palette.buttonText().color())
+        painter.setFont(self.font())
+        alignment = Qt.AlignRight if rtl else Qt.AlignLeft
+        text = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, label.width())
+        painter.drawText(QStyle.visualRect(direction, bounds, label),
+                         alignment | Qt.AlignAbsolute | Qt.AlignVCenter | Qt.TextSingleLine, text)
+
+
 #: PoW Home HTTP/2 fragment switch label (Persian from the Home page) + auto tag.
 _POW_H2_FA = 'فرگمنت HTTP/2'
 _POW_AUTO_FA = 'خودکار'
@@ -944,10 +1029,21 @@ class ToggleSwitch(QCheckBox):
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.StrongFocus)
         self._thumb_position = 0.0
+        self._quick_palette = None
         self._thumb_animation = QPropertyAnimation(self, b"thumbPosition", self)
         self._thumb_animation.setDuration(260)
         self._thumb_animation.setEasingCurve(QEasingCurve.OutBack)
         self.toggled.connect(self._animate_thumb)
+
+    def set_quick_style(self, palette):
+        if palette is self._quick_palette:
+            return
+        self._quick_palette = palette
+        self.setFixedSize(*(_layout.QUICK_SWITCH_TARGET if palette else (48, 26)))
+        self._thumb_animation.stop()
+        self._thumb_animation.setDuration(_quick_controls.SWITCH_MS if palette else 260)
+        self._thumb_animation.setEasingCurve(QEasingCurve.InOutCubic if palette else QEasingCurve.OutBack)
+        self._set_thumb_position(float(self.isChecked()))
 
     def _get_thumb_position(self):
         return self._thumb_position
@@ -969,7 +1065,7 @@ class ToggleSwitch(QCheckBox):
         self._thumb_animation.start()
 
     def sizeHint(self):
-        return QSize(48, 26)
+        return QSize(*(_layout.QUICK_SWITCH_TARGET if self._quick_palette else (48, 26)))
 
     def hitButton(self, pos):
         """Make the complete painted switch clickable, not only native chrome."""
@@ -980,6 +1076,38 @@ class ToggleSwitch(QCheckBox):
         _set_high_quality_rendering(painter)
         enabled = self.isEnabled()
         checked = self.isChecked()
+        palette = self._quick_palette
+        if palette or _theme.is_direct():
+            running = self._thumb_animation.state() == QPropertyAnimation.Running
+            position = self._thumb_position if running else float(checked)
+            w, h = self.width(), self.height()
+            track = QRectF(1, 2, w - 2, h - 4)
+            track_color = _BaseQColor("#ee935a" if checked and enabled else "#36383c")
+            thumb_color = _BaseQColor("#fff2e9" if checked and enabled else "#95979e")
+            if palette:
+                width, height = _layout.QUICK_SWITCH
+                track = QRectF((w - width) / 2, (h - height) / 2, width, height)
+                off = _BaseQColor(palette["track_off"])
+                on = _BaseQColor(palette["track_on"])
+                progress = position if enabled else 0.0
+                track_color = _BaseQColor.fromRgbF(*(start + (end - start) * progress
+                                                    for start, end in zip(off.getRgbF()[:3], on.getRgbF()[:3])))
+                thumb_color = _BaseQColor(palette["thumb_on" if checked and enabled else "thumb_off"])
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(track_color)
+            radius = track.height() / 2
+            painter.drawRoundedRect(track, radius, radius)
+            painter.setBrush(thumb_color)
+            if self.layoutDirection() == Qt.RightToLeft:
+                position = 1 - position
+            travel = track.width() - track.height() if palette else w - h
+            start_x = track.left() + radius if palette else h / 2
+            painter.drawEllipse(QPointF(start_x + travel * position, h / 2), 7, 7)
+            if self.hasFocus() and self.focusPolicy() != Qt.NoFocus:
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(_BaseQColor(palette["icon"] if palette else "#ffad6e"), 1, Qt.DotLine))
+                painter.drawRoundedRect(QRectF(.5, .5, w - 1, h - 1), (h - 1) / 2, (h - 1) / 2)
+            return
         track = QColor("#0d6f76" if checked else "#12243c")
         if not enabled:
             track = QColor("#111c2d")
@@ -1218,6 +1346,12 @@ class PulseDot(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         _set_high_quality_rendering(painter)
+        if _theme.is_direct():
+            painter.setPen(Qt.NoPen)
+            accent = _direct_theme.CONNECTION_ACCENTS
+            painter.setBrush(_BaseQColor(accent.get(self.state, accent["disconnected"])))
+            painter.drawEllipse(QPointF(self.width() / 2, self.height() / 2), 3.5, 3.5)
+            return
         color = QColor(self.COLORS.get(self.state, self.COLORS["idle"]))
         pulse = .5 + .5 * math.sin(self._phase) if MOTION_ENABLED else .4
         glow = QColor(color)
@@ -1235,6 +1369,9 @@ class StatusPill(QFrame):
         self.setObjectName("statusPill")
         self.language = language
         self.state = "disconnected"
+        self._connected_at = None
+        self._session_tick = QTimer(self, interval=1000)
+        self._session_tick.timeout.connect(self._show_session_time)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(13, 8, 15, 8)
         layout.setSpacing(7)
@@ -1255,13 +1392,34 @@ class StatusPill(QFrame):
             "disconnected": ("وضعیت: قطع", "Status: Disconnected"),
             "connecting": ("وضعیت: در حال اتصال", "Status: Connecting"),
             "connected": ("وضعیت: متصل", "Status: Connected"),
+            "paused": ("وضعیت: مکث", "Status: Paused"),
             "error": ("وضعیت: خطا", "Status: Error"),
         }
         fa, en = values.get(state, values["disconnected"])
-        self.label.setText(en if self.language == "en" else fa)
+        if _theme.is_direct() and state == "connected":
+            if self._connected_at is None:
+                self._connected_at = time.monotonic()
+                self._session_tick.start()
+            self._show_session_time()
+        else:
+            self._session_tick.stop()
+            self._connected_at = None
+            self.label.setText(en if self.language == "en" else fa)
         self.dot.set_state(state)
         self.setProperty("state", state)
         _restyle(self)
+        if _theme.is_direct():
+            _restyle(self.label)
+
+    def _show_session_time(self):
+        if self._connected_at is None or not _theme.is_direct():
+            self._session_tick.stop()
+            self._connected_at = None
+            return
+        hours, remainder = divmod(int(time.monotonic() - self._connected_at), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        duration = f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
+        self.label.setText(f"Connected · {duration}" if self.language == "en" else f"متصل · {ltr_isolate(duration)}")
 
 
 class ActivityIndicator(QWidget):
@@ -1287,6 +1445,11 @@ class ActivityIndicator(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         _set_high_quality_rendering(painter)
+        if _theme.is_direct():
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(_BaseQColor("#ed796a" if self.state == "error" else "#ffad6e"))
+            painter.drawEllipse(QRectF(self.width() / 2 - 3.5, self.height() / 2 - 3.5, 7, 7))
+            return
         color = QColor({"error": "#ff5c7c", "warning": "#ffd166", "success": "#23f5a6"}.get(self.state, "#23f5e0"))
         if self.busy:
             for index in range(12):
@@ -1375,6 +1538,9 @@ class ActivityBar(QFrame):
 
     def set_language(self, language):
         self.language = language
+        alignment = Qt.AlignLeft if language == "en" else Qt.AlignRight
+        for label in (self.title, self.message):
+            label.setAlignment(alignment | Qt.AlignAbsolute | Qt.AlignVCenter)
         self.title.setText("CURRENT ACTIVITY" if language == "en" else "فعالیت فعلی")
         if self.state == "idle":
             self.message.setText("Ready. No background task is running." if language == "en" else "آماده؛ هیچ عملیات پس‌زمینه‌ای در حال اجرا نیست.")
@@ -1384,48 +1550,13 @@ class ActivityBar(QFrame):
         self.updated_at = time.time()
         self.revision += 1
         if message:
-            self.message.setText(message)
+            self.message.setText(_fonts.persian_ui_text(message) if self.language == "fa" else message)
         elif state == "idle":
             self.set_language(self.language)
         self.indicator.set_activity(state, busy)
         self.rail.set_busy(busy)
         self.setProperty("state", state)
         _restyle(self)
-
-
-class MiniSparkline(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.values: list[float] = []
-        self.setMinimumHeight(24)
-        self.setMaximumHeight(28)
-
-    def add_value(self, value):
-        try:
-            self.values.append(float(value))
-        except (TypeError, ValueError):
-            return
-        self.values = self.values[-28:]
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        _set_high_quality_rendering(painter)
-        baseline = self.height() - 5
-        painter.setPen(QPen(QColor(44, 199, 255, 50), 1))
-        painter.drawLine(0, baseline, self.width(), baseline)
-        if len(self.values) < 2:
-            return
-        low, high = min(self.values), max(self.values)
-        span = max(1.0, high - low)
-        path = QPainterPath()
-        for index, value in enumerate(self.values):
-            x = index * self.width() / max(1, len(self.values) - 1)
-            y = baseline - 3 - ((value - low) / span) * max(7, self.height() - 11)
-            if index == 0: path.moveTo(x, y)
-            else: path.lineTo(x, y)
-        painter.setPen(QPen(QColor("#23f5e0"), 1.4))
-        painter.drawPath(path)
 
 
 class ElidedLabel(QLabel):
@@ -1454,82 +1585,6 @@ class ElidedLabel(QLabel):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._sync_text()
-
-
-class MetricCard(MotionFrame):
-    def __init__(self, title, icon_name, value_widget=None, parent=None):
-        super().__init__(parent)
-        self.setObjectName("metricCard")
-        self.setAttribute(Qt.WA_Hover, True)
-        self.setMinimumHeight(154)
-        self.card_layout = QVBoxLayout(self)
-        self.card_layout.setContentsMargins(16, 15, 16, 14)
-        self.card_layout.setSpacing(10)
-        header = QHBoxLayout(); header.setSpacing(9)
-        self.icon_label = QLabel(); self.icon_label.setObjectName("metricIcon")
-        self.icon_label.setFixedSize(34, 34)
-        self.icon_label.setPixmap(cyber_pixmap(icon_name, "#23f5e0", 19))
-        self.title = QLabel(title); self.title.setObjectName("metricLabel")
-        header.addWidget(self.icon_label); header.addWidget(self.title); header.addStretch()
-        self.card_layout.addLayout(header)
-        self.value = value_widget or QLabel("—")
-        self.value.setObjectName("metricValue")
-        self.card_layout.addWidget(self.value, 1)
-        self.secondary = QLabel("")
-        self.secondary.setObjectName("metricSecondary")
-        self.secondary.setLayoutDirection(Qt.LeftToRight)
-        self.secondary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.secondary.setVisible(False)
-        self.card_layout.addWidget(self.secondary)
-        self.sparkline = MiniSparkline()
-        self.sparkline.setVisible(False)
-        self.card_layout.addWidget(self.sparkline)
-
-    def set_compact(self, compact):
-        compact = bool(compact)
-        self.setProperty("compact", compact)
-        self.setMinimumHeight(104 if compact else 132)
-        self.setMaximumHeight(112 if compact else 160)
-        self.card_layout.setContentsMargins(*(10, 8, 10, 8) if compact else (16, 12, 16, 11))
-        self._compact = compact
-        self.card_layout.setSpacing(self._row_spacing())
-        self.icon_label.setFixedSize(*(27, 27) if compact else (34, 34))
-        self.sparkline.setMaximumHeight(19 if compact else 28)
-        _restyle(self)
-
-    def _row_spacing(self):
-        spacing = 4 if getattr(self, "_compact", False) else 9
-        return min(spacing, 5) if getattr(self, "_tight", False) else spacing
-
-    def set_tight(self, tight):
-        """Smaller row gaps when an extra row (e.g. the parallel badge) is shown."""
-        self._tight = bool(tight)
-        if getattr(self, "_compact", None) is not None:
-            self.card_layout.setSpacing(self._row_spacing())
-
-    def set_secondary(self, text):
-        self._secondary_full = text or ""
-        self.secondary.setToolTip(self._secondary_full if not self.secondary.wordWrap() else "")
-        self._elide_secondary()
-        self.secondary.setVisible(bool(text))
-
-    def _elide_secondary(self):
-        full = getattr(self, "_secondary_full", None)
-        if full is None:
-            return
-        if self.secondary.wordWrap() or not full:
-            self.secondary.setText(full)
-            return
-        margins = self.card_layout.contentsMargins()
-        width = max(24, self.width() - margins.left() - margins.right())
-        self.secondary.setText(self.secondary.fontMetrics().elidedText(full, Qt.ElideRight, width))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._elide_secondary()
-
-    def enable_sparkline(self, enabled=True):
-        self.sparkline.setVisible(enabled)
 
 
 _SESSION_STATE_COLORS = {"up": "#35f0dc", "standby": "#9fb4d8", "skipped": "#f5a524", "down": "#ff5c7a"}
@@ -1573,7 +1628,7 @@ class ParallelBadge(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         self.text = QLabel("")
-        self.text.setObjectName("metricSecondary")
+        self.text.setObjectName("hudLegend")
         layout.addWidget(self.text)
         self.flags = []
         for _ in range(self.MAX_FLAGS):
@@ -1907,6 +1962,8 @@ class ConnectionOrb(QWidget):
         self.state = "disconnected"
         self._phase = 0.0
         self._transition = 1.0
+        self._direct_appearance = False
+        self._direct_frame = None
         self._from_color = QColor(self.COLORS["disconnected"])
         self._color_animation = QPropertyAnimation(self, b"transitionProgress", self)
         self._color_animation.setDuration(480)
@@ -1917,6 +1974,23 @@ class ConnectionOrb(QWidget):
         self._timer.timeout.connect(self._tick)
         if _animations_enabled():
             self._timer.start(20)
+
+    def set_direct_appearance(self, active):
+        if active == self._direct_appearance:
+            return
+        self._direct_appearance = active
+        if active:
+            self._timer.stop()
+            self._color_animation.stop()
+            self._direct_frame = QImage(str(ASSETS / "ui" / "velocity-energy-flow" / "core-idle.png"))
+        elif _animations_enabled():
+            self._timer.start(20)
+        self.update()
+
+    def set_direct_frame(self, frame):
+        if not frame.isNull():
+            self._direct_frame = frame
+            self.update()
 
     def _get_transition(self):
         return self._transition
@@ -1950,7 +2024,7 @@ class ConnectionOrb(QWidget):
             return
         self._from_color = self._current_color()
         self.state = state
-        if not _animations_enabled():
+        if self._direct_appearance or not _animations_enabled():
             self._set_transition(1.0)
             return
         self._color_animation.stop()
@@ -1971,6 +2045,10 @@ class ConnectionOrb(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         _set_high_quality_rendering(p)
+        if self._direct_appearance:
+            if self._direct_frame is not None:
+                p.drawImage(self.rect(), self._direct_frame)
+            return
         scale = min(self.width(), self.height()) / 224.0
         p.scale(scale, scale)
         center = QPointF(self.width() / (2 * scale), self.height() / (2 * scale))
@@ -2250,7 +2328,7 @@ def resolve_startup_engine(settings) -> tuple:
         settings[ENGINE_DEFAULT_MARKER] = True
         return ENGINE_POW, True
     mode = str(settings.get("engine_mode", ENGINE_POW) or ENGINE_POW)
-    return (mode if mode in (ENGINE_XRAY, ENGINE_POW) else ENGINE_POW), False
+    return (mode if mode in (ENGINE_XRAY, ENGINE_POW, ENGINE_DIRECT) else ENGINE_POW), False
 
 
 class TuningDialog(QDialog):
@@ -2310,16 +2388,13 @@ class TuningDialog(QDialog):
 
         self.mux_enabled = ToggleSwitch(); self.mux_enabled.setChecked(bool(getattr(tuning, "xray_mux_enabled", True)))
         self.mux_concurrency = NumericInput(getattr(tuning, "xray_mux_concurrency", 8), 1, 32)
-        self.iran_direct = ToggleSwitch(); self.iran_direct.setChecked(bool(getattr(tuning, "iran_direct", True)))
         self.background_probe = ToggleSwitch(); self.background_probe.setChecked(bool(getattr(tuning, "background_quality_probe_enabled", False)))
         self.probe_delay = NumericInput(getattr(tuning, "background_quality_probe_delay_s", 30), 10, 300, "s")
         self.log_level = QComboBox(); self.log_level.addItems(["minimal", "normal"]); self.log_level.setCurrentText(tuning.log_level)
         adv_layout.addWidget(self._section(
             self.t(f"شتاب‌دهی {ltr_isolate('Xray')}", "Xray acceleration"),
             self.t("اتصال‌های مرورگر را تجمیع می‌کند تا تعداد Handshakeهای گران کاهش یابد.", "Reduce expensive tunnel handshakes by sharing browser streams."),
-            [(self.t("سایت‌های ایرانی مستقیم", "Iranian sites direct"), self.iran_direct,
-              self.t("سایت‌ها و آی‌پی‌های ایرانی بدون تونل باز می‌شوند (سریع‌تر و بدون مصرف تونل).", "Iranian sites and IPs skip the tunnel (faster, no tunnel load).")),
-             (self.t(f"فعال‌سازی {ltr_isolate('Mux')}", "Enable Mux"), self.mux_enabled,
+            [(self.t(f"فعال‌سازی {ltr_isolate('Mux')}", "Enable Mux"), self.mux_enabled,
               self.t("شروع صفحات را سریع‌تر می‌کند. اگر سرور ناسازگار باشد تست اتصال آن را تشخیص می‌دهد.", "Usually improves page start. The real connectivity probe detects incompatible servers.")),
              (self.t("جریان در هر تونل", "Streams per tunnel"), self.mux_concurrency,
               self.t("عدد بیشتر Handshake را کم می‌کند؛ عدد بسیار زیاد ممکن است روی ویدئو Head-of-line ایجاد کند.", "Higher values reduce handshakes; excessive values can add head-of-line blocking to video.")),
@@ -2531,8 +2606,8 @@ class TuningDialog(QDialog):
         body_layout.addWidget(strategy)
         # Local proxy ports (Engine 1) — settings dialog only, not Home.
         from .proxy_port_panel import install_xray_ports_into_tuning
-        install_xray_ports_into_tuning(self)
-        body_layout.addWidget(self._proxy_ports_section)
+        if install_xray_ports_into_tuning(self) is not None:
+            body_layout.addWidget(self._proxy_ports_section)
 
         adv = QFrame(); adv.setObjectName("settingsSection")
         adv_l = QVBoxLayout(adv); adv_l.setContentsMargins(18, 14, 18, 14); adv_l.setSpacing(10)
@@ -2786,7 +2861,7 @@ class TuningDialog(QDialog):
             self.connect_ip.setText(t.pattern_connect_ip); self.fallback_ips.setText(t.pattern_fallback_ips); self.profile_edges.setChecked(t.pattern_use_profile_edges); self.fake_sni.setText(t.pattern_fake_sni)
             self.inject_delay.setValue(t.pattern_inject_delay_ms); self.ack_timeout.setValue(t.pattern_ack_timeout_ms); self.connect_timeout.setValue(t.pattern_connect_timeout_ms)
             self.relay_buffer.setValue(t.pattern_relay_buffer_kb); self.socket_buffer.setValue(t.pattern_socket_buffer_kb); self.max_sessions.setValue(t.pattern_max_sessions); self.keepalive.setValue(t.pattern_keepalive_idle_s); self.upload_optimized.setChecked(t.pattern_upload_optimized)
-            self.mux_enabled.setChecked(getattr(t, "xray_mux_enabled", True)); self.iran_direct.setChecked(bool(getattr(t, "iran_direct", True))); self.mux_concurrency.setValue(getattr(t, "xray_mux_concurrency", 8)); self.background_probe.setChecked(getattr(t, "background_quality_probe_enabled", False)); self.probe_delay.setValue(getattr(t, "background_quality_probe_delay_s", 30)); self.log_level.setCurrentText(t.log_level)
+            self.mux_enabled.setChecked(getattr(t, "xray_mux_enabled", True)); self.mux_concurrency.setValue(getattr(t, "xray_mux_concurrency", 8)); self.background_probe.setChecked(getattr(t, "background_quality_probe_enabled", False)); self.probe_delay.setValue(getattr(t, "background_quality_probe_delay_s", 30)); self.log_level.setCurrentText(t.log_level)
             self.edge_cooldown.setValue(getattr(t, "pattern_edge_failure_cooldown_s", 8)); self.keepalive_interval.setValue(getattr(t, "pattern_keepalive_interval_s", 3)); self.keepalive_count.setValue(getattr(t, "pattern_keepalive_count", 3))
         finally:
             self._loading_tuning = False
@@ -2824,7 +2899,7 @@ class TuningDialog(QDialog):
         t.pattern_ack_timeout_ms = self.ack_timeout.value(); t.pattern_connect_timeout_ms = self.connect_timeout.value()
         t.pattern_relay_buffer_kb = self.relay_buffer.value(); t.pattern_socket_buffer_kb = self.socket_buffer.value()
         t.pattern_max_sessions = self.max_sessions.value(); t.pattern_keepalive_idle_s = self.keepalive.value()
-        t.pattern_upload_optimized = self.upload_optimized.isChecked(); t.xray_mux_enabled = self.mux_enabled.isChecked(); t.iran_direct = self.iran_direct.isChecked(); t.xray_mux_concurrency = self.mux_concurrency.value()
+        t.pattern_upload_optimized = self.upload_optimized.isChecked(); t.xray_mux_enabled = self.mux_enabled.isChecked(); t.xray_mux_concurrency = self.mux_concurrency.value()
         t.background_quality_probe_enabled = self.background_probe.isChecked(); t.background_quality_probe_delay_s = self.probe_delay.value(); t.log_level = self.log_level.currentText()
         t.pattern_edge_failure_cooldown_s = self.edge_cooldown.value(); t.pattern_keepalive_interval_s = self.keepalive_interval.value(); t.pattern_keepalive_count = self.keepalive_count.value()
         return Tuning.enforce_carrier(t, carrier)
@@ -2876,8 +2951,12 @@ class _OverlayHint(QLabel):
 
 
 class MainWindow(LogsPageMixin, QMainWindow):
+    GLOBAL_SETTINGS_PAGE = 9
+    POW_SETTINGS_PAGE = 10
+    DIRECT_SETTINGS_PAGE = 11
+
     def __init__(self):
-        super().__init__(); self.setWindowTitle("UAC Spoofer Desktop"); self.resize(1440, 900); self.setMinimumSize(1080, 700)
+        super().__init__(); self.setWindowTitle("UAC Spoofer Desktop"); self.resize(1440, 900); self.setMinimumSize(*_layout.MIN_WINDOW_SIZE)
         self.setAccessibleName("UAC Spoofer Desktop")
         self.storage = Storage(); self.language = self.storage.settings.get("language", "fa"); self.bridge = Bridge(); self.scan_cancelled = False; self.scanning = False; self.connecting = False; self.connection_error = ""; self.last_results: list[ScanResult] = []; self.sni_undo_snapshot = None; self._toast_timer = None
         if self.storage.settings.get("assistant_enabled", False):
@@ -2933,11 +3012,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._pending_file_log_lines: list[str] = []
         self._log_flush_failures = 0
         self._log_flush_timer = QTimer(self); self._log_flush_timer.setSingleShot(True); self._log_flush_timer.setInterval(180); self._log_flush_timer.timeout.connect(self._flush_log_buffer)
-        self._metrics_compact = None
         self._controls_compact = None
         self._target_latency_generation = 0
         self._target_latency_busy = False
-        self._target_latency_pending = False
         self._maker_generation = 0
         self._maker_import_generation = 0
         self._maker_running = False
@@ -2963,7 +3040,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             fake_sni=self.storage.tuning.pattern_fake_sni,
         )
         self.assistant_controller = None
-        self.engine = Engine(self.bridge.log.emit, self.bridge.state.emit, self.bridge.traffic.emit)
+        self.engine = Engine(lambda text: self.bridge.engine_log.emit(text, ENGINE_XRAY),
+                             self.bridge.state.emit, self.bridge.traffic.emit)
         self.engine.ech_via_pattern = bool(self.storage.settings.get("ech_via_pattern", False))
         self._apply_xray_port_setting()
         self.engine_mode, _engine_migrated = resolve_startup_engine(self.storage.settings)
@@ -2975,7 +3053,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         # Install the combined (both engines) stylesheet before any widget
         # exists, so start-up pays for one cheap install and a later engine
         # switch never has to replace the application stylesheet.
-        self.setProperty(_eswitch.ENGINE_PROPERTY, self.engine_mode)
+        self.global_settings = ApplicationSettings(self.storage)
+        self.setProperty(_eswitch.ENGINE_PROPERTY, ENGINE_POW if self.engine_mode == ENGINE_DIRECT else self.engine_mode)
         try:
             _startup_app = QApplication.instance()
             if _startup_app is not None and is_app_style(_startup_app.styleSheet()):
@@ -2983,6 +3062,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         except Exception:
             pass
         self.pow_controller = PowController(self)
+        self.direct_controller = DirectPanel(self)
+        self.global_settings.migrate(self.engine_mode, self.pow_controller.store, self.direct_controller.store)
+        self._xray_session_mode = None
         gateway = getattr(self.engine, "gateway", None)
         if gateway is not None:
             gateway.state_changed = (
@@ -3000,7 +3082,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.engine.recover_stale_tun()
         except Exception as exc:
             self._pending_file_log_lines.append(f"sing-box recovery pending: {exc}")
-        _theme.set_pow(getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW); self._build(); self._sync_engine_ui(); self._setup_tray(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
+        _theme.set_engine(self.engine_mode); self._build(); self._sync_engine_ui(); self._setup_tray(); self._wire(); self._configure_technical_widgets(); self.refresh_profiles(); self.refresh_bookmarks(); self.refresh_processes(); self._apply_language(); self._append_log("UAC Spoofer Desktop آماده است")
         QTimer.singleShot(2500, self._prewarm_art_step)
         self.activity_bar.set_activity("", "idle", False)
         if ASSISTANT_FEATURE_ENABLED and AssistantController is not None:
@@ -3030,11 +3112,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _bind_text(self, widget, persian, english):
         widget.setProperty("i18nFa", persian)
         widget.setProperty("i18nEn", english)
-        widget.setText(english if self.language == "en" else persian)
+        widget.setText(self._ui_text(persian, english))
         return widget
 
-    def _action_button(self, persian, english, icon_name, object_name="secondaryAction"):
-        button = GlowButton()
+    def _action_button(self, persian, english, icon_name, object_name="secondaryAction", *, button_type=GlowButton):
+        button = button_type()
         button.setObjectName(object_name)
         button.setIcon(cyber_icon(icon_name, "#bfefff", 18))
         button.setIconSize(QSize(18, 18))
@@ -3052,6 +3134,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
             "App Bypass": ("route", "مسیریابی برنامه‌ها", "APPLICATION ROUTING"),
             "Network Tools": ("wrench", "ابزارهای تشخیص", "DIAGNOSTIC TOOLKIT"),
             "Support & Updates": ("headphones", "مرکز راهنما", "SUPPORT CENTER"),
+            "Global Settings": ("settings", "ترجیحات برنامه", "APPLICATION PREFERENCES"),
+            "PoW Settings": ("zap", "موتور PoW", "POW ENGINE"),
+            "Direct Settings": ("route", "موتور Direct", "DIRECT ENGINE"),
         }
         icon_name, persian_kicker, english_kicker = header_meta.get(
             english_title, ("shield", "رابط دسکتاپ", "FLOXU DESKTOP")
@@ -3064,7 +3149,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
         copy = QVBoxLayout(); copy.setSpacing(3)
         kicker = self._bind_text(QLabel(), persian_kicker, english_kicker); kicker.setObjectName("pageEyebrow")
         title = self._bind_text(QLabel(), persian_title, english_title); title.setObjectName("pageTitle")
-        subtitle = self._bind_text(QLabel(), persian_subtitle, english_subtitle); subtitle.setObjectName("pageSubtitle"); subtitle.setWordWrap(True)
+        dashboard = english_title == "Connection Center"
+        subtitle = self._bind_text(ElidedLabel() if dashboard else QLabel(), persian_subtitle, english_subtitle)
+        subtitle.setObjectName("pageSubtitle"); subtitle.setWordWrap(not dashboard)
+        if dashboard:
+            copy.setAlignment(Qt.AlignVCenter)
         subtitle.setTextInteractionFlags(Qt.TextSelectableByMouse)
         copy.addWidget(kicker); copy.addWidget(title); copy.addWidget(subtitle)
         layout.addLayout(copy, 1)
@@ -3079,14 +3168,19 @@ class MainWindow(LogsPageMixin, QMainWindow):
         scroll.setWidget(body)
         return scroll, body
 
-    def _toggle_option(self, toggle, persian, english, row_click_enabled=True):
+    def _toggle_option(self, toggle, persian, english, row_click_enabled=True, *, word_wrap=False):
         wrapper = ToggleOptionFrame(
             toggle, row_click_enabled=row_click_enabled
         ); wrapper.setObjectName("toggleOption")
         layout = QHBoxLayout(wrapper); layout.setContentsMargins(10, 7, 10, 7); layout.setSpacing(10)
-        label = self._bind_text(QLabel(), persian, english); label.setObjectName("controlLabel")
+        label = QLabel() if word_wrap else ElidedLabel()
+        if word_wrap:
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._bind_text(label, persian, english)
+        label.setObjectName("controlLabel")
         label.setAttribute(Qt.WA_TransparentForMouseEvents)
-        layout.addWidget(toggle); layout.addWidget(label); layout.addStretch()
+        layout.addWidget(toggle); layout.addWidget(label, 1)
         toggle.setAccessibleName(english)
         return wrapper
 
@@ -3095,28 +3189,64 @@ class MainWindow(LogsPageMixin, QMainWindow):
         sidebar = QFrame(); self.sidebar = sidebar; sidebar.setObjectName("sidebar"); sidebar.setAttribute(Qt.WA_StyledBackground, True); sidebar.setFixedWidth(286); side = QVBoxLayout(sidebar); self.sidebar_layout = side; side.setContentsMargins(18, 20, 18, 18); side.setSpacing(4)
         logo = QFrame(); self.logo_card = logo; logo.setObjectName("logoCard"); logo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed); logo_root = QVBoxLayout(logo); self.logo_root = logo_root; logo_root.setContentsMargins(12, 10, 12, 10); logo_root.setSpacing(9); logo_root.setSizeConstraint(QBoxLayout.SizeConstraint.SetMinimumSize)
         brand_row = QHBoxLayout(); brand_row.setSpacing(12)
-        mark = QLabel(); self.logo_mark = mark; mark.setObjectName("logoMark"); mark.setAlignment(Qt.AlignCenter); mark.setFixedSize(46, 46); mark.setPixmap(cyber_pixmap("shield", "#031422", 24)); brand_row.addWidget(mark, 0, Qt.AlignVCenter)
+        mark = QLabel(); self.logo_mark = mark; mark.setObjectName("logoMark"); mark.setAlignment(Qt.AlignCenter); mark.setFixedSize(_layout.BRAND_ICON, _layout.BRAND_ICON); mark.setPixmap(cyber_pixmap("shield", "#031422", 24)); brand_row.addWidget(mark, 0, Qt.AlignVCenter)
         logo_text = QVBoxLayout(); logo_text.setSpacing(1)
         brand = QLabel("UAC Spoofer"); self.brand_label = brand; brand.setObjectName("brand"); brand.setTextFormat(Qt.RichText); logo_text.addWidget(brand)
         version = QLabel(f"DESKTOP  \u00b7  v{__version__}"); self.version_label = version; version.setObjectName("brandEdition"); version.setLayoutDirection(Qt.LeftToRight); logo_text.addWidget(version)
         self.engine_badge = QLabel(); self.engine_badge.setObjectName("engineBadge"); self.engine_badge.setTextFormat(Qt.RichText); logo_text.addWidget(self.engine_badge)
         brand_row.addLayout(logo_text, 1); logo_root.addLayout(brand_row)
-        switch = QFrame(); self.engine_switch = switch; switch.setObjectName("engineSwitch"); switch.setLayoutDirection(Qt.LeftToRight); switch_layout = QHBoxLayout(switch); switch_layout.setContentsMargins(3, 3, 3, 3); switch_layout.setSpacing(3); switch.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        switch = QFrame(); self.engine_switch = switch; switch.setObjectName("engineSwitch"); switch.setLayoutDirection(Qt.LeftToRight); switch_layout = QHBoxLayout(switch); switch_layout.setContentsMargins(2, 3, 2, 3); switch_layout.setSpacing(2); switch.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        switch.setStyleSheet("QPushButton#engineOption { padding-left: 2px; padding-right: 2px; }")
         from PySide6.QtWidgets import QButtonGroup
         self.engine_group = QButtonGroup(self); self.engine_group.setExclusive(True); self.engine_buttons = {}
-        for engine_key, icon_name, engine_label in ((ENGINE_XRAY, "server", "Xray"), (ENGINE_POW, "zap", "UAC\u00a0PoW")):
-            engine_icon = QIcon(); engine_icon.addPixmap(cyber_pixmap(icon_name, "#9fb4d8", 15), QIcon.Normal, QIcon.Off); engine_icon.addPixmap(cyber_pixmap(icon_name, "#031422", 15), QIcon.Normal, QIcon.On)
-            option = QPushButton(engine_label); option.setObjectName("engineOption"); option.setCheckable(True); option.setCursor(Qt.PointingHandCursor); option.setIcon(engine_icon); option.setIconSize(QSize(15, 15)); option.setProperty("engine", engine_key)
+        modes = ((ENGINE_XRAY, "Xray"), (ENGINE_POW, "UAC\u00a0PoW"), (ENGINE_DIRECT, "UAC\u00a0Direct"))
+        for (engine_key, engine_label), stretch in zip(modes, _layout.ENGINE_SWITCH_STRETCH):
+            option = QPushButton(engine_label); option.setObjectName("engineOption"); option.setCheckable(True); option.setCursor(Qt.PointingHandCursor); option.setProperty("engine", engine_key)
+            option.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             option.clicked.connect(lambda _checked=False, key=engine_key: self._engine_option_clicked(key))
-            self.engine_group.addButton(option); self.engine_buttons[engine_key] = option; switch_layout.addWidget(option, 1)
+            self.engine_group.addButton(option); self.engine_buttons[engine_key] = option; switch_layout.addWidget(option, stretch)
         self.engine_thumb = _eswitch.EngineThumb(switch, _engine_thumb_palettes()); self.engine_thumb.lower(); switch.installEventFilter(self)
         logo_root.addWidget(switch); side.addWidget(logo); side.addSpacing(14)
+        def navigation_button(icon_name, persian, english):
+            button = self._bind_text(NavButton(parent=sidebar), persian, english)
+            button.setIcon(cyber_icon(self._nav_icon(icon_name), "#9fb4d8", _layout.NAV_ICON))
+            button.setIconSize(QSize(_layout.NAV_ICON, _layout.NAV_ICON))
+            button.setProperty("iconName", icon_name)
+            button.hide()
+            return button
+
         self.nav = []
-        entries = [("home", "خانه", "Home"), ("file-cog", "کانفیگ‌ها", "Configs"), ("sparkles", "سازنده کانفیگ اس‌ان‌آی", "SNI Maker"), ("flask", "آزمایشگاه اس‌ان‌آی", "SNI Lab"), ("activity", "لاگ زنده", "Live Logs"), ("shield", "عبور مستقیم برنامه‌ها", "App Bypass"), ("wrench", "ابزارها", "Tools"), ("zap", "یو‌ای‌سی پاو", "UAC PoW"), ("headphones", "پشتیبانی", "Support")]
-        self.nav_meta = []
+        entries = (
+            ("home", "خانه", "Home"),
+            ("file-cog", "کانفیگ‌ها", "Configs"),
+            ("sparkles", "سازنده SNI", "SNI Maker"),
+            ("flask", "آزمایشگاه SNI", "SNI Lab"),
+            ("activity", "لاگ زنده", "Live Logs"),
+            ("shield", "عبور مستقیم برنامه‌ها", "App Bypass"),
+            ("wrench", "ابزارها", "Tools"),
+            ("zap", "یو‌ای‌سی پاو", "UAC PoW"),
+            ("headphones", "پشتیبانی", "Support"),
+            ("settings", "تنظیمات کلی", "Global Settings"),
+            ("pow-settings", "تنظیمات PoW", "PoW Settings"),
+            ("direct-settings", "تنظیمات Direct", "Direct Settings"),
+        )
         for index, (icon_name, name, english) in enumerate(entries):
-            button = NavButton(english if self.language == "en" else name); button.setIcon(cyber_icon(icon_name, "#9fb4d8", 22)); button.setIconSize(QSize(22, 22)); button.setProperty("iconName", icon_name); button.clicked.connect(lambda _, i=index: self.show_page(i)); side.addWidget(button); self.nav.append(button)
-            self.nav_meta.append((icon_name, name, english))
+            button = navigation_button(icon_name, name, english)
+            button.clicked.connect(lambda _, i=index: self.show_page(i))
+            self.nav.append(button)
+        self.xray_settings_button = navigation_button("xray-settings", "تنظیمات Xray", "Xray Settings")
+        self.xray_settings_button.setCheckable(False)
+        self.xray_settings_button.clicked.connect(self.open_tuning)
+        ordered_nav = (*self.nav[:7], self.nav[self.GLOBAL_SETTINGS_PAGE],
+                       self.nav[self.POW_SETTINGS_PAGE], self.nav[self.DIRECT_SETTINGS_PAGE],
+                       self.xray_settings_button, self.nav[8])
+        for button in ordered_nav:
+            side.addWidget(button)
+        for first, second in zip(ordered_nav, ordered_nav[1:]):
+            self.setTabOrder(first, second)
+        self.sidebar_compact_spacer = QWidget(sidebar)
+        self.sidebar_compact_spacer.setFixedHeight(_layout.COMPACT_NAV_SPACER)
+        side.addWidget(self.sidebar_compact_spacer)
         side.addStretch()
         self.rating_card = QFrame(); self.rating_card.setObjectName("ratingCard"); self.rating_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed); rating_layout = QVBoxLayout(self.rating_card); rating_layout.setContentsMargins(15, 13, 15, 13); rating_layout.setSpacing(4)
         self.rating_title = self._bind_text(QLabel(), "از برنامه راضی هستید؟", "Enjoying the app?"); self.rating_title.setObjectName("ratingTitle")
@@ -3132,16 +3262,20 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.language_button = QPushButton("English"); self.language_button.setObjectName("footerAction"); self.language_button.setFixedHeight(40); self.language_button.setIcon(cyber_icon("globe", "#9fb4d8", 19)); self.language_button.setIconSize(QSize(19, 19)); self.language_button.clicked.connect(self.toggle_language); footer_layout.addWidget(self.language_button)
         self.data_button = QPushButton(); self.data_button.setObjectName("footerAction"); self._bind_text(self.data_button, "باز کردن پوشه داده‌ها", "Open Data Folder"); self.data_button.setFixedHeight(40); self.data_button.setIcon(cyber_icon("folder", "#9fb4d8", 19)); self.data_button.setIconSize(QSize(19, 19)); self.data_button.clicked.connect(lambda: os.startfile(DATA_DIR)); footer_layout.addWidget(self.data_button); side.addWidget(footer)
         layout.addWidget(sidebar)
-        content_shell = QFrame(); content_shell.setObjectName("contentShell"); content_layout = QVBoxLayout(content_shell); content_layout.setContentsMargins(0, 0, 0, 0); content_layout.setSpacing(0)
+        content_shell = QFrame(); self.content_shell = content_shell; content_shell.setObjectName("contentShell"); content_layout = QVBoxLayout(content_shell); content_layout.setContentsMargins(0, 0, 0, 0); content_layout.setSpacing(0)
         self.stack = QStackedWidget(); self.stack.setObjectName("content"); content_layout.addWidget(self.stack, 1)
         activity_wrap = QFrame(); self.activity_wrap = activity_wrap; activity_wrap.setObjectName("activityWrap"); activity_layout = QVBoxLayout(activity_wrap); self.activity_layout = activity_layout; activity_layout.setContentsMargins(30, 0, 30, 18)
         self.activity_bar = ActivityBar(self.language); activity_layout.addWidget(self.activity_bar); content_layout.addWidget(activity_wrap)
         layout.addWidget(content_shell, 1)
         pages = [self._home_page(), self._configs_page(), self._sni_maker_page(), self._scanner_page(), self._logs_page(),
                  self._apps_page(), self._tools_page(), self._pow_page(), self._support_page()]
+        self.global_settings_page = SharedGlobalSettings(self)
+        pages.extend((self.global_settings_page, self.pow_controller.build_settings_page(),
+                      self.direct_controller.build_settings_page()))
         for page, object_name in zip(pages, (
                 "homePage", "configsPage", "sniMakerPage", "sniLabPage",
-                "liveLogsPage", "appBypassPage", "toolsPage", "powPage", "supportPage")):
+                "liveLogsPage", "appBypassPage", "toolsPage", "powPage", "supportPage",
+                "globalSettingsPage", "powSettingsPage", "directSettingsPage")):
             page.setObjectName(object_name)
             self.stack.addWidget(page)
         for widget, object_name in (
@@ -3165,34 +3299,50 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.show_page(0)
 
     def _home_page(self):
-        page = QWidget(); self.home_page = page; root = QVBoxLayout(page); self.home_root = root; root.setContentsMargins(26, 18, 26, 14); root.setSpacing(12)
+        page, body = self._scroll_page()
+        self.home_page = page
+        root = QVBoxLayout(body); self.home_root = root; root.setContentsMargins(26, 18, 26, 14); root.setSpacing(12)
         self.status_pill = StatusPill(self.language)
         self.wizard_restart_btn = None
-        self.home_header = self._page_header("کنترل اتصال", "Connection Center", f"نسخه دسکتاپ با استفاده از {ltr_isolate('Xray')}، پروکسی سیستم ویندوز و هسته {ltr_isolate('Patterniha Wrong-Sequence')}", "Desktop engine powered by Xray, Windows System Proxy and native TLS fragmentation", self.status_pill); root.addWidget(self.home_header)
+        self.home_header = self._page_header("کنترل اتصال", "Connection Center", f"{ltr_isolate('Xray')}، پروکسی ویندوز و فرگمنت {ltr_isolate('TLS')}", "Xray with Windows proxy and TLS fragmentation", self.status_pill); root.addWidget(self.home_header)
         self._install_wizard_restart_button()
         hero = HeroCard(); self.hero_card = hero; hero.setMinimumHeight(318); hero_layout = QHBoxLayout(hero); self.hero_layout = hero_layout; hero_layout.setContentsMargins(38, 28, 34, 28); hero_layout.setSpacing(34)
         hero_copy = QVBoxLayout(); self.hero_copy_layout = hero_copy; hero_copy.setSpacing(9)
         eyebrow = QHBoxLayout(); eyebrow.setSpacing(9); eyebrow_icon = QLabel(); eyebrow_icon.setPixmap(cyber_pixmap("lock", "#23f5e0", 18)); eyebrow_icon.setFixedSize(20, 20)
         self.hero_badge = self._bind_text(QLabel(), "تونل امن دسکتاپ", "SECURE DESKTOP TUNNEL"); self.hero_badge.setObjectName("heroBadge")
-        eyebrow.addWidget(eyebrow_icon); eyebrow.addWidget(self.hero_badge); eyebrow.addStretch(); hero_copy.addLayout(eyebrow)
+        eyebrow.addWidget(eyebrow_icon); eyebrow.addWidget(self.hero_badge, 1); hero_copy.addLayout(eyebrow)
         self.status = QLabel(f"{ltr_isolate('VPN')} خاموش است"); self.status.setObjectName("heroStatus"); self.status.setWordWrap(True); self.status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); hero_copy.addWidget(self.status)
         self.connection_hint = QLabel("آماده اتصال"); self.connection_hint.setObjectName("heroHint"); self.connection_hint.setWordWrap(True); self.connection_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); hero_copy.addWidget(self.connection_hint)
         hero_copy.addStretch()
-        self.connect_button = GlowButton("اتصال"); self.connect_button.setObjectName("connectButton"); self.connect_button.setProperty("i18nFa", "اتصال"); self.connect_button.setProperty("i18nEn", "Connect"); self.connect_button.setProperty("state", "idle"); self.connect_button.setIcon(cyber_icon("play", "#031422", 21)); self.connect_button.setIconSize(QSize(21, 21)); self.connect_button.setMinimumSize(216, 60); self.connect_button.setMaximumWidth(260); self.connect_button.setCursor(Qt.PointingHandCursor); hero_copy.addWidget(self.connect_button)
+        self.connect_button = GlowButton("اتصال"); self.connect_button.setObjectName("connectButton"); self.connect_button.setProperty("i18nFa", "اتصال"); self.connect_button.setProperty("i18nEn", "Connect"); self.connect_button.setProperty("state", "idle"); self.connect_button.setIcon(cyber_icon("play", "#031422", 21)); self.connect_button.setIconSize(QSize(21, 21)); self.connect_button.setMinimumSize(216, 60); self.connect_button.setMaximumWidth(260); self.connect_button.setCursor(Qt.PointingHandCursor)
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        actions.addWidget(self.connect_button)
+        self.pause_button = self._action_button("مکث", "Pause", "pause", "secondaryAction")
+        self.pause_button.setMinimumSize(94, 44)
+        self.pause_button.clicked.connect(self._toggle_pause_action)
+        self.pause_button.hide()
+        actions.addWidget(self.pause_button)
+        actions.addStretch(1)
+        hero_copy.addLayout(actions)
         hero_layout.addLayout(hero_copy, 3)
         orb_shell = QFrame(); self.orb_shell = orb_shell; orb_shell.setObjectName("orbShell"); orb_shell.setMinimumWidth(284); orb_layout = QVBoxLayout(orb_shell); orb_layout.setContentsMargins(18, 8, 18, 10); orb_layout.setSpacing(2)
         self.orb = ConnectionOrb(); orb_caption = QLabel("NETWORK CORE"); self.orb_caption = orb_caption; orb_caption.setObjectName("orbCaption"); orb_caption.setAlignment(Qt.AlignCenter); orb_layout.addWidget(self.orb, alignment=Qt.AlignCenter); orb_layout.addWidget(orb_caption)
+        self.hero_card.orb = self.orb
         hero_layout.addWidget(orb_shell, 2, Qt.AlignCenter); root.addWidget(hero)
 
         self.country_card = QFrame(); self.country_card.setObjectName("countrySelectorCard"); self.country_card.setMinimumHeight(104)
         country_layout = QHBoxLayout(self.country_card); self.country_layout = country_layout; country_layout.setContentsMargins(16, 10, 16, 10); country_layout.setSpacing(12)
         country_icon = QLabel(); self.country_icon = country_icon; country_icon.setObjectName("countryIcon"); country_icon.setFixedSize(46, 46); country_icon.setAlignment(Qt.AlignCenter); country_icon.setPixmap(cyber_pixmap("globe", "#78fff0", 24)); country_layout.addWidget(country_icon, 0, Qt.AlignVCenter)
-        country_copy = QVBoxLayout(); country_copy.setSpacing(3)
+        country_copy = QVBoxLayout(); country_copy.setSpacing(3); country_copy.setAlignment(Qt.AlignVCenter)
         self.country_eyebrow = self._bind_text(QLabel(), "انتخاب هوشمند مسیر", "SMART ROUTE SELECTION"); self.country_eyebrow.setObjectName("countryEyebrow")
         self.country_title = self._bind_text(QLabel(), "کشور خروجی", "Exit country"); self.country_title.setObjectName("countryTitle")
         self.country_description = self._bind_text(QLabel(), "با انتخاب کشور، فقط کانفیگ‌های سالم همان کشور دوباره تست می‌شوند و بهترین مورد متصل می‌شود.", "Choose a country to retest its verified configs and connect the best route."); self.country_description.setObjectName("countryDescription"); self.country_description.setWordWrap(True)
+        for label, height in zip((self.country_eyebrow, self.country_title, self.country_description), _layout.COUNTRY_TEXT_HEIGHTS):
+            label.setFixedHeight(height)
         country_copy.addWidget(self.country_eyebrow); country_copy.addWidget(self.country_title); country_copy.addWidget(self.country_description); country_layout.addLayout(country_copy, 1)
-        country_actions = QVBoxLayout(); self.country_actions = country_actions; country_actions.setSpacing(5)
+        self.country_actions_widget = QWidget(self.country_card)
+        country_actions = QVBoxLayout(self.country_actions_widget); self.country_actions = country_actions; country_actions.setContentsMargins(0, 0, 0, 0); country_actions.setSpacing(5)
         self.country_count = QLabel(); self.country_count.setObjectName("countryCount"); self.country_count.setAlignment(Qt.AlignCenter)
         self.route_source_tabs = QTabBar(); self.route_source_tabs.setObjectName("routeSourceTabs"); self.route_source_tabs.setExpanding(True); self.route_source_tabs.setDrawBase(False)
         self.route_source_tabs.addTab(self.tr("پیشنهادی", "Suggested")); self.route_source_tabs.addTab("User Config")
@@ -3204,46 +3354,50 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.original_configs_label = QLabel("UAC Spoof Original Configs"); self.original_configs_label.setObjectName("originalConfigsLabel"); self.original_configs_label.setMinimumWidth(300); self.original_configs_label.setMinimumHeight(48); self.original_configs_label.setAlignment(Qt.AlignCenter); self.original_configs_label.setLayoutDirection(Qt.LeftToRight)
         country_actions.addLayout(source_row); country_actions.addWidget(self.country_combo); country_actions.addWidget(self.original_configs_label)
         from .pow_ui import PowExitSelector; self.pow_country_button = PowExitSelector(); self.pow_country_button.setAccessibleName("PoW exit country"); self.pow_country_button.clicked.connect(self._open_pow_country_picker); self.pow_country_button.setVisible(False)
-        country_actions.addWidget(self.pow_country_button); country_layout.addLayout(country_actions)
+        country_actions.addWidget(self.pow_country_button); country_layout.addWidget(self.country_actions_widget)
         self._refresh_country_selector()
         root.addWidget(self.country_card)
 
-        self.metrics_layout = QGridLayout(); self.metrics_layout.setSpacing(14)
-        self.active_profile = ElidedLabel("—"); self.active_profile.setStyleSheet("font-family: 'Inter', 'Vazirmatn UI FD', 'Segoe UI';"); self.route_card = MetricCard(self.tr("مسیر فعال", "Active Route"), "route", self.active_profile); self.route_card.title.setProperty("i18nFa", "مسیر فعال"); self.route_card.title.setProperty("i18nEn", "Active Route"); self.route_card.setMinimumWidth(200)
-        self.route_detail = self.route_card.secondary; self.route_detail.setWordWrap(True)
-        from .route_card import RouteDetails
-        self.route_details = RouteDetails(); self.route_card.card_layout.insertWidget(self.route_card.card_layout.indexOf(self.route_card.secondary), self.route_details)
-        self.ping_label = QLabel("—"); self.latency_card = MetricCard(self.tr("پینگ", "Latency"), "gauge", self.ping_label); self.latency_card.title.setProperty("i18nFa", "پینگ"); self.latency_card.title.setProperty("i18nEn", "Latency"); self.latency_card.enable_sparkline(True)
-        self.up_label = QLabel("0 B"); self.upload_card = MetricCard(self.tr("آپلود", "Upload"), "upload", self.up_label); self.upload_card.title.setProperty("i18nFa", "آپلود"); self.upload_card.title.setProperty("i18nEn", "Upload")
-        self.down_label = QLabel("0 B"); self.download_card = MetricCard(self.tr("دانلود", "Download"), "download", self.down_label); self.download_card.title.setProperty("i18nFa", "دانلود"); self.download_card.title.setProperty("i18nEn", "Download")
-        self.ip_label = QLabel("—"); self.ip_flag = QLabel(); self.ip_flag.setFixedSize(22, 16); self.ip_flag.setVisible(False)
-        self.ip_card = MetricCard(self.tr("آی‌پی عمومی", "Public IP"), "map-pin", self.ip_label); self.ip_card.title.setProperty("i18nFa", "آی‌پی عمومی"); self.ip_card.title.setProperty("i18nEn", "Public IP")
-        self.ip_card.card_layout.itemAt(0).layout().addWidget(self.ip_flag, 0, Qt.AlignVCenter)
-        self.ip_parallel = ParallelBadge(); self.ip_card.card_layout.insertWidget(self.ip_card.card_layout.indexOf(self.ip_card.secondary) + 1, self.ip_parallel)
-        for _numeric_label in (self.ping_label, self.up_label, self.down_label, self.ip_label): _numeric_label.setProperty("numeric", True)
-        # icon-only refresh in the card header (the old full-width button clipped the card)
-        self.ip_button = QPushButton(); self.ip_button.setObjectName("ipRefreshBtn"); self.ip_button.setCursor(Qt.PointingHandCursor)
-        self.ip_button.setIcon(cyber_icon("refresh", "#23f5e0", 16)); self.ip_button.setIconSize(QSize(16, 16)); self.ip_button.setFixedSize(30, 30)
-        self.ip_button.setToolTip(self.tr("بررسی IP", "Check IP")); self.ip_button.setAccessibleName("Check IP")
-        self.ip_button.setStyleSheet("QPushButton#ipRefreshBtn { background: rgba(35,245,224,0.08); border: 1px solid rgba(35,245,224,0.30); border-radius: 15px; }"
-                                     "QPushButton#ipRefreshBtn:hover { background: rgba(35,245,224,0.18); }"
-                                     "QPushButton#ipRefreshBtn:disabled { border-color: rgba(255,255,255,0.10); background: transparent; }")
-        self.ip_button.clicked.connect(self.check_ip); self.ip_card.card_layout.itemAt(0).layout().addWidget(self.ip_button, 0, Qt.AlignVCenter)
+        self.network_metrics = SharedNetworkMetrics(self.tr, _animations_enabled)
+        self.metric_cards = self.network_metrics.cards
+        self.route_card, self.latency_card, self.upload_card, self.download_card, self.ip_card = self.metric_cards
+        self.active_profile, self.ping_label, self.up_label, self.down_label, self.ip_label = (
+            card.value for card in self.metric_cards
+        )
+        self.ip_flag = QLabel()
+        self.ip_flag.setFixedSize(22, 16)
+        policy = self.ip_flag.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.ip_flag.setSizePolicy(policy)
+        self.ip_flag.hide()
+        self.ip_card.readout.addWidget(self.ip_flag)
+        self.ip_parallel = ParallelBadge()
+        self.ip_card.caption.addWidget(self.ip_parallel)
+        self.ip_button = self.network_metrics.ip_refresh
+        self.ip_button.setToolTip(self.tr("بررسی IP", "Check IP"))
+        self.ip_button.clicked.connect(self.check_ip)
         from .ip_info import ClickableCard
         self._ip_click = ClickableCard(self.ip_card, self._open_ip_details)
-        self.metric_cards = [self.route_card, self.latency_card, self.upload_card, self.download_card, self.ip_card]
-        root.addLayout(self.metrics_layout)
+        self.metrics_slot = QWidget()
+        slot = QVBoxLayout(self.metrics_slot)
+        slot.setContentsMargins(0, 0, 0, 0)
+        slot.addWidget(self.network_metrics, alignment=Qt.AlignVCenter)
+        root.addWidget(self.metrics_slot)
 
-        controls = QFrame(); self.quick_controls = controls; controls.setObjectName("quickControls"); self.controls_layout = QGridLayout(controls); self.controls_layout.setContentsMargins(13, 9, 13, 9); self.controls_layout.setHorizontalSpacing(9); self.controls_layout.setVerticalSpacing(7)
+        controls = QFrame(); self.quick_controls = controls; controls.setObjectName("quickControls")
+        self.controls_layout = QuickControlsGrid(controls)
         self.auto_mode = ToggleSwitch(); self.auto_mode.setChecked(self.storage.settings.get("auto_mode", True)); self.auto_option = self._toggle_option(self.auto_mode, "حالت خودکار", "Auto Mode")
-        self.pick_best = ToggleSwitch(); self.pick_best.setChecked(self.storage.settings.get("pick_best", False)); self.manual_option = self._toggle_option(self.pick_best, "انتخاب بهترین کانفیگ از لیست", "Pick Best in List")
-        self.proxy_mode = ToggleSwitch(); self.proxy_mode.setChecked(self.storage.settings.get("proxy_mode", True)); self.proxy_option = self._toggle_option(self.proxy_mode, "پروکسی ویندوز", "Windows Proxy")
+        self.pick_best = ToggleSwitch(); self.pick_best.setChecked(self.storage.settings.get("pick_best", False))
+        self.manual_option = self._toggle_option(
+            self.pick_best, "انتخاب بهترین کانفیگ از لیست", "Pick Best in List", word_wrap=True,
+        )
+        self.proxy_mode = ToggleSwitch(); self.proxy_mode.setChecked(self._proxy_mode_enabled()); self.proxy_option = self._toggle_option(self.proxy_mode, "پروکسی ویندوز", "Windows Proxy")
         self.proxy_option.setObjectName("proxyModeOption"); self.proxy_option.setProperty("active", self.proxy_mode.isChecked())
         self.proxy_mode.setToolTip(self.tr(
             "خاموش: هسته اسپوف فعال می‌ماند و فقط پروکسی سیستم ویندوز اعمال نمی‌شود.",
             "Off: the spoof core stays active; only Windows System Proxy is skipped.",
         ))
-        self.tun_mode = ToggleSwitch(); self.tun_mode.setChecked(self.storage.settings.get("tun_mode", False)); self.tun_option = self._toggle_option(self.tun_mode, "حالت TUN", "TUN Mode")
+        self.tun_mode = ToggleSwitch(); self.tun_mode.setChecked(self._tun_mode_enabled()); self.tun_option = self._toggle_option(self.tun_mode, "حالت TUN", "TUN Mode")
         self.tun_option.setObjectName("tunModeOption"); self.tun_option.setProperty("active", self.tun_mode.isChecked())
         self.tun_mode.setToolTip(self.tr(
             "تمام ترافیک TCP و UDP ویندوز را از sing-box و هسته اسپوف عبور می‌دهد؛ پینگ CMD مستقیم و واقعی می‌ماند.",
@@ -3254,16 +3408,16 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.gateway_devices_badge = QToolButton()
         self.gateway_devices_badge.setObjectName("gatewayDevicesBadge")
         self.gateway_devices_badge.setText("0")
-        self.gateway_devices_badge.setIcon(cyber_icon("wifi", "#72eee7", 14))
-        self.gateway_devices_badge.setIconSize(QSize(14, 14))
-        self.gateway_devices_badge.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.gateway_devices_badge.setIcon(QIcon(_raw_cyber_pixmap(
+            "wifi", _quick_controls.PALETTES[ENGINE_XRAY]["muted_icon"], 16, lucide=True,
+        )))
+        self.gateway_devices_badge.setIconSize(QSize(16, 16))
+        self.gateway_devices_badge.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.gateway_devices_badge.setCursor(Qt.PointingHandCursor)
         self.gateway_devices_badge.setFixedHeight(26)
-        self.gateway_devices_badge.setMinimumWidth(50)
-        self.gateway_devices_badge.setMaximumWidth(76)
         self.gateway_devices_badge.setAccessibleName("Mobile Gateway connected devices")
-        self.gateway_option.layout().addWidget(
-            self.gateway_devices_badge, 0, Qt.AlignVCenter
+        self.gateway_option.layout().insertWidget(
+            0, self.gateway_devices_badge, 0, Qt.AlignVCenter
         )
         self.gateway_devices_popup = GatewayDevicesPopup(self.language, self)
         self.gateway_devices_badge.clicked.connect(
@@ -3274,41 +3428,72 @@ class MainWindow(LogsPageMixin, QMainWindow):
             "One click routes mobile internet through this computer and the verified tunnel.",
         ))
         self.proxy_option.setEnabled(not self.tun_mode.isChecked())
-        self.carrier = QComboBox(); self.carrier.setObjectName("carrierModeCombo"); self.carrier.addItems(["auto", "mci", "irancell"]); self.carrier.setCurrentText(self.storage.tuning.carrier_mode); self.carrier.setMinimumWidth(100); self.carrier.setMaximumWidth(120); self.carrier.setAccessibleName("Carrier")
+        self.carrier = QuickCarrierCombo(); self.carrier.setObjectName("carrierModeCombo"); self.carrier.addItems(["auto", "mci", "irancell"]); self.carrier.setCurrentText(self.storage.tuning.carrier_mode); self.carrier.setMinimumWidth(100); self.carrier.setMaximumWidth(120); self.carrier.setAccessibleName("Carrier")
         self.carrier_control = QFrame(); self.carrier_control.setObjectName("carrierControl"); self.carrier_control.setMinimumWidth(190); self.carrier_control.setMaximumWidth(220); carrier_layout = QHBoxLayout(self.carrier_control); self.carrier_layout = carrier_layout; carrier_layout.setContentsMargins(7, 3, 7, 3); carrier_layout.setSpacing(6); self.carrier_label = self._bind_text(QLabel(), "اپراتور", "Carrier"); self.carrier_label.setObjectName("controlLabel"); carrier_layout.addWidget(self.carrier_label); carrier_layout.addWidget(self.carrier)
-        self.tune_button = self._action_button("تنظیمات پیشرفته", "Advanced Settings", "settings", "advancedButton"); self.tune_button.setProperty("chevron", True); self.tune_button.setIconSize(QSize(19, 19)); self.tune_button.clicked.connect(self.open_tuning)
-        root.addWidget(controls)
+        self.tune_button = self._action_button("تنظیمات پیشرفته", "Advanced Settings", "settings", "advancedButton",
+                                               button_type=QuickSettingsButton)
+        self.tune_button.setProperty("chevron", True)
+        self.tune_button.setIconSize(QSize(19, 19))
+        self.tune_button.clicked.connect(self.open_tuning)
+        self.quick_controls_header = QWidget(controls)
+        self.quick_controls_header.setFixedHeight(_layout.QUICK_HEADER_HEIGHT)
+        heading = QHBoxLayout(self.quick_controls_header)
+        heading.setContentsMargins(0, 0, 0, 0)
+        heading.setSpacing(7)
+        self.quick_controls_icon = QLabel()
+        heading.addWidget(self.quick_controls_icon)
+        title = self._bind_text(QLabel(), "تنظیمات سریع", "Quick settings")
+        title.setObjectName("quickControlsTitle")
+        heading.addWidget(title)
+        heading.addStretch()
+        stamp = self.quick_controls_stamp = QLabel()
+        stamp.setObjectName("quickControlsStamp")
+        stamp_font = stamp.font()
+        stamp_font.setLetterSpacing(QFont.AbsoluteSpacing, 1.1)
+        stamp.setFont(stamp_font)
+        heading.addWidget(stamp)
+        self._quick_tiles = []
+        for option, toggle, names, color in (
+            (self.auto_option, self.auto_mode, {ENGINE_XRAY: "zap", ENGINE_POW: "shield", ENGINE_DIRECT: "globe"}, "icon"),
+            (self.manual_option, self.pick_best, {ENGINE_XRAY: "trending-up"}, "muted_icon"),
+            (self.proxy_option, self.proxy_mode, dict.fromkeys(_quick_controls.PALETTES, "layout-grid"), "icon"),
+            (self.tun_option, self.tun_mode, {ENGINE_XRAY: "shield", ENGINE_POW: "square-arrow-right", ENGINE_DIRECT: "shield"}, "muted_icon"),
+            (self.gateway_option, self.gateway_mode, {ENGINE_POW: "layout-grid"}, "muted_icon"),
+            (self.carrier_control, None, {ENGINE_XRAY: "signal", ENGINE_POW: "brick-wall"}, "icon"),
+        ):
+            icon = QLabel(option)
+            icon.setAttribute(Qt.WA_TransparentForMouseEvents)
+            icon.setFixedSize(16, 16)
+            option.layout().insertWidget(0, icon)
+            self._quick_tiles.append((option, toggle, icon, names, color))
+        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option,
+                       self.gateway_option, self.carrier_control, self.tune_button):
+            option.setParent(controls)
+            option.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.carrier_control.setMinimumWidth(0)
+        self.carrier_control.setMaximumWidth(16777215)
+        self.quick_controls_slot = QWidget()
+        self.quick_controls_slot.setFixedHeight(_layout.QUICK_SLOT_HEIGHT)
+        slot = QVBoxLayout(self.quick_controls_slot)
+        slot.setContentsMargins(0, 0, 0, 0)
+        slot.addWidget(controls, 0, Qt.AlignTop)
+        root.addWidget(self.quick_controls_slot)
         self._layout_home_dashboard()
         return page
-
-    def _layout_metric_cards(self, compact):
-        if not hasattr(self, "metrics_layout") or self._metrics_compact == compact:
-            return
-        self._metrics_compact = compact
-        while self.metrics_layout.count():
-            self.metrics_layout.takeAt(0)
-        for column in range(6):
-            self.metrics_layout.setColumnStretch(column, 0)
-        self.metrics_layout.setSpacing(8 if compact else 12)
-        for column, card_widget in enumerate(self.metric_cards):
-            card_widget.set_compact(compact)
-            card_widget.setMinimumWidth(180 if column == 0 and compact else 200 if column == 0 else 96)
-            self.metrics_layout.addWidget(card_widget, 0, column)
-            self.metrics_layout.setColumnStretch(column, 3 if column in (0, len(self.metric_cards) - 1) else 2)
 
     def _layout_hero(self, compact):
         if not hasattr(self, "hero_layout"):
             return
         self.hero_layout.setDirection(QBoxLayout.LeftToRight)
         self.hero_card.setProperty("compact", bool(compact))
-        self.hero_layout.setContentsMargins(*(18, 12, 18, 12) if compact else (32, 22, 28, 22))
+        margins = (18, 12, 18, 12) if compact else (32, 22, 28, 22)
+        self.hero_layout.setContentsMargins(*margins)
         self.hero_layout.setSpacing(18 if compact else 30)
         self.hero_copy_layout.setSpacing(5 if compact else 9)
         self.orb_shell.setMinimumWidth(160 if compact else 270)
         self.orb_shell.setMaximumWidth(190 if compact else 330)
         self._fit_orb(compact)
-        self.connect_button.setMinimumSize(176 if compact else 216, 46 if compact else 56)
-        self.connect_button.setMaximumHeight(46 if compact else 56)
+        self.connect_button.setFixedSize(176 if compact else 216, _layout.CONNECT_HEIGHT)
         _restyle(self.hero_card)
 
     def _fit_orb(self, compact):
@@ -3320,8 +3505,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             hero_height = max(self.hero_card.height(), 178)
         shell_layout = self.orb_shell.layout()
         shell_margins = shell_layout.contentsMargins()
-        caption = getattr(self, "orb_caption", None)
-        caption_height = caption.sizeHint().height() if caption is not None else 14
+        caption_height = self.orb_caption.minimumHeight()
         available_height = (
             hero_height - hero_margins.top() - hero_margins.bottom()
             - shell_margins.top() - shell_margins.bottom()
@@ -3345,105 +3529,100 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if not hasattr(self, "controls_layout") or self._controls_compact == compact:
             return
         self._controls_compact = compact
-        while self.controls_layout.count():
-            self.controls_layout.takeAt(0)
-        for column in range(8):
-            self.controls_layout.setColumnStretch(column, 0)
-        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option, self.gateway_option):
-            option.layout().setContentsMargins(7, 5, 7, 5)
-            option.layout().setSpacing(7)
-        pow_bar = getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW
-        if compact and pow_bar:
-            # No Optimized on the PoW bar: two even halves on the first row.
-            self.controls_layout.addWidget(self.auto_option, 0, 0, 1, 2)
-            self.controls_layout.addWidget(self.gateway_option, 0, 2, 1, 2)
-        elif compact:
-            self.controls_layout.addWidget(self.auto_option, 0, 0)
-            self.controls_layout.addWidget(self.manual_option, 0, 1, 1, 2)
-            self.controls_layout.addWidget(self.gateway_option, 0, 3)
-        if compact:
-            self.controls_layout.addWidget(self.proxy_option, 1, 0)
-            self.controls_layout.addWidget(self.tun_option, 1, 1)
-            self.controls_layout.addWidget(self.carrier_control, 1, 2)
-            self.controls_layout.addWidget(self.tune_button, 1, 3)
-            self.controls_layout.setColumnStretch(0, 1)
-            self.controls_layout.setColumnStretch(1, 1)
-            self.controls_layout.setColumnStretch(2, 1)
-            self.controls_layout.setColumnStretch(3, 1)
-            self.tune_button.setMaximumWidth(16777215)
-        elif pow_bar:
-            self.controls_layout.addWidget(self.auto_option, 0, 0)
-            self.controls_layout.addWidget(self.gateway_option, 0, 1)
-            self.controls_layout.addWidget(self.proxy_option, 0, 2)
-            self.controls_layout.addWidget(self.tun_option, 0, 3)
-            self.controls_layout.addWidget(self.carrier_control, 0, 4)
-            self.controls_layout.setColumnStretch(6, 1)
-            self.controls_layout.addWidget(self.tune_button, 0, 7)
+        grid = self.controls_layout
+        mode = self.engine_mode
+        direct = mode == ENGINE_DIRECT
+        palette = _quick_controls.PALETTES[mode]
+        while grid.count():
+            grid.takeAt(0)
+        if direct:
+            rows = ((self.auto_option, self.proxy_option, self.tun_option, self.tune_button),)
+        elif mode == ENGINE_POW:
+            rows = ((self.auto_option, self.gateway_option, self.carrier_control),
+                    (self.proxy_option, self.tun_option, self.tune_button))
         else:
-            self.controls_layout.addWidget(self.auto_option, 0, 0)
-            self.controls_layout.addWidget(self.manual_option, 0, 1)
-            self.controls_layout.addWidget(self.proxy_option, 0, 2)
-            self.controls_layout.addWidget(self.tun_option, 0, 3)
-            self.controls_layout.addWidget(self.gateway_option, 0, 4)
-            self.controls_layout.addWidget(self.carrier_control, 0, 5)
-            self.controls_layout.setColumnStretch(6, 1)
-            self.controls_layout.addWidget(self.tune_button, 0, 7)
-            self.tune_button.setMaximumWidth(230)
+            rows = ((self.auto_option, self.manual_option, self.gateway_option),
+                    (self.proxy_option, self.tun_option, self.carrier_control, self.tune_button))
+        margins = _layout.DIRECT_QUICK_MARGINS if direct else _layout.QUICK_GRID_MARGINS
+        tile_height = _layout.DIRECT_QUICK_TILE_HEIGHT if direct else _layout.QUICK_TILE_HEIGHT
+        grid.equal_columns = len(rows[-1])
+        grid.setContentsMargins(*margins)
+        grid.setHorizontalSpacing(9 if direct else _layout.QUICK_GRID_GAP)
+        grid.setVerticalSpacing(7 if direct else _layout.QUICK_GRID_GAP)
+        self.quick_controls.setFixedHeight(_layout.QUICK_PANEL_HEIGHT if direct else _layout.QUICK_SLOT_HEIGHT)
+        for column in range(4):
+            grid.setColumnStretch(column, int(column < grid.equal_columns))
+        for option, toggle, icon, names, color in self._quick_tiles:
+            option.setFixedHeight(tile_height)
+            row = option.layout()
+            vertical = 2 if option is self.manual_option else 5
+            row.setContentsMargins(9, vertical, 9, vertical)
+            row.setSpacing(6)
+            if toggle is not None:
+                row.removeWidget(toggle)
+                row.addWidget(toggle)
+                toggle.set_quick_style(palette)
+            name = names.get(mode)
+            icon.setVisible(bool(name))
+            if name:
+                icon.setPixmap(_raw_cyber_pixmap(name, palette[color], 16, lucide=True))
+        self.carrier_layout.setStretch(self.carrier_layout.indexOf(self.carrier_label), 1)
+        self.carrier.setFixedSize(*_layout.QUICK_DROPDOWN_SIZE)
+        self.carrier.arrow_color = palette["icon"] if mode == ENGINE_XRAY else None
+        self.tune_button.setFixedHeight(tile_height)
+        self.tune_button.quick_palette = palette
+        self.quick_controls_stamp.setText(f"{mode.upper()} / CONTROL")
+        self.quick_controls_icon.setPixmap(_raw_cyber_pixmap("sliders", palette["icon"], 17, lucide=True))
+        self.tune_button.setIcon(QIcon(_raw_cyber_pixmap("settings", palette["icon"], 18, lucide=True)))
+        grid.addWidget(self.quick_controls_header, 0, 0, 1, grid.equal_columns)
+        for row, tiles in enumerate(rows, start=1):
+            column = 0
+            for tile in tiles:
+                span = 2 if mode == ENGINE_XRAY and tile is self.auto_option else 1
+                grid.addWidget(tile, row, column, 1, span)
+                column += span
 
     def _layout_home_dashboard(self, narrow=None, dense=None):
         if not hasattr(self, "home_root"):
             return
         narrow = self.width() < 1320 if narrow is None else bool(narrow)
-        stack_height = self.stack.height() if hasattr(self, "stack") and self.stack.height() > 100 else self.height() - 76
+        language = "en" if self.language == "en" else "fa"
+        stack_height = self.height() - _layout.ACTIVITY_HEIGHT[language] - 8
         dense = stack_height < 760 if dense is None else bool(dense)
-        margins = (14, 8, 14, 8) if dense else (26, 18, 26, 14)
-        spacing = 7 if dense else 12
-        self.home_root.setContentsMargins(*margins)
-        self.home_root.setSpacing(spacing)
+        layout = _layout.dashboard_layout(stack_height, narrow, dense)
+        self.home_root.setContentsMargins(*layout.margin)
+        self.home_root.setSpacing(layout.gap)
         self.home_root.setAlignment(Qt.AlignTop)
-        header_height = 88 if dense else 100
-        country_height = 104
-        metric_height = 116 if dense or narrow else 142
-        controls_height = 106
-        fixed = header_height + country_height + metric_height + controls_height + margins[1] + margins[3] + spacing * 4
-        hero_height = max(178, min(318, stack_height - fixed))
-        compact_hero = dense or hero_height < 250
-        self.home_header.setFixedHeight(header_height)
+        self.home_header.setFixedHeight(layout.header)
         self.home_header.setProperty("compact", dense)
         self.home_header.layout().setContentsMargins(*(13, 8, 13, 8) if dense else (19, 12, 19, 12))
-        header_icon = self.home_header.findChild(QLabel, "pageHeaderIcon")
-        if header_icon is not None:
-            header_icon.setFixedSize(*(42, 42) if dense else (54, 54))
-        self.hero_card.setFixedHeight(hero_height)
-        self._layout_hero(compact_hero)
+        self.home_header.findChild(QLabel, "pageHeaderIcon").setFixedSize(*(42, 42) if dense else (54, 54))
+        for name, height in zip(("pageEyebrow", "pageTitle", "pageSubtitle"), _layout.HEADER_TEXT_HEIGHTS[language][not dense]):
+            self.home_header.findChild(QLabel, name).setFixedHeight(height)
+        self.status_pill.setFixedSize(*_layout.STATUS_PILL_SIZE[language])
+        hint, caption = _layout.HERO_TEXT_HEIGHTS[language]
+        self.connection_hint.setFixedHeight(hint)
+        self.orb_caption.setFixedHeight(caption)
+        self.hero_card.setFixedHeight(layout.hero)
+        self._layout_hero(dense or layout.hero < 250)
         self.country_card.setVisible(True)
-        self.quick_controls.setVisible(True)
-        self.country_card.setFixedHeight(country_height)
+        self.country_card.setFixedHeight(layout.country)
         self.country_card.setProperty("compact", dense)
         self.country_layout.setContentsMargins(*(12, 7, 12, 7) if dense else (16, 10, 16, 10))
         self.country_layout.setSpacing(9 if dense else 12)
         self.country_icon.setFixedSize(*(40, 40) if dense else (46, 46))
-        self.country_actions.setDirection(QBoxLayout.TopToBottom)
+        self.country_actions_widget.setFixedWidth(340)
         self.country_combo.setMinimumWidth(210 if dense else 280)
         self.country_combo.setMaximumWidth(255 if dense else 340)
         self.country_combo.setFixedHeight(38 if dense else 42)
         self.country_count.setMaximumHeight(38 if dense else 28)
         _restyle(self.country_card)
-        self._layout_metric_cards(dense or narrow)
-        for card_widget in self.metric_cards:
-            card_widget.setFixedHeight(metric_height)
-        self.ip_button.setFixedSize(*((26, 26) if dense or narrow else (30, 30)))
+        self.metrics_slot.setFixedHeight(layout.metrics)
         self._layout_control_bar(True)
-        self.quick_controls.setFixedHeight(controls_height)
-        self.controls_layout.setContentsMargins(10, 5, 10, 5)
-        for option in (self.auto_option, self.manual_option, self.proxy_option, self.tun_option, self.gateway_option):
-            option.setFixedHeight(40)
-        self.carrier_layout.setContentsMargins(4, 3, 4, 3)
-        self.carrier_layout.setSpacing(4)
-        self.carrier.setFixedHeight(34)
-        self.carrier_control.setFixedHeight(42)
-        self.tune_button.setFixedHeight(42)
-        self.activity_layout.setContentsMargins(18 if dense else 30, 0, 18 if dense else 30, 8)
+        self.quick_controls_slot.setFixedHeight(layout.controls)
+        margin = 18 if dense else 30
+        self.activity_layout.setContentsMargins(margin, 0, margin, 8)
+        self.activity_bar.setFixedHeight(_layout.ACTIVITY_HEIGHT[language])
 
     def _layout_sni_maker(self):
         if not hasattr(self, "maker_root"):
@@ -3814,16 +3993,53 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _apps_page(self):
         page = QWidget(); root = QVBoxLayout(page); root.setContentsMargins(34, 28, 34, 26); root.setSpacing(14)
         self.process_count_label = QLabel("0 selected"); self.process_count_label.setObjectName("summaryPill"); self.process_count_label.setLayoutDirection(Qt.LeftToRight)
-        root.addWidget(self._page_header("عبور مستقیم برنامه‌ها", "App Bypass", "پردازه‌هایی را انتخاب کنید که در موتور Xray و UAC PoW مستقیم و خارج از تونل کار کنند", "Choose which running apps stay direct outside the tunnel on both Xray and UAC PoW", self.process_count_label))
+        root.addWidget(self._page_header(
+            "عبور مستقیم برنامه‌ها", "App Bypass",
+            "حالت مسیریابی و برنامه‌هایی را که برای VPN انتخاب می‌شوند، مدیریت کنید.",
+            "Manage the VPN routing policy and the apps selected for it.", self.process_count_label,
+        ))
+        self.app_routing_mode = SettingsSelect()
+        self.app_routing_mode.setMinimumWidth(280)
+        self.app_routing_mode.currentIndexChanged.connect(self._app_routing_changed)
+        policy = QFrame()
+        policy.setObjectName("pageToolbar")
+        policy_layout = QVBoxLayout(policy)
+        policy_layout.setContentsMargins(10, 3, 10, 3)
+        policy_layout.addWidget(SettingsRow(
+            self, ("مسیریابی برنامه‌ها", "App routing"),
+            ("حالت «فقط برنامه‌های انتخاب‌شده» در اتصال بعدی VPN با PoW یا Direct اعمال می‌شود.",
+             "Selected apps only applies to the next PoW or Direct VPN connection."),
+            self.app_routing_mode, icon="shield",
+        ))
+        root.addWidget(policy)
+        self._refresh_app_routing_mode()
         toolbar = QFrame(); toolbar.setObjectName("pageToolbar"); toolbar_layout = QHBoxLayout(toolbar); toolbar_layout.setContentsMargins(12, 9, 12, 9); toolbar_layout.setSpacing(10)
         search_wrap = QFrame(); search_wrap.setObjectName("searchWrap"); search_layout = QHBoxLayout(search_wrap); search_layout.setContentsMargins(10, 0, 8, 0); search_layout.setSpacing(7); search_icon = QLabel(); search_icon.setPixmap(cyber_pixmap("search", "#7fa2c5", 18)); search_layout.addWidget(search_icon)
         self.process_search = QLineEdit(); self.process_search.setObjectName("processSearch"); self.process_search.setPlaceholderText(self.tr("جستجوی پردازه…", "Search processes…")); self.process_search.setClearButtonEnabled(True); search_layout.addWidget(self.process_search); toolbar_layout.addWidget(search_wrap, 1)
         self.process_refresh_btn = self._action_button("به‌روزرسانی فهرست", "Refresh Process List", "refresh", "secondaryAction"); self.process_refresh_btn.clicked.connect(self.refresh_processes); toolbar_layout.addWidget(self.process_refresh_btn); root.addWidget(toolbar)
         table_frame = QFrame(); table_frame.setObjectName("tableFrame"); table_layout = QVBoxLayout(table_frame); table_layout.setContentsMargins(0, 0, 0, 0)
-        self.process_table = QTableWidget(0, 2); self.process_table.setObjectName("processTable"); self.process_table.setHorizontalHeaderLabels([self.tr("خارج از VPN", "Bypass VPN"), "Process"]); self.process_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed); self.process_table.setColumnWidth(0, 145); self.process_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch); self.process_table.verticalHeader().hide(); self.process_table.verticalHeader().setDefaultSectionSize(46); self.process_table.setShowGrid(False); self.process_table.setAlternatingRowColors(True); self.process_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.process_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.process_table = QTableWidget(0, 2); self.process_table.setObjectName("processTable"); self.process_table.setHorizontalHeaderLabels([self.tr("انتخاب", "Selected"), self.tr("پردازه", "Process")]); self.process_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed); self.process_table.setColumnWidth(0, 145); self.process_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch); self.process_table.verticalHeader().hide(); self.process_table.verticalHeader().setDefaultSectionSize(46); self.process_table.setShowGrid(False); self.process_table.setAlternatingRowColors(True); self.process_table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.process_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table_layout.addWidget(self.process_table); root.addWidget(table_frame, 1)
         self.process_search.textChanged.connect(self._filter_processes)
         return page
+
+    def _refresh_app_routing_mode(self):
+        combo = self.app_routing_mode
+        with QSignalBlocker(combo):
+            combo.clear()
+            for key, fa, en in (
+                ("all", "همهٔ برنامه‌ها", "All apps"),
+                ("bypass", "عبور مستقیم برنامه‌های انتخاب‌شده", "Bypass selected apps"),
+                ("only", "فقط برنامه‌های انتخاب‌شده", "Selected apps only"),
+            ):
+                combo.addItem(self._ui_text(fa, en), key)
+            combo.setCurrentIndex(combo.findData(self.global_settings.snapshot().routing_mode))
+        combo.setAccessibleName(self.tr("مسیریابی برنامه‌ها", "App routing"))
+
+    def _app_routing_changed(self):
+        mode = self.app_routing_mode.currentData()
+        if not self._change_global_settings(routing_mode=mode):
+            self._refresh_app_routing_mode()
 
     def _apply_xray_port_setting(self):
         """Hand the saved engine-1 SOCKS/HTTP pair to the engine (next start)."""
@@ -3931,7 +4147,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.assistant_guides_toggle.toggled.connect(self._assistant_guides_changed)
         self.assistant_warnings_toggle.toggled.connect(self._assistant_warnings_changed)
         self.assistant_replay_button.clicked.connect(self._replay_assistant_guide)
-        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.latency.connect(self._set_latency); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.profile_pings_done.connect(self._profile_pings_finished); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self.connection_hint.setText); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished); self.bridge.gateway_mode_applied.connect(self._gateway_mode_apply_finished); self.bridge.gateway_runtime_state.connect(self._gateway_runtime_state_changed); self.bridge.gateway_devices_changed.connect(self._gateway_devices_updated); self.bridge.gateway_device_names_changed.connect(self._gateway_device_names_updated)
+        self.bridge.engine_log.connect(self._append_log)
+        self.bridge.log.connect(self._append_log); self.bridge.state.connect(self._set_state); self.bridge.traffic.connect(self._set_traffic); self.bridge.target_latency.connect(self._target_latency_finished); self.bridge.maker_imported.connect(self._maker_import_finished); self.bridge.maker_batch.connect(self._maker_test_batch); self.bridge.maker_done.connect(self._maker_test_done); self.bridge.maker_failed.connect(self._maker_failed); self.bridge.scan_progress.connect(self._scan_progress); self.bridge.scan_done.connect(self._scan_done); self.bridge.scan_failed.connect(self._scan_failed); self.bridge.error.connect(self._handle_error); self.bridge.profiles_changed.connect(self.refresh_profiles); self.bridge.profile_pings_done.connect(self._profile_pings_finished); self.bridge.ip.connect(self._ip_checked); self.bridge.hint.connect(self._set_xray_hint); self.bridge.activity.connect(self.activity_bar.set_activity); self.bridge.processes.connect(self._populate_processes); self.bridge.update_checked.connect(self._update_checked); self.bridge.update_failed.connect(self._update_failed); self.bridge.proxy_mode_applied.connect(self._proxy_mode_apply_finished); self.bridge.tun_mode_applied.connect(self._tun_mode_apply_finished); self.bridge.gateway_mode_applied.connect(self._gateway_mode_apply_finished); self.bridge.gateway_runtime_state.connect(self._gateway_runtime_state_changed); self.bridge.gateway_devices_changed.connect(self._gateway_devices_updated); self.bridge.gateway_device_names_changed.connect(self._gateway_device_names_updated)
         self._traffic_interface = None
         self._traffic_base_up = None
         self._traffic_base_down = None
@@ -4116,21 +4333,20 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._apply_engine_theme()
 
     def _sync_engine_ui_layout(self):
+        self._layout_sidebar_chrome()
         self._sync_engine_nav()
         self._sync_engine_switch()
         self._apply_engine_home()
         self._ensure_engine_page()
 
-    def _apply_app_style(self, pow_on=None):
+    def _apply_app_style(self):
         """Fonts (Inter / Vazirmatn UI FD / JetBrains Mono) + themed stylesheet."""
-        if pow_on is None:
-            pow_on = getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW
         app = QApplication.instance()
         if app is None:
             return
         language = getattr(self, "language", "fa")
         _fonts.apply_app_font(app, language)
-        engine = ENGINE_POW if pow_on else ENGINE_XRAY
+        engine = getattr(self, "engine_mode", ENGINE_XRAY)
         current = app.styleSheet()
         wanted = combined_app_style(language)
         if is_app_style(current) and current != wanted:
@@ -4138,8 +4354,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.setProperty(_eswitch.ENGINE_PROPERTY, engine)
             app.setStyleSheet(wanted)
             self._stale_pages = set()
-            return
-        if self.property(_eswitch.ENGINE_PROPERTY) != engine:
+        elif self.property(_eswitch.ENGINE_PROPERTY) != engine:
             self._flip_engine_property(engine)
 
     def _flip_engine_property(self, engine):
@@ -4230,13 +4445,15 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._schedule_stale_restyle(15)
 
     def _apply_engine_theme(self):
-        pow_on = getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW
-        changed = _theme.is_pow() != pow_on
-        _theme.set_pow(pow_on)
-        self._apply_app_style(pow_on)
+        engine = getattr(self, "engine_mode", ENGINE_XRAY)
+        changed = self.property(_eswitch.ENGINE_PROPERTY) != engine
+        _theme.set_engine(engine)
+        self._apply_app_style()
         if changed or not getattr(self, "_theme_applied", False):
             self._theme_applied = True
             self._retheme_art()
+        if hasattr(self, "global_settings_page"):
+            self.global_settings_page.set_engine(engine)
         self._sync_brand()
         status = getattr(self, "status", None)
         if status is not None:
@@ -4261,18 +4478,27 @@ class MainWindow(LogsPageMixin, QMainWindow):
         brand = getattr(self, "brand_label", None)
         if brand is None:
             return
-        pow_on = getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW
-        dot = f"<span style='color:{_theme.accent() if pow_on else '#23f5e0'}'>\u25cf</span>&nbsp;&nbsp;"
+        mode = getattr(self, "engine_mode", ENGINE_XRAY)
+        pow_on = mode == ENGINE_POW
+        direct = mode == ENGINE_DIRECT
+        dot_color = _theme.DIRECT_PALETTE["primary"] if direct else _theme.accent() if pow_on else "#23f5e0"
+        dot = f"<span style='color:{dot_color}'>\u25cf</span>&nbsp;&nbsp;"
         if pow_on:
             brand.setText(f"UAC <span style='color:{_theme.brand_accent()}'>PoW</span>")
             self.logo_mark.setObjectName("logoMarkCube")
             self.logo_mark.setPixmap(_cube_pixmap(46))
             self.engine_badge.setText(dot + "PoW ENGINE")
+        elif mode == ENGINE_DIRECT:
+            brand.setText(f"UAC <span style='color:{_theme.DIRECT_PALETTE['primary']}'>Direct</span>")
+            self.logo_mark.setObjectName("logoMark")
+            self.logo_mark.setPixmap(cyber_pixmap("zap", _theme.DIRECT_PALETTE["accent"], 25))
+            self.engine_badge.setText(dot + "Direct")
         else:
             brand.setText("UAC Spoofer")
             self.logo_mark.setObjectName("logoMark")
             self.logo_mark.setPixmap(cyber_pixmap("shield", "#031422", 24))
             self.engine_badge.setText(dot + "XRAY ENGINE")
+        self.rating_button.setIcon(cyber_icon("star" if direct else "external-link", "#bfefff", 18))
         _restyle(self.logo_mark)
 
     def _sync_engine_switch(self):
@@ -4284,6 +4510,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         tips = {
             ENGINE_XRAY: self.tr("موتور Xray: کانفیگ‌های VLESS/Trojan با اسپوف SNI", "Xray engine: VLESS/Trojan configs with SNI spoofing"),
             ENGINE_POW: self.tr("موتور UAC PoW: سایفون روی WARP", "UAC PoW engine: Psiphon over WARP"),
+            ENGINE_DIRECT: self.tr("وایرگارد روی HTTP/2 یا TLS مستقیم", "WireGuard over HTTP/2 or direct TLS"),
         }
         for key, button in buttons.items():
             button.blockSignals(True)
@@ -4309,10 +4536,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
         thumb.show()
 
     def _engine_option_clicked(self, key):
-        if self._engine_switching:
+        if self._engine_switching or getattr(self, "_engine_guard_pending", False):
             self._sync_engine_switch()
             return
         if key != getattr(self, "engine_mode", ENGINE_XRAY):
+            self._engine_switch_target = key
             self._switch_engine()
         self._sync_engine_switch()
 
@@ -4327,7 +4555,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             widget.setProperty("xrayEn", widget.property("i18nEn"))
         widget.setProperty("i18nFa", persian)
         widget.setProperty("i18nEn", english)
-        widget.setText(self.tr(persian, english))
+        widget.setText(self._ui_text(persian, english))
 
     def _restore_bilingual(self, widget):
         if widget is None or widget.property("xrayFa") is None:
@@ -4336,7 +4564,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         english = str(widget.property("xrayEn") or "")
         widget.setProperty("i18nFa", persian)
         widget.setProperty("i18nEn", english)
-        widget.setText(self.tr(persian, english))
+        widget.setText(self._ui_text(persian, english))
 
     def _pow_setting(self, **changes):
         from dataclasses import replace
@@ -4345,7 +4573,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             return
         before = controller.store.snapshot()
         after = replace(before, **changes)
-        controller.store.save(after)
+        controller.store.save(after, exclude=self.global_settings.pow_legacy_fields)
         try:
             self._log_pow_setting_changes(before, after)
         except Exception:
@@ -4355,9 +4583,37 @@ class MainWindow(LogsPageMixin, QMainWindow):
         """Same Connection Center layout; the slots follow the active engine."""
         if not hasattr(self, "home_header"):
             return
-        pow_on = getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW
+        mode = getattr(self, "engine_mode", ENGINE_XRAY)
+        pow_on = mode == ENGINE_POW
+        direct_on = mode == ENGINE_DIRECT
         subtitle = self.home_header.findChild(QLabel, "pageSubtitle")
+        self.hero_card.set_atmosphere(mode)
+        self.orb.set_direct_appearance(direct_on)
+        self.orb_caption.setText("DIRECT CORE" if direct_on else "NETWORK CORE")
+        self.pow_country_button.refresh_chevron(direct_on)
+        self.network_metrics.set_engine(mode)
+        self._sync_pause_action()
+        self.gateway_option.setVisible(not direct_on)
+        self.carrier_control.setVisible(not direct_on)
+        self.manual_option.setVisible(mode == ENGINE_XRAY)
+        if direct_on:
+            self._set_bilingual(subtitle, "مدیریت هوشمند ارتباطات شبکه", "Intelligent network management")
+            self._set_bilingual(self.hero_badge, "موتور ارتباط مستقیم", "Direct connection engine")
+            self._set_bilingual(self._option_label(self.auto_option), "DNS خودکار", "Automatic DNS")
+            self._set_bilingual(self.tune_button, "تنظیمات Direct", "Direct Settings")
+            self.route_source_tabs.hide()
+            self.country_count.hide()
+            self.country_combo.hide()
+            self.original_configs_label.hide()
+            self.pow_country_button.show()
+            self._relayout_control_bar()
+            self.direct_controller.refresh()
+            return
+        self._restore_bilingual(self.hero_badge)
+        self.country_description.setToolTip("")
         if pow_on:
+            self.pow_country_button.setEnabled(True)
+            self.pow_country_button.setAccessibleName("PoW exit country")
             self._set_bilingual(subtitle, "سایفون روی وارپ، با پروکسی ویندوز یا حالت TUN", "Psiphon over WARP, with Windows proxy or TUN mode")
             self._set_bilingual(self.country_description, "کشور خروجی سایفون. خودکار یعنی بدون قفل منطقه.", "Psiphon exit country. Automatic means no region pin.")
             self._set_bilingual(self._option_label(self.auto_option), "سایفون روی وارپ", "Psiphon over WARP")
@@ -4382,7 +4638,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._restore_bilingual(self.country_description)
             self._restore_bilingual(self._option_label(self.auto_option))
             self._restore_bilingual(self._option_label(self.manual_option))
-            self._restore_bilingual(self._option_label(self.gateway_option))
+            self._set_bilingual(self._option_label(self.gateway_option), "درگاه موبایل", "Gateway")
             self._restore_bilingual(self.carrier_label)
             self._restore_bilingual(self.tune_button)
             self.route_source_tabs.setTabText(0, self.tr("پیشنهادی", "Suggested"))
@@ -4411,11 +4667,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
         for widget in widgets:
             widget.blockSignals(True)
         try:
-            self.auto_mode.setChecked(bool(settings.chain_psiphon))
+            self.auto_mode.setChecked(settings.exit_mode == "chain")
             self.pick_best.setChecked(bool(settings.optimized_mode))
-            proxy = bool(controller.effective_exit_proxy())
-            self.proxy_mode.setChecked(proxy)
-            self.tun_mode.setChecked(not proxy)
+            proxy = controller.effective_exit_proxy()
+            self.proxy_mode.setChecked(proxy is True)
+            self.tun_mode.setChecked(proxy is False)
             self.gateway_mode.setChecked(bool(controller.h2_fragment_display()[0]))
             firewall = settings.firewall_profile if settings.firewall_profile in ("auto", "mci", "irancell") else "auto"
             self.carrier.setCurrentText(firewall)
@@ -4442,21 +4698,18 @@ class MainWindow(LogsPageMixin, QMainWindow):
             toggle._set_thumb_position(1.0 if value else 0.0)
 
     def _pow_sync_home_visuals(self):
-        """PoW Home: TUN / Windows proxy show the real running exit (exactly one
-        on) and HTTP/2 fragment shows the effective state, with an auto tag
-        when adaptive fragmentation turned it on."""
+        """Show the selected output and effective HTTP/2 fragmentation."""
         controller = getattr(self, "pow_controller", None)
         if controller is None or getattr(self, "engine_mode", ENGINE_XRAY) != ENGINE_POW:
             return
         if not hasattr(self, "proxy_mode") or getattr(self, "_pow_home_loading", False):
             return
-        proxy = bool(controller.effective_exit_proxy())
-        self._pow_set_toggle(self.proxy_mode, proxy)
-        self._pow_set_toggle(self.tun_mode, not proxy)
+        proxy = controller.effective_exit_proxy()
         for option, toggle, active in (
-            (self.proxy_option, self.proxy_mode, proxy),
-            (self.tun_option, self.tun_mode, not proxy),
+            (self.proxy_option, self.proxy_mode, proxy is True),
+            (self.tun_option, self.tun_mode, proxy is False),
         ):
+            self._pow_set_toggle(toggle, active)
             changed = False
             if not option.isEnabled() or not toggle.isEnabled():
                 # Xray's TUN / gateway rules disable these rows; PoW needs both.
@@ -4485,13 +4738,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
             ))
 
     def _pow_exit_mode_clicked(self, proxy, enabled):
-        """TUN and Windows proxy are one choice: turning one on turns the other
-        off, turning one off selects the other. Applied live when connected."""
         controller = getattr(self, "pow_controller", None)
         if controller is None or getattr(self, "_pow_home_loading", False):
             return
-        want_proxy = bool(proxy) if enabled else (not proxy)
-        controller.set_exit_mode(want_proxy)
+        controller.set_exit_mode(proxy if enabled else None)
         self._pow_sync_home_visuals()
 
     def _fill_pow_country_combo(self, selected: str, automatic: bool):
@@ -4544,6 +4794,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         button.setToolTip(self.tr("انتخاب کشور خروجی", "Choose the exit country"))
 
     def _open_pow_country_picker(self):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self.direct_controller.open_country_picker()
+            return
         from .pow_ui import PowCountryPicker
         controller = getattr(self, "pow_controller", None)
         if controller is None:
@@ -4574,8 +4827,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         try:
             self.auto_mode.setChecked(bool(self.storage.settings.get("auto_mode", True)))
             self.pick_best.setChecked(bool(self.storage.settings.get("pick_best", False)))
-            self.proxy_mode.setChecked(bool(self.storage.settings.get("proxy_mode", True)))
-            self.tun_mode.setChecked(bool(self.storage.settings.get("tun_mode", False)))
+            self.proxy_mode.setChecked(bool(self._proxy_mode_enabled()))
+            self.tun_mode.setChecked(bool(self._tun_mode_enabled()))
             self.gateway_mode.setChecked(False)
             self.carrier.setCurrentText(self.storage.tuning.carrier_mode)
             route_source = str(self.storage.settings.get("route_source", "suggested") or "suggested").lower()
@@ -4604,27 +4857,39 @@ class MainWindow(LogsPageMixin, QMainWindow):
         except Exception:
             pass
 
-    def _nav_visible(self, icon: str) -> bool:
-        """Logs, Support, and App Bypass stay. Everything else belongs to one engine.
+    @staticmethod
+    def _nav_icon(name):
+        return "settings" if name in ("xray-settings", "pow-settings", "direct-settings") else name
 
-        Home is always shown and opens that engine's own page. The PoW page
-        has no separate sidebar entry. App Bypass is shared: the same process
-        list applies to Xray and to UAC PoW.
-        """
-        if icon in ("home", "activity", "headphones", "shield"):
+    def _nav_visible(self, icon: str) -> bool:
+        engine = getattr(self, "engine_mode", ENGINE_XRAY)
+        if icon in ("home", "activity", "headphones", "shield", "settings"):
             return True
         if icon == "zap":
             return False
-        return getattr(self, "engine_mode", ENGINE_XRAY) != ENGINE_POW
+        if icon == "pow-settings":
+            return engine == ENGINE_POW
+        if icon == "direct-settings":
+            return engine == ENGINE_DIRECT
+        return engine == ENGINE_XRAY
 
     def _sync_engine_nav(self):
-        for button in getattr(self, "nav", []):
+        for button in (*self.nav, self.xray_settings_button):
             icon = button.property("iconName")
             button.setVisible(self._nav_visible(icon))
+        self.sidebar_compact_spacer.setVisible(self.engine_mode != ENGINE_XRAY)
+        self._sync_nav_selection(self.stack.currentIndex())
         try:
             self._fit_sidebar()
         except Exception:
             pass
+
+    def _sync_nav_selection(self, page_index):
+        for index, button in enumerate(self.nav):
+            active = index == page_index and not button.isHidden()
+            button.setChecked(active)
+            icon = self._nav_icon(button.property("iconName"))
+            button.setIcon(cyber_icon(icon, "#23f5e0" if active else "#9fb4d8", _layout.NAV_ICON))
 
     def _pow_stack_index(self) -> int:
         for index, button in enumerate(self.nav):
@@ -4648,7 +4913,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.show_page(0)
 
     def _switch_engine(self):
-        """Toggle Xray <-> UAC PoW (animated unless motion is off).
+        """Switch the selected engine and animate the transition when enabled.
 
         Disconnect rules are unchanged (see _switch_engine_now); this wrapper
         only adds the snapshot cross-fade, the sliding pill and the
@@ -4656,14 +4921,18 @@ class MainWindow(LogsPageMixin, QMainWindow):
         """
         if self._engine_switching:
             return
+        QToolTip.hideText()
         if self._engine_busy():
             # Ask after the click handler returns (a modal loop inside the
             # click left the switch buttons stuck in a pressed/dark state).
-            QTimer.singleShot(0, self._guarded_switch)
+            if not getattr(self, "_engine_guard_pending", False):
+                self._engine_guard_pending = True
+                QTimer.singleShot(0, self._guarded_switch)
             return
         started = time.perf_counter()
         previous = getattr(self, "engine_mode", ENGINE_XRAY)
-        animate = _animations_enabled() and self.isVisible() and getattr(self, "engine_thumb", None) is not None
+        animate = (self._navigation_animations_enabled() and self.isVisible()
+                   and getattr(self, "engine_thumb", None) is not None)
         self._engine_switch_stats = {"started": started, "animated": animate}
         if not animate:
             self._switch_engine_now()
@@ -4777,7 +5046,15 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._schedule_stale_restyle(60)
 
     def _switch_engine_now(self, defer=None):
-        target = ENGINE_XRAY if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW else ENGINE_POW
+        target = getattr(self, "_engine_switch_target", None)
+        if target is None:
+            target = ENGINE_XRAY if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW else ENGINE_POW
+        self._engine_switch_target = None
+        direct = getattr(self, "direct_controller", None)
+        if direct is not None and direct.busy:
+            self._engine_switch_target = target
+            self._disconnect_then_switch()
+            return
         controller = getattr(self, "pow_controller", None)
         busy_pow = bool(controller is not None and controller.busy)
         try:
@@ -4809,6 +5086,14 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 self.show_toast(self.tr("اتصال قبلی قطع شد؛ موتور عوض شد", "Previous connection stopped; engine switched"), "info")
             except Exception:
                 pass
+        current_page = self.stack.currentWidget() if hasattr(self, "stack") else None
+        following_log = (current_page is not None and current_page.objectName() == "liveLogsPage"
+                         and self._log_follow and self.log_autoscroll.isChecked())
+        self._engine_page_scroll = (current_page, tuple(
+            (bar, bar.value()) for bar in current_page.findChildren(QScrollBar)
+            if bar.orientation() == Qt.Vertical
+            and not (following_log and bar is self.logs.verticalScrollBar())
+        )) if current_page is not None else (None, ())
         self.engine_mode = target
         try:
             self.storage.settings["engine_mode"] = target
@@ -4834,7 +5119,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
         except Exception:
             busy_pow = False
         engine = getattr(self, "engine", None)
-        return bool(busy_pow or getattr(engine, "running", False) or getattr(self, "connecting", False))
+        direct = getattr(self, "direct_controller", None)
+        worker = getattr(self, "_connect_thread", None)
+        return bool(busy_pow or (direct is not None and direct.busy) or getattr(engine, "running", False)
+                    or getattr(self, "connecting", False) or (worker is not None and worker.is_alive()))
 
     def _confirm_engine_switch(self):
         """True = disconnect and switch. Tests may inject _switch_guard_fn."""
@@ -4850,6 +5138,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._restore_engine_switch_look()
         if ok:
             self._disconnect_then_switch()
+        else:
+            self._engine_guard_pending = False
+            self._engine_switch_target = None
 
     def _restore_engine_switch_look(self):
         self._engine_checked_override = None
@@ -4869,6 +5160,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         """Fully stop the active engine (await it), then switch."""
         self.bridge.log.emit("ENGINE SWITCH: disconnecting before switch")
         self._set_connection_visual("disconnecting")
+        direct = getattr(self, "direct_controller", None)
+        if direct is not None and direct.busy:
+            direct.stop()
         controller = getattr(self, "pow_controller", None)
         try:
             if controller is not None and controller.busy:
@@ -4890,8 +5184,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 self.bridge.log.emit("ENGINE SWITCH: engine did not stop in time; switch cancelled")
                 self.show_toast(self.tr("قطع اتصال کامل نشد؛ دوباره امتحان کن", "Disconnect did not finish; try again"), "warning")
                 self._restore_engine_switch_look()
+                self._engine_guard_pending = False
+                self._engine_switch_target = None
                 return
             self.bridge.log.emit("ENGINE SWITCH: previous engine fully stopped; switching")
+            self._engine_guard_pending = False
             self._switch_engine()
         poll()
 
@@ -4907,6 +5204,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             except Exception:
                 pass
         self._set_connection_visual("disconnected")
+        self._set_activity("", "", "idle", False)
 
     def _coach(self):
         queue = getattr(self, "_coach_queue", None)
@@ -4921,8 +5219,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _queue_engine_coach(self):
         self._coach().enqueue(
             "engine_switch", lambda: getattr(self, "engine_switch", None),
-            "✨ تازه! دو تا موتور داری — از اینجا هر وقت خواستی بین Xray و UAC PoW جابه‌جا شو. اگه یکی وصل نشد، اون یکی رو امتحان کن.",
-            "✨ New! You have two engines — switch between Xray and UAC PoW here anytime. If one doesn't connect, try the other.",
+            "از اینجا می‌توانید بین موتورهای Xray، UAC PoW و UAC Direct جابه‌جا شوید.",
+            "Switch between Xray, UAC PoW and UAC Direct here.",
             "فهمیدم", "Got it")
 
     def _queue_restart_coach(self):
@@ -4933,16 +5231,26 @@ class MainWindow(LogsPageMixin, QMainWindow):
             "باشه", "OK")
 
     def _reset_engine_cards(self):
+        self._traffic_interface = None
+        self._target_latency_generation += 1
+        self._target_latency_busy = False
         """Never show the other engine's route/ping/IP/traffic after a switch."""
+        dialog = getattr(self, "_ip_dialog", None)
+        if dialog is not None:
+            try:
+                dialog.close()
+            except RuntimeError:
+                pass
+            self._ip_dialog = None
         try:
-            self.ping_label.setText("—"); self.latency_card.set_secondary("")
-            self.latency_card.sparkline.values = []; self.latency_card.sparkline.update()
-            self.up_label.setText("0 B"); self.down_label.setText("0 B")
+            self.network_metrics.set_connection_state("disconnected")
+            self.network_metrics.set_latency(None)
+            self.network_metrics.reset_traffic()
             self.upload_card.set_secondary(""); self.download_card.set_secondary("")
             self.ip_label.setText("—"); self.ip_flag.setVisible(False); self.ip_card.set_secondary("")
-            self.ip_parallel.setVisible(False); self.ip_card.set_tight(False)
-            if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
-                self.route_details.setVisible(False)
+            self.ip_button.setEnabled(True)
+            self.ip_parallel.setVisible(False)
+            if getattr(self, "engine_mode", ENGINE_XRAY) != ENGINE_XRAY:
                 self.active_profile.setText("—"); self.active_profile.setToolTip("")
                 self.route_card.set_secondary(self.tr("هنوز وصل نشدی؛ دکمه اتصال رو بزن", "Not connected yet; tap Connect"))
             else:
@@ -4954,9 +5262,13 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 pass
 
     def _finish_engine_switch_ui(self):
+        page, scroll = getattr(self, "_engine_page_scroll", (None, ()))
+        self._engine_page_scroll = (None, ())
         self._sync_engine_ui_layout()
         self._reset_engine_cards()
         self._reset_connection_ui()
+        if self.engine_mode == ENGINE_DIRECT:
+            self.direct_controller.refresh()
         self._sync_wizard_restart_button()
         if (getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_XRAY
                 and QApplication.platformName() != "offscreen"):
@@ -4965,13 +5277,23 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._layout_home_dashboard()
         except Exception:
             pass
-        self.show_page(0)
+        if self.stack.currentWidget() is page:
+            if page is not None and page.objectName() == "liveLogsPage":
+                self._render_logs()
+                self._update_log_summary()
+            if scroll:
+                def restore_scroll():
+                    if self.stack.currentWidget() is page:
+                        for bar, value in scroll:
+                            bar.setValue(value)
+
+                restore_scroll()
+                QTimer.singleShot(0, restore_scroll)
 
     def show_page(self, index):
         requested = self.nav[index].property("iconName") if 0 <= index < len(self.nav) else "home"
         if requested in ("home", "zap") or not self._nav_visible(requested):
             index = 0
-        highlight = "home" if index == 0 else self.nav[index].property("iconName")
         previous_index = self.stack.currentIndex()
         if self._page_animation is not None:
             self._page_animation.stop()
@@ -4980,15 +5302,21 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._animated_page = None
         self._freshen_page(self.stack.widget(index))
         self.stack.setCurrentIndex(index)
+        if requested == "activity":
+            self._render_logs()
+            self._update_log_summary()
+        if index == self.GLOBAL_SETTINGS_PAGE:
+            self.global_settings_page.refresh()
+        elif index == self.POW_SETTINGS_PAGE:
+            self.pow_controller.refresh_settings_page()
+        elif index == self.DIRECT_SETTINGS_PAGE:
+            self.direct_controller.refresh()
         if index == 2:
             self._layout_sni_maker()
             QTimer.singleShot(0, self._layout_sni_maker)
             QTimer.singleShot(120, self._layout_sni_maker)
-        for button in self.nav:
-            active = button.property("iconName") == highlight and not button.isHidden()
-            button.setChecked(active)
-            button.setIcon(cyber_icon(button.property("iconName"), "#23f5e0" if active else "#9fb4d8", 22))
-        if _animations_enabled() and not self._suppress_page_motion:
+        self._sync_nav_selection(index)
+        if self._navigation_animations_enabled() and not self._suppress_page_motion:
             page = self.stack.currentWidget()
             effect = QGraphicsOpacityEffect(page); page.setGraphicsEffect(effect); effect.setOpacity(0.0)
             end_position = page.pos()
@@ -5044,6 +5372,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.show_toast(str(message), "danger")
 
     def _ip_checked(self, value):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            return
         self.ip_button.setEnabled(True)
         if not str(value).startswith("{"):
             self.ip_label.setText(value)
@@ -5066,7 +5396,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             return
         self._ip_failures = 0
         fa = self.language != "en"
-        self.ip_parallel.setVisible(False); self.ip_card.set_tight(False)
+        self.ip_parallel.setVisible(False)
         self.ip_label.setText(info["ip"])
         code = str(info.get("country") or "").upper()
         if len(code) == 2:
@@ -5075,9 +5405,6 @@ class MainWindow(LogsPageMixin, QMainWindow):
         else:
             self.ip_flag.setVisible(False)
         kind = ("\u200fتونل \u2068Xray\u2069" if fa else "Xray tunnel")
-        secondary = self.ip_card.secondary
-        secondary.setLayoutDirection(Qt.RightToLeft if fa else Qt.LeftToRight)
-        secondary.setAlignment((Qt.AlignRight if fa else Qt.AlignLeft) | Qt.AlignVCenter)
         self.ip_card.set_secondary(card_subtitle(info, fa, kind))
         if info.get("force"):
             self._set_activity("آی‌پی عمومی دریافت شد.", "Public IP check completed.", "success", False)
@@ -5104,6 +5431,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
 
     def _refresh_ip_card(self, force=False):
         """Direct IP when disconnected, Xray exit IP when connected (PoW owns its own)."""
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            return
         mode = self._ip_mode()
         controller = getattr(self, "pow_controller", None)
         if mode == "pow":
@@ -5164,7 +5493,20 @@ class MainWindow(LogsPageMixin, QMainWindow):
         from .ip_info import IpDetailsDialog, direct_identity, fetch_details
         fa = self.language != "en"
         mode = self._ip_mode()
-        if mode == "xray":
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            from .direct.probe import trace
+            coordinator = self.direct_controller.coordinator
+            status = coordinator.status
+            if status.phase not in ("connected", "paused") or not status.exit_ip:
+                return
+            def loader():
+                route = coordinator.status
+                if route.phase not in ("connected", "paused") or not route.socks_port:
+                    raise RuntimeError("The Direct route is disconnected")
+                result = trace(route.socks_port)
+                return {"ip": result.get("ip"), "country": result.get("loc"), "source": "UAC Direct"}
+            label = "UAC Direct"
+        elif mode == "xray":
             port = getattr(self.engine, "http_port", None)
             from .ip_info import cache_get as _cg, cache_put as _cp
             def loader(port=port):
@@ -5195,8 +5537,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         dialog.show(); dialog.raise_()
 
     def _configure_technical_widgets(self):
-        widgets = [self.route_detail, self.ping_label, self.up_label, self.down_label, self.ip_label,
-                   self.logs, self.domains, self.carrier, self.log_filter, self.process_search,
+        widgets = [self.logs, self.domains, self.carrier, self.log_filter, self.process_search,
                    self.maker_repo_url, self.maker_search]
         for widget in widgets:
             widget.setLayoutDirection(Qt.LeftToRight)
@@ -5248,9 +5589,6 @@ class MainWindow(LogsPageMixin, QMainWindow):
     # Sidebar fitting: nav rows, the star card and the footer must never
     # overlap. Nav rows shrink a little first, then the star card goes
     # compact (no sentence), then it is hidden.
-    SIDEBAR_NAV_HEIGHTS = (46, 44, 42, 40)
-    SIDEBAR_NAV_GAP = 4
-
     def _fit_sidebar(self):
         sidebar = getattr(self, "sidebar", None)
         if sidebar is None or not hasattr(self, "rating_card"):
@@ -5259,19 +5597,24 @@ class MainWindow(LogsPageMixin, QMainWindow):
         margins = side.contentsMargins()
         available = max(sidebar.height(), self.centralWidget().height() if self.centralWidget() else 0, self.height())
         available = min(available, self.height()) - margins.top() - margins.bottom()
-        visible = [b for b in self.nav if self._nav_visible(b.property("iconName"))]
         logo = self.logo_card.sizeHint().height()
         footer = self.sidebar_footer.sizeHint().height()
         fixed = logo + 14 + footer + 4 * side.spacing()
-        gap = self.SIDEBAR_NAV_GAP
-        nav_height = self.SIDEBAR_NAV_HEIGHTS[-1]
-        for height in self.SIDEBAR_NAV_HEIGHTS:
-            if fixed + len(visible) * (height + gap) + 220 <= available:
+        if not self.sidebar_compact_spacer.isHidden():
+            fixed += _layout.COMPACT_NAV_SPACER + side.spacing()
+        buttons = (*self.nav, self.xray_settings_button)
+        nav_count = sum(not button.isHidden() for button in buttons)
+        gap = _layout.SIDEBAR_GAP
+        nav_height = _layout.NAV_HEIGHTS[-1]
+        for height in _layout.NAV_HEIGHTS:
+            if fixed + nav_count * (height + gap) + 180 <= available:
                 nav_height = height
                 break
-        for button in self.nav:
+        if self.engine_mode == ENGINE_XRAY and nav_count:
+            nav_height = min(nav_height, (available - fixed - 10) // nav_count - gap)
+        for button in buttons:
             button.setFixedHeight(nav_height)
-        rest = available - fixed - len(visible) * (nav_height + gap)
+        rest = available - fixed - nav_count * (nav_height + gap)
         compact_width = self.width() < 1240
         self.rating_text.setVisible(True)
         full = self.rating_card.sizeHint().height() if not compact_width else 10**6
@@ -5291,6 +5634,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
 
     def tr(self, persian: str, english: str | None = None) -> str:
         return (english or FA_EN.get(persian, persian)) if self.language == "en" else persian
+
+    def _ui_text(self, persian, english):
+        return english if self.language == "en" else _fonts.persian_ui_text(persian)
 
     def toggle_language(self):
         """Switch fa <-> en with the engine-switch snapshot fade.
@@ -5384,6 +5730,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         QTimer.singleShot(0, getattr(self, "_maker_update_chips", lambda: None))
         direction = Qt.LeftToRight if self.language == "en" else Qt.RightToLeft
         self.setLayoutDirection(direction)
+        self.sidebar.setLayoutDirection(direction)
+        self.content_shell.setLayoutDirection(direction)
+        self.hero_card.setLayoutDirection(direction)
         self.sidebar.setProperty("rtl", self.language != "en"); _restyle(self.sidebar)
         # Rebind ONLY from the i18n catalog. Never remap by the widget's current
         # text (that left Persian strings stuck on English UI and the reverse).
@@ -5391,7 +5740,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
             for widget in self.findChildren(widget_type):
                 fa = widget.property("i18nFa"); en = widget.property("i18nEn")
                 if fa is not None and en is not None:
-                    widget.setText(str(en) if self.language == "en" else str(fa))
+                    widget.setText(self._ui_text(str(fa), str(en)))
+        for page in self.stack.findChildren(SettingsPage):
+            page.refresh_labels()
+        self.global_settings_page.refresh_labels()
         self.profile_tabs.setTabText(0, "User Config"); self.profile_tabs.setTabText(1, self.tr("دستی", "Manual")); self.profile_tabs.setTabText(2, self.tr("پیشنهادی", "Suggested"))
         self.profile_select_all_checkbox.setToolTip(self.tr(
             "انتخاب یا لغو انتخاب همه کانفیگ‌های لیست فعال",
@@ -5403,7 +5755,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.scan_tabs.setTabText(0, self.tr("نتایج", "Results")); self.scan_tabs.setTabText(1, self.tr("ذخیره‌شده", "Saved"))
         result_headers = (["", "Domain", "IP", "Colo", "Ping", "Stability", "First byte", "Bytes/2s", "Score"] if self.language == "en" else ["", "دامنه", "IP", "Colo", "پینگ", "پایداری", "اولین بایت", "بایت/۲ثانیه", "امتیاز"])
         for table in (self.results_table, self.bookmarks_table): table.setHorizontalHeaderLabels(result_headers)
-        self.process_table.setHorizontalHeaderLabels([self.tr(f"خارج از {ltr_isolate('VPN')}", "Bypass VPN"), self.tr("پردازه", "Process")])
+        self.process_table.setHorizontalHeaderLabels([self.tr("انتخاب", "Selected"), self.tr("پردازه", "Process")])
+        self._refresh_app_routing_mode()
         self.maker_model.set_headers(
             ["", "Country", "Status", "Real ping", "Configuration"]
             if self.language == "en"
@@ -5456,10 +5809,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             "statuses": self.maker_model.status_counts(),
             "countries": self.maker_model.country_summary(),
         })
-        for index, (button, (icon_name, persian, english)) in enumerate(zip(self.nav, self.nav_meta)):
-            button.setText(english if self.language == "en" else persian)
+        for button in (*self.nav, self.xray_settings_button):
             button.setProperty("rtl", self.language != "en"); _restyle(button)
-            button.setIcon(cyber_icon(icon_name, "#23f5e0" if index == self.stack.currentIndex() else "#9fb4d8", 22))
         self.language_button.setText("فارسی" if self.language == "en" else "English")
         self.data_button.setText(self.tr("باز کردن پوشه داده‌ها", "Open Data Folder"))
         self._sync_sidebar_language_layout()
@@ -5484,7 +5835,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             pass
         if not self.activity_bar.busy: self.activity_bar.set_activity("", "idle", False)
         hero_alignment = (Qt.AlignLeft | Qt.AlignAbsolute) if self.language == "en" else (Qt.AlignRight | Qt.AlignAbsolute)
-        self.status.setAlignment(hero_alignment | Qt.AlignVCenter); self.connection_hint.setAlignment(hero_alignment | Qt.AlignVCenter); self.hero_badge.setAlignment(hero_alignment | Qt.AlignVCenter); self.hero_copy_layout.setAlignment(self.connect_button, hero_alignment)
+        self.status.setAlignment(hero_alignment | Qt.AlignVCenter); self.connection_hint.setAlignment(hero_alignment | Qt.AlignVCenter); self.hero_badge.setAlignment(hero_alignment | Qt.AlignVCenter)
         if self.connecting:
             self._set_connection_visual("connecting")
         elif self.connection_error and not self.engine.running:
@@ -5513,6 +5864,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.proxy_option.setEnabled(not self._tun_mode_enabled())
         self._sync_gateway_controls()
         self._configure_technical_widgets()
+        self.global_settings_page.refresh()
+        self.pow_controller.refresh_settings_page()
+        self._sync_pause_action()
         self._layout_home_dashboard()
         self._layout_sni_maker()
         if self._update_notification is not None and self._latest_update is not None:
@@ -5537,6 +5891,77 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 gateway_popup.set_language(self.language)
             except Exception:
                 pass
+
+    def _change_global_settings(self, **changes):
+        before = self.global_settings.snapshot()
+        try:
+            self.global_settings.change(**changes)
+        except OSError as exc:
+            self.show_toast(str(exc), "danger")
+            self.global_settings_page.refresh()
+            return False
+        self._global_settings_changed(before)
+        return True
+
+    def _navigation_animations_enabled(self):
+        return _animations_enabled() and not self.global_settings.reduce_navigation_motion
+
+    def _global_settings_changed(self, before):
+        current = self.global_settings.snapshot()
+        self.global_settings_page.refresh()
+        if before.routing_mode != current.routing_mode and self.app_routing_mode.currentData() != current.routing_mode:
+            self._refresh_app_routing_mode()
+        if self.engine_mode == ENGINE_XRAY:
+            self._sync_xray_output_controls()
+        elif self.engine_mode == ENGINE_POW:
+            controller = self.pow_controller
+            if not before.auto_connect and current.auto_connect:
+                controller.reset_auto_connect()
+            if ((before.lan_share, before.lan_share_mode, before.lan_share_port)
+                    != (current.lan_share, current.lan_share_mode, current.lan_share_port)):
+                controller.apply_global_lan_share()
+            self._pow_sync_home_visuals()
+        elif self.engine_mode == ENGINE_DIRECT:
+            self.direct_controller.refresh()
+
+    def _sync_pause_action(self):
+        if not hasattr(self, "pause_button"):
+            return
+        proxy = False
+        ready = False
+        paused = False
+        if self.engine_mode == ENGINE_DIRECT:
+            coordinator = self.direct_controller.coordinator
+            proxy = coordinator.session_vpn is False
+            phase = coordinator.status.phase
+            ready = phase in ("connected", "paused")
+            paused = phase == "paused"
+        elif self.engine_mode == ENGINE_POW:
+            from .pow.status import PowPhase
+
+            controller = self.pow_controller
+            proxy = controller.coordinator.session_proxy_mode is True
+            phase = controller.status.snapshot().phase
+            ready = phase in (PowPhase.CONNECTED, PowPhase.PAUSED)
+            paused = phase == PowPhase.PAUSED
+        button = self.pause_button
+        button.setVisible(ready and proxy)
+        label = self.tr("ادامه", "Resume") if paused else self.tr("مکث", "Pause")
+        button.setText(label)
+        button.setAccessibleName(label)
+        button.setIcon(cyber_icon("play" if paused else "pause", "#9cfbf4", 19))
+        button.setToolTip(self.tr(
+            "مسیر اتصال بازیابی و بررسی می‌شود." if paused else
+            "تا زمان ادامه، ترافیک از مسیر مستقیم عبور می‌کند. مکث فقط در حالت پروکسی در دسترس است.",
+            "Restore and verify the connection." if paused else
+            "Traffic uses the direct route until you resume. Pause is available in proxy mode.",
+        ))
+
+    def _toggle_pause_action(self):
+        if self.engine_mode == ENGINE_DIRECT:
+            self.direct_controller.toggle_pause()
+        elif self.engine_mode == ENGINE_POW:
+            self.pow_controller.toggle_paused()
 
     def _save_flag(self, key, value): self.storage.settings[key] = value; self.storage.save_settings()
 
@@ -5581,20 +6006,56 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if controller is not None and controller.enabled:
             controller.evaluate(force=True)
 
+    def _xray_output(self):
+        session = self._xray_session_mode
+        if session is not None and (self.connecting or self.engine.running):
+            return session
+        return self.global_settings.snapshot().connection_mode
+
     def _proxy_mode_enabled(self) -> bool:
-        return bool(self.storage.settings.get("proxy_mode", True))
+        return self._xray_output() == "proxy"
 
     def _tun_mode_enabled(self) -> bool:
-        return bool(self.storage.settings.get("tun_mode", False))
+        return self._xray_output() == "vpn"
+
+    def _set_xray_output(self, mode):
+        if self._change_global_settings(connection_mode=mode):
+            self._xray_session_mode = mode
+        self._sync_xray_output_controls()
+
+    def _sync_xray_output_controls(self):
+        proxy, vpn = self._proxy_mode_enabled(), self._tun_mode_enabled()
+        for option, toggle, value in ((self.proxy_option, self.proxy_mode, proxy),
+                                      (self.tun_option, self.tun_mode, vpn)):
+            self._pow_set_toggle(toggle, value)
+            option.setProperty("active", value)
+            _restyle(option)
+        self.proxy_option.setEnabled(not vpn)
+
+    def _set_direct_output(self, mode):
+        before = self.global_settings.snapshot().connection_mode
+        if not self._change_global_settings(connection_mode=mode):
+            self.direct_controller.refresh()
+            return
+        if mode == "local":
+            self.direct_controller.stop()
+            self.direct_controller.refresh()
+        elif before not in (mode, "local") and self.direct_controller.busy:
+            self._set_activity("اتصال Direct برای تغییر نوع خروجی دوباره برقرار می‌شود.",
+                               "Direct is reconnecting to change its output.", "running", True)
+            self.direct_controller.restart_if_active()
 
     def _proxy_mode_changed(self, enabled):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self._set_direct_output("proxy" if enabled else "local")
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if getattr(self, "_pow_home_loading", False):
                 return
             self._pow_exit_mode_clicked(proxy=True, enabled=bool(enabled))
             return
         enabled = bool(enabled)
-        self._save_flag("proxy_mode", enabled)
+        self._set_xray_output("proxy" if enabled else "local")
         self.proxy_option.setProperty("active", enabled)
         _restyle(self.proxy_option)
         if (self.connecting and hasattr(self, "_ui_running")
@@ -5950,7 +6411,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.proxy_mode.blockSignals(True)
             self.proxy_mode.setChecked(fallback)
             self.proxy_mode.blockSignals(False)
-            self._save_flag("proxy_mode", fallback)
+            self._set_xray_output("proxy" if fallback else "local")
             self.proxy_option.setProperty("active", fallback)
             _restyle(self.proxy_option)
             self._handle_error(error)
@@ -5994,6 +6455,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         return True
 
     def _tun_mode_changed(self, enabled):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self._set_direct_output("vpn" if enabled else "local")
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if getattr(self, "_pow_home_loading", False):
                 return
@@ -6010,7 +6474,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 self.tun_mode.blockSignals(False)
                 enabled = False
                 availability_error = str(exc)
-        self._save_flag("tun_mode", enabled)
+        if not availability_error:
+            self._set_xray_output("vpn" if enabled else "proxy")
         self.tun_option.setProperty("active", enabled)
         self.proxy_option.setEnabled(not enabled)
         _restyle(self.tun_option)
@@ -6190,7 +6655,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.tun_mode.blockSignals(True)
             self.tun_mode.setChecked(runtime_enabled)
             self.tun_mode.blockSignals(False)
-            self._save_flag("tun_mode", runtime_enabled)
+            self._set_xray_output("vpn" if runtime_enabled else
+                                  "proxy" if self.engine._proxy_enabled else "local")
             self.tun_option.setProperty("active", runtime_enabled)
             self.proxy_option.setEnabled(not runtime_enabled)
             _restyle(self.tun_option)
@@ -6398,6 +6864,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         badge = getattr(self, "gateway_devices_badge", None)
         if badge is not None:
             badge.setText(str(count))
+            badge.setToolButtonStyle(Qt.ToolButtonTextBesideIcon if count else Qt.ToolButtonIconOnly)
             badge.setProperty("hasDevices", bool(count))
             badge.setProperty("gatewayActive", active)
             badge.setAccessibleName(self.tr(
@@ -6463,6 +6930,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             set_position(1.0 if checked else 0.0)
 
     def _sync_gateway_controls(self):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            return
         requested = bool(getattr(self, "_gateway_requested", False))
         active = self._gateway_runtime_active()
         target = getattr(self, "_gateway_apply_target", None)
@@ -6942,6 +7411,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _refresh_country_selector(self):
         if not hasattr(self, "country_combo"):
             return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self.direct_controller.refresh_country()
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW and hasattr(self, "pow_country_button"):
             self._update_pow_country_selector()
             return
@@ -7082,7 +7554,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         )
 
     def _start_selected_country(self):
-        if (not self._closing and self.auto_mode.isChecked()
+        if (getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_XRAY and not self._closing and self.auto_mode.isChecked()
                 and self._selected_country_code() and not self.connecting
                 and not self.engine.running):
             self.toggle_connection()
@@ -7188,6 +7660,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         return selected
 
     def _sync_auto_mode_ui(self, select_profile=False):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            return
         enabled = self.auto_mode.isChecked()
         self.country_combo.setEnabled(enabled)
         self.route_source_tabs.setEnabled(enabled)
@@ -7226,9 +7700,12 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._save_flag("pick_best", enabled)
 
     def _auto_mode_changed(self, enabled):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self.direct_controller.save("auto_select_dns", bool(enabled))
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if not getattr(self, "_pow_home_loading", False):
-                self._pow_setting(chain_psiphon=bool(enabled))
+                self._pow_setting(exit_mode="chain" if enabled else "warp")
             return
         if enabled:
             self._remember_direct_profile(self.storage.selected())
@@ -7282,39 +7759,20 @@ class MainWindow(LogsPageMixin, QMainWindow):
                    or self.storage.tuning.pattern_fake_sni or profile.sni).strip()
 
     def _update_route_card(self, profile, carrier=None):
-        """Active Route card: clean title + pill / endpoint / ping / SNI rows."""
+        """Refresh the selected Xray route and retain its technical details in the tooltip."""
         from .route_card import card_title, route_kind
-        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
-            return  # the PoW controller owns the card on engine 2
+        if getattr(self, "engine_mode", ENGINE_XRAY) != ENGINE_XRAY:
+            return
         if profile is None:
-            self.active_profile.setText(self.tr("\u0647\u06cc\u0686 \u06a9\u0627\u0646\u0641\u06cc\u06af\u06cc \u0627\u0646\u062a\u062e\u0627\u0628 \u0646\u0634\u062f\u0647", "No config selected"))
+            self.active_profile.setText("—")
             self.active_profile.setToolTip("")
             self.route_card.set_secondary("")
-            self.route_details.setVisible(False)
             return
         self.active_profile.setText(card_title(profile, self.language))
-        self.active_profile.setToolTip(profile.name)
-        # keep the legacy text (tooltips/tests) but show the structured rows
-        self.route_card.set_secondary(self._profile_route_label(profile, carrier))
-        self.route_card.secondary.setVisible(False)
-        try:
-            gene_active = bool(self.storage.settings.get("multi_gene_enabled", False))
-        except Exception:
-            gene_active = False
-        kind = route_kind(profile, gene_active)
-        sni_label = "SNI" if _is_direct_route(profile) else "Fake SNI"
-        sni = str(profile.sni or "") if _is_direct_route(profile) else self._effective_profile_fake_sni(profile, carrier)
-        ping = profile.last_ping_ms if profile.last_ping_ok else 0
-        endpoint = f"{profile.address}:{profile.port}"
-        if _is_direct_route(profile):
-            try:
-                _parsed = parse_outbound(profile)
-                endpoint = f"{_parsed['host']}:{_parsed['port']}"
-            except Exception:
-                pass
-        self.route_details.set_route(kind, endpoint, ping, sni_label, sni)
-        self.route_details.setToolTip(self._profile_route_label(profile, carrier))
-        self.route_details.setVisible(True)
+        kind = route_kind(profile, bool(self.storage.settings.get("multi_gene_enabled", False)))
+        detail = f"{kind}\n{self._profile_route_label(profile, carrier)}"
+        self.active_profile.setToolTip(detail)
+        self.route_card.set_secondary(detail)
 
     def _profile_route_label(self, profile, carrier=None, include_ping=True):
         if profile is None:
@@ -9700,7 +10158,26 @@ class MainWindow(LogsPageMixin, QMainWindow):
         threading.Thread(target=work, name=f"mci-quality-{generation}", daemon=True).start()
         return True
 
+    def nativeEvent(self, event_type, message):
+        if sys.platform == "win32":
+            from ctypes.wintypes import MSG
+
+            event = MSG.from_address(int(message))
+            if event.message == 0x0218 and event.wParam == 0x0012:  # PBT_APMRESUMEAUTOMATIC
+                controller = getattr(self, "pow_controller", None)
+                if controller is not None and controller.running:
+                    controller.coordinator.notify_resume()
+                direct = getattr(self, "direct_controller", None)
+                if direct is not None and direct.busy:
+                    direct.coordinator.notify_resume()
+        return super().nativeEvent(event_type, message)
+
     def toggle_connection(self):
+        direct = getattr(self, "direct_controller", None)
+        if direct is not None and (direct.busy or self.engine_mode == ENGINE_DIRECT):
+            if direct.busy or not self._engine_busy():
+                direct.toggle()
+            return
         try:
             pow_controller = getattr(self, "pow_controller", None)
             pow_busy = bool(pow_controller is not None and pow_controller.busy)
@@ -9774,10 +10251,12 @@ class MainWindow(LogsPageMixin, QMainWindow):
             )
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
             return
+        preferences = self.global_settings.snapshot()
+        self._xray_session_mode = preferences.connection_mode
         generation, cancel = self._begin_connect_attempt()
-        base_tuning = self.storage.tuning
+        base_tuning = replace(self.storage.tuning, iran_direct=preferences.iran_direct)
         carrier = base_tuning.carrier_mode
-        bypass = self.selected_processes()
+        bypass = list(self.global_settings.processes()) if preferences.routing_mode == "bypass" else []
         auto_enabled = self.auto_mode.isChecked()
         manual_only = self.pick_best.isChecked()
         forced_profile_id = self._forced_profile_id
@@ -9839,7 +10318,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             message = self.tr("هیچ SNI معتبر در مخزن اسکن پیدا نشد", "No valid SNI was found in the scan repository")
             self.connection_error = message; self._set_connection_visual("error"); self._handle_error(message)
             return
-        self.connecting = True; self.connection_error = ""; self._set_connection_visual("connecting"); self._set_latency(0.0, "testing")
+        self.connecting = True; self.connection_error = ""; self._set_connection_visual("connecting")
         if forced_profile is not None:
             self._set_activity(
                 f"در حال فعال‌سازی کانفیگ {ltr_isolate(forced_profile.name)}…",
@@ -10371,6 +10850,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._connect_thread = threading.Thread(target=work, name=f"connect-{generation}", daemon=True)
         self._connect_thread.start()
 
+    def _set_xray_hint(self, text):
+        if self.engine_mode == ENGINE_XRAY:
+            self.connection_hint.setText(text)
+
     def _set_connection_visual(self, state):
         states = {
             "disconnected": (f"{ltr_isolate('VPN')} خاموش است", "VPN is OFF", "اتصال امن فعال نیست", "Your connection is not active", "اتصال", "Connect", "play", "idle", True),
@@ -10378,21 +10861,50 @@ class MainWindow(LogsPageMixin, QMainWindow):
             "connected": (f"{ltr_isolate('VPN')} متصل است", "VPN is ON", "تونل امن فعال است", "Secure tunnel is active", "قطع اتصال", "Disconnect", "power", "connected", True),
             "disconnecting": ("در حال قطع اتصال…", "Disconnecting…", "در حال بازگردانی پروکسی سیستم…", "Restoring system proxy…", "در حال قطع…", "Disconnecting…", "loader", "loading", False),
             "error": ("خطای اتصال", "Connection Error", f"اتصال ناموفق بود؛ {ltr_isolate('Live Logs')} را بررسی کنید.", "Connection failed. Check Live Logs for details.", "تلاش دوباره", "Retry", "refresh", "error", True),
+            "paused": ("اتصال در حالت مکث است", "Connection paused", "مسیر مستقیم فعال است", "The direct route is active", "قطع اتصال", "Disconnect", "power", "connected", True),
         }
+        direct = getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT
         fa_status, en_status, fa_hint, en_hint, fa_button, en_button, icon_name, button_state, enabled = states[state]
-        self.status.setProperty("i18nFa", fa_status); self.status.setProperty("i18nEn", en_status); self.connection_hint.setProperty("i18nFa", fa_hint); self.connection_hint.setProperty("i18nEn", en_hint); self.status.setText(self.tr(fa_status, en_status)); self.connection_hint.setText(self.tr(fa_hint, en_hint)); self.connect_button.setProperty("i18nFa", fa_button); self.connect_button.setProperty("i18nEn", en_button); self.connect_button.setText(self.tr(fa_button, en_button)); self.connect_button.setEnabled(enabled)
-        self.connect_button.setProperty("state", button_state); self.connect_button.setIcon(cyber_icon(icon_name, "#031422" if state == "disconnected" else "#eaffff", 20)); _restyle(self.connect_button)
+        if direct and state == "connected":
+            fa_status, en_status = f"اتصال {ltr_isolate('Direct')} برقرار است", "Direct is connected"
+            fa_hint, en_hint = "مسیر Direct تأیید شده است.", "The Direct route is verified."
+        elif direct and state == "disconnected":
+            fa_status, en_status = "آماده اتصال", "Ready to connect"
+            fa_hint, en_hint = "برای برقراری ارتباط امن، متصل شوید.", "Connect to establish a secure connection."
+            icon_name = "power"
+        elif direct and state == "disconnecting":
+            fa_hint, en_hint = "در حال بستن نشست Direct…", "Closing the Direct session…"
+        self.connection_hint.setToolTip("")
+        self._bind_text(self.status, fa_status, en_status)
+        self._bind_text(self.connection_hint, fa_hint, en_hint)
+        self._bind_text(self.connect_button, fa_button, en_button)
+        self.connect_button.setEnabled(enabled)
+        if direct:
+            icon_color = (_direct_theme.CONNECTED_BUTTON_TEXT if button_state in ("connected", "loading")
+                          else _direct_theme.IDLE_BUTTON_TEXT)
+        else:
+            icon_color = "#031422" if state == "disconnected" else "#eaffff"
+        self.connect_button.setProperty("state", button_state); self.connect_button.setIcon(cyber_icon(icon_name, icon_color, 20)); _restyle(self.connect_button)
         visual_state = "connecting" if state == "disconnecting" else state
         self.status_pill.set_state(visual_state); self.orb.set_state(visual_state)
-        if state in ("connected", "disconnected"):
+        self.hero_card.set_wave_state(state)
+        if self.network_metrics.connection_state != state:
+            self.network_metrics.set_connection_state(state)
+            if state not in ("connected", "paused"):
+                self._traffic_interface = None
+            self._target_latency_generation += 1
+            self._target_latency_busy = False
+            if state == "connected" and not direct:
+                QTimer.singleShot(0, self._queue_target_latency_probe)
+        if not direct and state in ("connected", "disconnected"):
             self._schedule_ip_refresh(1500 if state == "connected" else 900)
         self.status.setObjectName("heroStatusOn" if state == "connected" else "heroStatusError" if state == "error" else "heroStatus")
         self.status.setText(_accent_state_word(self.status.text()))
         _restyle(self.status)
+        self._sync_pause_action()
 
     def _set_state(self, running):
-        # Xray state signals must not repaint the PoW activity line.
-        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
+        if getattr(self, "engine_mode", ENGINE_XRAY) != ENGINE_XRAY:
             return
         if running and not self.engine.running:
             running = False
@@ -10434,7 +10946,6 @@ class MainWindow(LogsPageMixin, QMainWindow):
         else:
             self._set_connection_visual("disconnected")
             if was_running: self._set_activity("تونل متوقف و پروکسی سیستم بازگردانی شد.", "Tunnel stopped and system proxy restored.", "success", False)
-        QTimer.singleShot(0, self._queue_target_latency_probe)
 
     def _set_traffic(self, up, down):
         pass
@@ -10478,6 +10989,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         except Exception:
             return None
     def _poll_windows_traffic(self):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            return
         pow_running = (
             getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW
             and bool(getattr(getattr(self, "pow_controller", None), "running", False))
@@ -10487,8 +11000,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._traffic_base_up = None
             self._traffic_base_down = None
 
-            self.up_label.setText("0 B")
-            self.down_label.setText("0 B")
+            self.network_metrics.reset_traffic()
             return
 
         counters = self._windows_traffic_counters()
@@ -10506,99 +11018,57 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._traffic_interface = interface_name
             self._traffic_base_up = sent
             self._traffic_base_down = received
+            self.network_metrics.reset_traffic()
+            self.network_metrics.set_traffic(0, 0)
+            self.hero_card.set_wave_traffic(0, 0)
             return
 
         upload = max(0, sent - self._traffic_base_up)
         download = max(0, received - self._traffic_base_down)
 
-        self.up_label.setText(format_bytes(upload))
-        self.down_label.setText(format_bytes(download))
-    ####################
-    def _set_latency(self, milliseconds, source="tunnel"):
-        if source == "testing":
-            self.ping_label.setText("…")
-            self.latency_card.set_secondary("8.8.8.8 • Checking…")
-            return
+        self.network_metrics.set_traffic(upload, download)
+        self.hero_card.set_wave_traffic(upload, download)
+
+    def _dns_probe_route(self):
+        if self.network_metrics.connection_state != "connected":
+            return None
+        if self.engine_mode == ENGINE_POW:
+            coordinator = self.pow_controller.coordinator
+            if coordinator.running and coordinator.exit_port:
+                return self.engine_mode, coordinator.exit_port, None
+        elif self.engine_mode == ENGINE_XRAY and self.engine.running and self.engine.socks_port:
+            return self.engine_mode, self.engine.socks_port, self.engine.run_id
+        return None
 
     def _queue_target_latency_probe(self):
-        if self._closing:
+        if self._closing or self._target_latency_busy:
             return
-        if self._target_latency_busy:
-            self._target_latency_pending = True
+        route = self._dns_probe_route()
+        if route is None:
             return
         self._target_latency_busy = True
-        self._target_latency_pending = False
         self._target_latency_generation += 1
         generation = self._target_latency_generation
-        use_tun = bool(getattr(self.engine, "tun_running", False))
-        proxy_active = bool(
-            not use_tun
-            and getattr(self.engine, "running", False)
-            and getattr(self.engine, "_proxy_enabled", False)
-        )
-        run_id = int(getattr(self.engine, "run_id", 0) or 0)
+        port = route[1]
 
         def work():
-            if use_tun:
-                mode = "tun"
-                value = _tun_tls_latency_8888()
-            elif proxy_active:
-                mode = f"proxy|{run_id}"
-                value = self.engine.measure_proxy_latency(timeout=5.0)
-            else:
-                mode = "direct"
-                value = _direct_ping_8888()
-            if value is None and mode == "tun":
-                value = _direct_ping_8888()
-                mode = "direct-fallback"
-            self.bridge.target_latency.emit(float(value or 0.0), mode, generation)
+            from .direct.probe import verify_dns
+            started = time.monotonic()
+            result = verify_dns(port, "8.8.8.8", timeout=2.0)
+            delay = max(1.0, (time.monotonic() - started) * 1000) if result.ok else None
+            self.bridge.target_latency.emit(delay, route, generation)
 
-        thread_name = "latency-8.8.8.8" if use_tun else "latency-active-config"
-        threading.Thread(target=work, name=thread_name, daemon=True).start()
+        threading.Thread(target=work, name="network-metrics-dns", daemon=True).start()
 
-    def _target_latency_finished(self, milliseconds, mode, generation):
+    def _target_latency_finished(self, milliseconds, route, generation):
         if generation != self._target_latency_generation:
             return
         self._target_latency_busy = False
-        base_mode = str(mode).split("|", 1)[0]
-        current_tun = bool(getattr(self.engine, "tun_running", False))
-        current_proxy = bool(
-            not current_tun
-            and getattr(self.engine, "running", False)
-            and getattr(self.engine, "_proxy_enabled", False)
-        )
-        stale_mode = (
-            (base_mode == "tun" and not current_tun)
-            or (base_mode == "direct-fallback" and not current_tun)
-            or (base_mode == "direct" and (current_tun or current_proxy))
-            or (
-                base_mode == "proxy"
-                and (
-                    not current_proxy
-                    or str(getattr(self.engine, "run_id", 0))
-                    != str(mode).partition("|")[2]
-                )
-            )
-        )
-        if not stale_mode:
-            value = max(0.0, float(milliseconds))
-            self.ping_label.setText(f"{value:.0f} ms" if value > 0 else "Timeout")
-            if base_mode == "proxy":
-                secondary = self.tr(
-                    "کانفیگ فعال • تأخیر زنده",
-                    "Active config • Live delay",
-                )
-            else:
-                secondary = {
-                    "tun": "8.8.8.8 • TUN TLS",
-                    "direct": "8.8.8.8 • Direct ICMP",
-                    "direct-fallback": "8.8.8.8 • Direct fallback",
-                }.get(base_mode, "8.8.8.8")
-            self.latency_card.set_secondary(secondary)
-            if value > 0:
-                self.latency_card.sparkline.add_value(value)
-        if stale_mode or self._target_latency_pending:
-            QTimer.singleShot(0, self._queue_target_latency_probe)
+        if route is not None and route == self._dns_probe_route():
+            detail = self.tr("پاسخ DNS از مسیر فعال · ۸.۸.۸.۸", "DNS response via active route · 8.8.8.8")
+            if milliseconds is None:
+                detail = self.tr("پاسخ DNS دریافت نشد", "No DNS response")
+            self.network_metrics.set_latency(milliseconds, detail)
 
     def _flush_log_buffer(self, final=False):
         if not self._pending_file_log_lines:
@@ -10677,8 +11147,12 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 "QPushButton#wizardRestartBtn:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #35f0dd, stop:1 #5c93ff); }"
                 "QPushButton#wizardRestartBtn:pressed { padding-top: 9px; }")
             button.clicked.connect(lambda: self._open_wizard())
+            slot = QWidget(self.home_header)
+            slot.setFixedWidth(_layout.GUIDE_WIDTH)
+            slot_layout = QHBoxLayout(slot); slot_layout.setContentsMargins(0, 0, 0, 0)
+            slot_layout.addWidget(button, 0, Qt.AlignVCenter)
             index = layout.indexOf(self.status_pill)
-            layout.insertWidget(index if index >= 0 else layout.count(), button, 0, Qt.AlignVCenter)
+            layout.insertWidget(index if index >= 0 else layout.count(), slot, 0, Qt.AlignVCenter)
             self.wizard_restart_btn = button
             self._sync_wizard_restart_button()
         except Exception as exc:
@@ -10912,6 +11386,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         return ",".join(picks), sources
 
     def open_tuning(self):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self.direct_controller.open_settings()
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             self.pow_controller._open_settings()
             self._load_pow_home_controls()
@@ -11500,15 +11977,21 @@ class MainWindow(LogsPageMixin, QMainWindow):
         area = self.centralWidget().rect(); x = max(18, area.center().x() - toast.width() // 2); y = max(18, area.bottom() - toast.height() - 24)
         toast.move(x, y)
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
+    def _layout_sidebar_chrome(self):
         compact = self.width() < 1240
         dense_sidebar = self.height() < 790
-        self.sidebar.setFixedWidth(238 if compact else 286)
-        self.sidebar_layout.setContentsMargins(
-            *(14, 10, 14, 10) if dense_sidebar else (18, 20, 18, 18)
-        )
-        self.logo_root.setContentsMargins(*(10, 8, 10, 8) if dense_sidebar else (12, 10, 12, 10)); self.logo_root.setSpacing(7 if dense_sidebar else 9)
+        self.sidebar.setFixedWidth(_layout.SIDEBAR_WIDTH[0 if compact else 1])
+        self.sidebar_layout.setContentsMargins(*_layout.SIDEBAR_MARGIN[0 if dense_sidebar else 1])
+        self.sidebar_layout.setSpacing(_layout.SIDEBAR_GAP)
+        self.logo_root.setContentsMargins(*_layout.BRAND_MARGIN[0 if dense_sidebar else 1])
+        self.logo_root.setSpacing(7 if dense_sidebar else 9)
+        language = "en" if self.language == "en" else "fa"
+        for label, height in zip((self.brand_label, self.version_label, self.engine_badge), _layout.BRAND_TEXT_HEIGHTS[language]):
+            label.setFixedHeight(height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_sidebar_chrome()
         self._fit_sidebar()
         self._layout_home_dashboard()
         self._layout_sni_maker()
@@ -11582,6 +12065,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.storage.save_settings()
         self._update_process_count()
 
+        direct = getattr(self, "direct_controller", None)
+        if direct is not None and self.engine_mode == ENGINE_DIRECT and direct.busy:
+            direct.restart_if_active()
+            return
+
 
 
         pow_busy = False
@@ -11651,6 +12139,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         return values
 
     def check_ip(self, proxy=None):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+            self.direct_controller.coordinator.request_exit_refresh()
+            return
         controller = getattr(self, "pow_controller", None)
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW and controller is not None and controller.coordinator.running:
             controller.check_exit_ip()
@@ -11711,6 +12202,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         except Exception as exc:
             self._pending_file_log_lines.append(f"Shutdown cleanup retry: {exc}")
         try:
+            direct = getattr(self, "direct_controller", None)
+            if direct is not None:
+                direct.shutdown()
             controller = getattr(self, "pow_controller", None)
             if controller is not None:
                 controller.shutdown()
@@ -11749,7 +12243,7 @@ COLOR_TOKENS = {
     "background": "#050b18", "bgsoft": "#071225", "surface": "#0a1830",
     "surface2": "#0d2340", "border": "rgba(54, 211, 255, 0.22)",
     "borderstrong": "rgba(54, 211, 255, 0.55)", "accent": "#23f5e0",
-    "accent2": "#2cc7ff", "purple": "#7c3cff", "success": "#23f5a6",
+    "accent2": _theme.XRAY_BLUE, "purple": "#7c3cff", "success": "#23f5a6",
     "warning": "#ffd166", "danger": "#ff5c7c", "muted": "#9fb4d8",
     "text": "#f4f8ff", "checkicon": str(ASSETS / "ui" / "check.svg").replace("\\", "/"),
     "chevronicon": str(ASSETS / "ui" / "chevron-down.svg").replace("\\", "/"),
@@ -11760,7 +12254,8 @@ STYLE = """
 QWidget { background: transparent; }
 QMainWindow, QWidget#windowRoot { background: $background; }
 QWidget#page, QWidget#pageBody, QStackedWidget#content, QFrame#contentShell, QFrame#activityWrap { background: transparent; }
-QScrollArea#pageScroll, QScrollArea#pageScroll > QWidget, QScrollArea#pageScroll > QWidget > QWidget { background: transparent; border: 0; }
+QScrollArea#pageScroll, QScrollArea#pageScroll > QWidget, QScrollArea#pageScroll > QWidget > QWidget,
+QScrollArea#homePage, QScrollArea#homePage > QWidget, QScrollArea#homePage > QWidget > QWidget { background: transparent; border: 0; }
 *[technical="true"] { font-family: "JetBrains Mono", "Vazirmatn UI FD", "Consolas"; }
 QToolTip { background: #102441; color: #eafaff; border: 1px solid #326789; border-radius: 8px; padding: 7px 10px; }
 QToolButton#helpDot { background: rgba(16,52,80,0.88); color: #78eefa; border: 1px solid rgba(54,211,255,0.36); border-radius: 12px; font-size: 13px; font-weight: 900; padding: 0; }
@@ -11828,12 +12323,7 @@ QComboBox#countryCombo QAbstractItemView::item { min-height: 38px; padding: 6px 
 QComboBox#countryCombo QAbstractItemView::item:hover { background: rgba(22,83,102,0.86); }
 QComboBox#countryCombo QAbstractItemView::item:selected { background: rgba(14,105,111,0.92); color: #ffffff; }
 
-QFrame#metricCard { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(10,29,60,0.94),stop:1 rgba(8,21,44,0.92)); border: 1px solid rgba(54,211,255,0.24); border-radius: 19px; }
-QFrame#metricCard:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(12,39,72,0.96),stop:1 rgba(8,29,53,0.94)); border-color: rgba(54,211,255,0.58); }
-QLabel#metricIcon { background: rgba(10,57,76,0.72); border: 1px solid rgba(35,245,224,0.26); border-radius: 10px; qproperty-alignment: AlignCenter; }
-QLabel#metricLabel, QLabel#fieldLabel { color: #a9bdd7; font-size: 11px; font-weight: 750; }
-QLabel#metricValue { color: #f7fbff; font-size: 22px; font-weight: 850; }
-QLabel#metricSecondary { color: #55e7df; font-family: "JetBrains Mono", "Vazirmatn UI FD", "Consolas"; font-size: 11px; font-weight: 650; }
+QLabel#fieldLabel { color: #a9bdd7; font-size: 11px; font-weight: 750; }
 QFrame#quickControls, QFrame#sniActionBar { background: rgba(9,25,54,0.86); border: 1px solid rgba(54,211,255,0.24); border-radius: 18px; }
 QFrame#toggleOption, QFrame#proxyModeOption, QFrame#tunModeOption, QFrame#gatewayModeOption, QFrame#carrierControl { background: rgba(8,24,47,0.74); border: 1px solid rgba(54,211,255,0.13); border-radius: 12px; }
 QFrame#toggleOption:hover, QFrame#proxyModeOption:hover, QFrame#tunModeOption:hover, QFrame#gatewayModeOption:hover, QFrame#carrierControl:hover { border-color: rgba(54,211,255,0.35); background: rgba(12,36,61,0.82); }
@@ -12031,7 +12521,7 @@ QLabel#brand { font-size: 16px; font-weight: 900; color: #f7fdff; letter-spacing
 QLabel#brandEdition { color: #8fa9c6; font-size: 11px; font-weight: 650; }
 QLabel#versionChip { color: #9ffdf5; background: rgba(8,69,78,0.56); border: 1px solid rgba(72,236,225,0.28); border-radius: 7px; padding: 0px 6px; font-size: 10px; font-weight: 800; }
 QFrame#engineSwitch { background: rgba(3,13,27,0.78); border: 1px solid rgba(54,211,255,0.22); border-radius: 12px; }
-QPushButton#engineOption { min-height: 20px; background: transparent; border: 1px solid transparent; border-radius: 9px; color: #8fa9c6; font-size: 12px; font-weight: 800; padding: 4px 8px; }
+QPushButton#engineOption { min-height: 20px; background: transparent; border: 1px solid transparent; border-radius: 9px; color: #8fa9c6; font-size: 11px; font-weight: 800; padding: 4px 4px; }
 QPushButton#engineOption:pressed { padding-top: 5px; padding-bottom: 3px; }
 QPushButton#engineOption:hover { color: #eafcff; background: rgba(22,83,102,0.55); border-color: rgba(54,211,255,0.22); }
 QPushButton#engineOption:checked { color: #031422; background: transparent; border-color: transparent; }
@@ -12065,28 +12555,12 @@ QLabel#powDialogSubtitle { color: #8fa9c6; font-size: 12px; font-weight: 500; }
 QToolButton#powDialogClose { color: #9fb4d8; background: transparent; border: 1px solid transparent; border-radius: 9px; font-size: 14px; font-weight: 800; }
 QToolButton#powDialogClose:hover { color: #ffffff; background: rgba(255,92,124,0.16); border-color: rgba(255,92,124,0.45); }
 QScrollArea#powDialogScroll, QScrollArea#powDialogScroll > QWidget, QScrollArea#powDialogScroll > QWidget > QWidget { background: #071225; border: 0; }
-QFrame#powSection { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(11,33,62,0.96),stop:1 rgba(7,24,48,0.95)); border: 1px solid rgba(54,211,255,0.18); border-radius: 15px; }
-QWidget#powSectionBody { background: transparent; }
-QLabel#powSectionTitle { color: #67e8f9; font-size: 11px; font-weight: 850; letter-spacing: 1px; }
-QToolButton#powSectionToggle { color: #8fa9c6; background: transparent; border: 1px solid transparent; border-radius: 7px; font-size: 13px; font-weight: 800; }
-QToolButton#powSectionToggle:hover { color: #ffffff; border-color: rgba(54,211,255,0.3); }
-QFrame#powSettingRow { background: transparent; border: 1px solid transparent; border-radius: 11px; }
-QFrame#powSettingRow:hover { background: rgba(22,60,96,0.42); border-color: rgba(54,211,255,0.16); }
-QLabel#powRowTitle { color: #eef8ff; font-size: 13px; font-weight: 800; }
-QLabel#powRowDesc { color: #7f9bb8; font-size: 11px; font-weight: 500; }
 QLabel#powLearnedLine { color: #b4c7dc; font-size: 12px; font-weight: 600; }
 QFrame#powSegmented { background: rgba(4,16,32,0.92); border: 1px solid rgba(54,211,255,0.22); border-radius: 10px; }
-QFrame#powSection QFrame#powSegmented { background: rgba(4,16,32,0.92); }
+QFrame#settingsCard QFrame#powSegmented { background: rgba(4,16,32,0.92); }
 QPushButton#powSegment { background: transparent; border: 0; border-radius: 7px; color: #9fb4d8; padding: 5px 11px; min-height: 18px; font-size: 12px; font-weight: 700; }
 QPushButton#powSegment:hover { background: rgba(22,83,102,0.55); color: #eafcff; }
 QPushButton#powSegment:checked { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 rgba(14,105,111,0.95),stop:1 rgba(20,74,120,0.95)); color: #ffffff; }
-QComboBox#powComboCompact { background: rgba(4,16,32,0.92); border: 1px solid rgba(54,211,255,0.25); border-radius: 10px; padding: 5px 12px; color: #eaf4ff; font-size: 12px; font-weight: 700; min-height: 20px; }
-QComboBox#powComboCompact:hover, QComboBox#powComboCompact:focus { border-color: #67fff0; }
-QComboBox#powComboCompact QAbstractItemView { background: #091c35; border: 1px solid rgba(82,244,230,0.5); border-radius: 10px; padding: 5px; outline: 0; color: #eafcff; }
-QPushButton#powCompactAction { background: rgba(13,35,64,0.94); border: 1px solid rgba(88,135,183,0.5); border-radius: 10px; padding: 6px 12px; color: #dff6ff; font-size: 12px; font-weight: 750; min-height: 18px; }
-QPushButton#powCompactAction:hover { border-color: #67fff0; background: rgba(16,48,82,0.96); }
-QPushButton#powCompactAction[danger="true"] { color: #ffc3cf; border-color: rgba(255,92,124,0.38); }
-QPushButton#powCompactAction[danger="true"]:hover { background: rgba(73,17,36,0.7); border-color: rgba(255,92,124,0.7); }
 QPushButton#powCountryButton { text-align: left; background: rgba(4,20,43,0.96); border: 1px solid rgba(82,244,230,0.55); border-radius: 13px; padding: 7px 15px; color: #f4ffff; font-size: 13px; font-weight: 750; }
 QPushButton#powCountryButton:hover { border-color: #67fff0; background: rgba(6,34,55,0.98); }
 QLineEdit#powCountrySearch { background: rgba(4,16,32,0.92); border: 1px solid rgba(54,211,255,0.28); border-radius: 10px; padding: 8px 12px; color: #eaf4ff; font-size: 13px; }
@@ -12162,12 +12636,13 @@ QScrollBar::handle:horizontal { background: #27516d; border-radius: 5px; min-wid
 QScrollBar::handle:horizontal:hover { background: #387b93; }
 QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page { width: 0; height: 0; background: transparent; }
 """
+STYLE += GLOBAL_SETTINGS_STYLE
 for _name, _value in sorted(COLOR_TOKENS.items(), key=lambda item: -len(item[0])):
     STYLE = STYLE.replace(f"${_name}", _value)
 
 # UAC PoW look (mockup): same rules, green-black surfaces and mint accents.
 STYLE = _fonts.finish_style(STYLE)
-POW_STYLE = _theme.map_css(STYLE)
+POW_STYLE = _theme.map_css(STYLE) + _quick_controls.style(ENGINE_POW) + shared_global_settings_style(ENGINE_POW)
 _POW_STYLE_CACHE = {"version": _theme.palette_version(), "style": POW_STYLE}
 
 
@@ -12175,7 +12650,9 @@ def pow_style() -> str:
     """PoW stylesheet for the current palette (rebuilt after set_palette)."""
     if _POW_STYLE_CACHE["version"] != _theme.palette_version():
         _POW_STYLE_CACHE["version"] = _theme.palette_version()
-        _POW_STYLE_CACHE["style"] = _theme.map_css(STYLE)
+        _POW_STYLE_CACHE["style"] = (
+            _theme.map_css(STYLE) + _quick_controls.style(ENGINE_POW) + shared_global_settings_style(ENGINE_POW)
+        )
     return _POW_STYLE_CACHE["style"]
 
 
@@ -12184,10 +12661,10 @@ _LOCAL_STYLE_CACHE: dict = {}
 
 def app_style(pow_on: bool, language: str) -> str:
     """Engine theme + language font order (Vazirmatn first for fa)."""
-    base = pow_style() if pow_on else STYLE
     key = (bool(pow_on), language, _theme.palette_version())
     cached = _LOCAL_STYLE_CACHE.get(key)
     if cached is None:
+        base = pow_style() if pow_on else STYLE + _quick_controls.style(ENGINE_XRAY) + shared_global_settings_style(ENGINE_XRAY)
         cached = _fonts.localize_style(base, language)
         _LOCAL_STYLE_CACHE[key] = cached
     return cached
@@ -12197,7 +12674,7 @@ _COMBINED_STYLE_CACHE: dict = {}
 
 
 def combined_app_style(language: str) -> str:
-    """Both engine themes in one sheet, scoped by QMainWindow[engine=...].
+    """Engine themes in one sheet, scoped by QMainWindow[engine=...].
 
     Installed once (per language); an engine switch then only flips the
     window's ``engine`` property instead of replacing the app stylesheet.
@@ -12205,7 +12682,15 @@ def combined_app_style(language: str) -> str:
     key = (language, _theme.palette_version())
     cached = _COMBINED_STYLE_CACHE.get(key)
     if cached is None:
-        cached = _eswitch.combine_styles({ENGINE_XRAY: app_style(False, language), ENGINE_POW: app_style(True, language)})
+        cached = _eswitch.combine_styles({
+            ENGINE_XRAY: app_style(False, language),
+            ENGINE_POW: app_style(True, language),
+            ENGINE_DIRECT: _fonts.localize_style(
+                _theme.map_css(STYLE, direct=True) + _direct_theme.STYLE
+                + _quick_controls.style(ENGINE_DIRECT) + shared_global_settings_style(ENGINE_DIRECT),
+                language,
+            ),
+        })
         _COMBINED_STYLE_CACHE[key] = cached
     return cached
 
@@ -12214,15 +12699,17 @@ def _css_color(text: str) -> QColor:
     match = re.match(r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)", text.strip())
     if match:
         alpha = float(match.group(4)) if match.group(4) is not None else 1.0
-        return QColor(int(match.group(1)), int(match.group(2)), int(match.group(3)), round(255 * alpha))
-    return QColor(text.strip())
+        return _BaseQColor(int(match.group(1)), int(match.group(2)), int(match.group(3)), round(255 * alpha))
+    return _BaseQColor(text.strip())
 
 
 def _engine_thumb_palettes() -> dict:
     """Pill colours per engine (same as the old :checked gradient)."""
     xray = ("#35f0dc", "#5fc8ff", "rgba(205,255,251,0.7)")
     pow_colors = tuple(_theme.map_css(" " + value).strip() for value in xray)
-    return {ENGINE_XRAY: tuple(_css_color(v) for v in xray), ENGINE_POW: tuple(_css_color(v) for v in pow_colors)}
+    direct = ("#31231b", "#3c281d", "rgba(246,123,54,0.34)")
+    return {ENGINE_XRAY: tuple(_css_color(v) for v in xray), ENGINE_POW: tuple(_css_color(v) for v in pow_colors),
+            ENGINE_DIRECT: tuple(_css_color(v) for v in direct)}
 
 
 def is_app_style(css: str) -> bool:

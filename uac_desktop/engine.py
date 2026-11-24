@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ctypes
 import ipaddress
@@ -37,9 +37,10 @@ FRAGMENT_PORT = 40443
 ECH_VIA_PATTERN_ENV = "UAC_ECH_VIA_PATTERN"
 ECH_VIA_PATTERN_SETTING = "ech_via_pattern"
 ECH_PATTERN_FAKE_SNI_ENV = "UAC_ECH_PATTERN_FAKE_SNI"
-#: wrong_seq never rewrites the relayed bytes: it injects a separate fake
-#: ClientHello with an out-of-window sequence, then relays Xray's bytes as-is.
-ECH_PATTERN_STRATEGY = "wrong_seq"
+#: On MCI the outer ECH SNI (cloudflare-ech.com) is filtered even after a
+#: wrong_seq decoy. ech_mci = wrong_seq fake hello, then fragment the real ECH
+#: ClientHello (default sni_chars) so the outer name is not one TCP segment.
+ECH_PATTERN_STRATEGY = "disoob_byte0"  # MCI: OOB+TTL1 bypass for cloudflare-ech.com outer SNI
 # Hyper-V / WinNAT often reserves a block around the preferred pair. Scan upward
 # from here only after a real bind of 20808/20809 fails.
 PORT_SCAN_START = 38408
@@ -960,9 +961,12 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
             tls["alpn"] = ["http/1.1"]
         elif parsed["alpn"]:
             tls["alpn"] = parsed["alpn"]
-        if (tuning.carrier_mode == "mci" and profile.origin == "builtin"
+        if (tuning.carrier_mode == "mci"
                 and parsed["network"] in {"ws", "httpupgrade"}):
-            tls["fingerprint"] = "chrome"
+            # Measured CH sizes on this Xray: chrome/firefox/~None ~1.5â€“1.9KB
+            # fail post-HS on MCI; ios/edge/qq = 517B â€” same size that got
+            # WS 101 with disoob_byte0 in the direct probe. Force ios.
+            tls["fingerprint"] = "ios"
         elif parsed["fingerprint"]:
             tls["fingerprint"] = parsed["fingerprint"]
         if parsed.get("ech"):
@@ -2084,7 +2088,7 @@ class Engine:
                 self._fragment_required = True
                 self.log(
                     f"ECH VIA PATTERN: on; Xray -> 127.0.0.1:{core_profile.config_port} -> Pattern "
-                    f"{ECH_PATTERN_STRATEGY} (ECH ClientHello relayed unchanged) "
+                    f"{ECH_PATTERN_STRATEGY} (OOB+TTL1 desync + relay real ECH ClientHello) "
                     f"fakeSni={core_tuning.pattern_fake_sni} edge={core_tuning.pattern_connect_ip}:"
                     f"{core_profile.port} fallback={core_tuning.pattern_fallback_ips or '-'}")
                 self.fragment.start(core_profile, core_tuning, ECH_PATTERN_STRATEGY)

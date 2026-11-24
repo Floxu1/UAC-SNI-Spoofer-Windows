@@ -8,11 +8,15 @@ available; a small QPainter fallback keeps controls usable in minimal builds.
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
 from html import escape
 from typing import Final
 
 from PySide6.QtCore import QByteArray, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
+
+from .paths import ASSETS
 
 try:
     from PySide6.QtSvg import QSvgRenderer
@@ -101,6 +105,9 @@ _ICONS: Final[dict[str, str]] = {
     """,
     "play": """
         <path d="m8 5 11 7-11 7V5Z"/>
+    """,
+    "pause": """
+        <path d="M9 5v14M15 5v14"/>
     """,
     "power": """
         <path d="M12 2v10"/><path d="M6.3 5.7a8 8 0 1 0 11.4 0"/>
@@ -209,8 +216,13 @@ def _colour(value: str | QColor) -> QColor:
     return colour
 
 
-def _svg(name: str, colour: QColor) -> bytes:
-    body = _ICONS.get(name)
+@lru_cache(maxsize=1)
+def _lucide_icons():
+    return json.loads((ASSETS / "ui" / "lucide-direct.json").read_text(encoding="utf-8"))
+
+
+def _svg(name: str, colour: QColor, lucide: bool = False) -> bytes:
+    body = (_lucide_icons() if lucide else _ICONS).get(name)
     if body is None:
         body = _ICONS["alert"]
     rgb = escape(colour.name(QColor.NameFormat.HexRgb), quote=True)
@@ -244,7 +256,7 @@ def _fallback_pixmap(name: str, colour: QColor, size: int) -> QPixmap:
     return result
 
 
-def pixmap(name: str, color: str = "#9fb4d8", size: int = 22) -> QPixmap:
+def pixmap(name: str, color: str = "#9fb4d8", size: int = 22, *, lucide=False) -> QPixmap:
     """Render *name* as a transparent square :class:`QPixmap`.
 
     Unknown names intentionally render the ``alert`` icon; a missing icon is
@@ -260,7 +272,7 @@ def pixmap(name: str, color: str = "#9fb4d8", size: int = 22) -> QPixmap:
 
     result = QPixmap(icon_size, icon_size)
     result.fill(Qt.GlobalColor.transparent)
-    renderer = QSvgRenderer(QByteArray(_svg(key, colour)))
+    renderer = QSvgRenderer(QByteArray(_svg(key, colour, lucide)))
     if not renderer.isValid():
         return _fallback_pixmap(key, colour, icon_size)
     painter = QPainter(result)
@@ -270,10 +282,10 @@ def pixmap(name: str, color: str = "#9fb4d8", size: int = 22) -> QPixmap:
     return result
 
 
-def icon(name: str, color: str = "#9fb4d8", size: int = 22) -> QIcon:
+def icon(name: str, color: str = "#9fb4d8", size: int = 22, *, lucide=False) -> QIcon:
     """Return a consistently styled :class:`QIcon` for buttons and labels."""
 
-    return QIcon(pixmap(name, color, size))
+    return QIcon(pixmap(name, color, size, lucide=lucide))
 
 
 __all__ = ["available_icons", "icon", "pixmap"]

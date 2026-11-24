@@ -12,8 +12,20 @@ datas = [
     ('bin/sing-box-LICENSE', 'bin'),
 
     ('bin/aether.exe', 'bin'),
+    ('core/aether/SOURCE.json', 'licenses/aether'),
+    ('core/aether/LICENSE', 'licenses/aether'),
+    ('core/quiche/COPYING', 'licenses/quiche'),
     ('bin/keyfetch-net.ps1', 'bin'),
     ('bin/uac-psiphon.exe', 'bin'),
+    ('bin/uac-pow-guard.exe', 'bin'),
+    ('bin/uac-direct.exe', 'bin'),
+    ('bin/uac-direct-xray.exe', 'bin'),
+    ('bin/uac-direct-xray-LICENSE', 'licenses/direct-xray'),
+    ('bin/uac-direct-mask.exe', 'bin'),
+    ('bin/uac-direct-guard.exe', 'bin'),
+    ('core/direct/SOURCE.json', 'licenses/direct'),
+    ('core/direct/LICENSE', 'licenses/direct'),
+    ('core/direct/BYEDPI-LICENSE', 'licenses/direct'),
 
     ('wizard guider', 'wizard guider'),
     (
@@ -26,7 +38,6 @@ datas += collect_data_files('pydivert.windivert_dll')
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
     datas=datas,
     hiddenimports=collect_submodules('dns'),
     hookspath=[],

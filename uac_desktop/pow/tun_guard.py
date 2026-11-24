@@ -37,7 +37,15 @@ PROBE_URLS = (
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 
 
-def harden_config(config: dict, stack: str = "mixed", mtu: int = 1400) -> dict:
+def effective_mtu(preferred: int, uplink_mtu: int) -> int:
+    """Apply the Android POW tunnel MTU bounds to the Windows uplink."""
+    mtu = max(1200, min(preferred, 1400))
+    if 576 <= uplink_mtu <= 9000:
+        return min(mtu, max(1200, uplink_mtu))
+    return mtu
+
+
+def harden_config(config: dict, stack: str = "mixed", mtu: int = 1400, ipv6_block: bool = True) -> dict:
     cfg = copy.deepcopy(config)
     cfg["log"] = {"level": "debug", "timestamp": False, "disabled": False}  # sniffed domains are DEBUG lines
     inbound = cfg["inbounds"][0]
@@ -60,7 +68,8 @@ def harden_config(config: dict, stack: str = "mixed", mtu: int = 1400) -> dict:
     for i, rule in enumerate(rules):
         if "process_name" in rule:
             insert_at = i + 1
-    rules.insert(insert_at, v6)
+    if ipv6_block:
+        rules.insert(insert_at, v6)
     route["rules"] = head + rules
     route["auto_detect_interface"] = True
     route["final"] = "proxy"
@@ -69,7 +78,7 @@ def harden_config(config: dict, stack: str = "mixed", mtu: int = 1400) -> dict:
     if not any(srv.get("tag") == "local-dns" for srv in servers):
         servers.append({"type": "local", "tag": "local-dns"})
     route["default_domain_resolver"] = "local-dns"
-    dns["strategy"] = "ipv4_only"
+    dns["strategy"] = "ipv4_only" if ipv6_block else "prefer_ipv4"
     dns["final"] = "remote-dns"
     return cfg
 
@@ -164,9 +173,36 @@ def _trace(session, proxies=None, timeout=8.0) -> dict:
     return out
 
 
-def verify_tun(socks_port: int, timeout: float = 8.0) -> tuple[bool, str, dict]:
+def verify_proxy(port: int, scheme: str, timeout: float = 6.0, *,
+                 stop: threading.Event | None = None) -> tuple[bool, str]:
+    endpoint = f"{scheme}://127.0.0.1:{port}"
+    reason = "no probe response"
+    with _session() as session:
+        for url in PROBE_URLS:
+            if stop is not None and stop.is_set():
+                return False, "verification cancelled"
+            try:
+                with session.get(
+                    url, timeout=timeout, proxies={"https": endpoint}, stream=True,
+                    allow_redirects=False,
+                ) as response:
+                    if stop is not None and stop.is_set():
+                        return False, "verification cancelled"
+                    if response.status_code == 204:
+                        return True, ""
+                    reason = f"HTTP {response.status_code}"
+            except Exception as exc:
+                reason = type(exc).__name__
+    return False, reason
+
+
+def verify_tun(socks_port: int, timeout: float = 8.0, *,
+               stop: threading.Event | None = None) -> tuple[bool, str, dict]:
     """(ok, reason, facts). Runs with the system proxy ignored."""
     facts: dict = {}
+    cancelled = stop.is_set if stop is not None else lambda: False
+    if cancelled():
+        return False, "verification cancelled", facts
     try:
         started = time.perf_counter()
         socket.getaddrinfo("www.youtube.com", 443, socket.AF_INET)
@@ -176,6 +212,8 @@ def verify_tun(socks_port: int, timeout: float = 8.0) -> tuple[bool, str, dict]:
     session = _session()
     try:
         for url in PROBE_URLS:
+            if cancelled():
+                return False, "verification cancelled", facts
             started = time.perf_counter()
             try:
                 r = session.get(url, timeout=timeout, headers={"Connection": "close"})
@@ -184,22 +222,27 @@ def verify_tun(socks_port: int, timeout: float = 8.0) -> tuple[bool, str, dict]:
             if r.status_code >= 500:
                 return False, f"https {url.split('/')[2]}: HTTP {r.status_code}", facts
             facts.setdefault("https_ms", int((time.perf_counter() - started) * 1000))
+        if cancelled():
+            return False, "verification cancelled", facts
         try:
             tun = _trace(session, timeout=timeout)
         except Exception as exc:
             return False, f"exit ip: {type(exc).__name__}", facts
         facts["ip"], facts["loc"] = tun.get("ip", ""), tun.get("loc", "")
+        if cancelled():
+            return False, "verification cancelled", facts
         try:
             proxies = {"https": f"socks5h://127.0.0.1:{socks_port}"}
             ref = _trace(session, proxies=proxies, timeout=timeout)
             facts["tunnel_ip"] = ref.get("ip", "")
         except Exception:
             facts["tunnel_ip"] = ""
-        if facts["tunnel_ip"]:
-            if facts["ip"] != facts["tunnel_ip"]:
-                return False, f"traffic bypasses tunnel ({facts['ip']} != {facts['tunnel_ip']})", facts
-        elif facts["loc"] == "IR":
-            return False, "exit ip is Iranian (traffic bypasses tunnel)", facts
+        if cancelled():
+            return False, "verification cancelled", facts
+        if not facts["tunnel_ip"] or not facts["ip"]:
+            return False, "could not verify the TUN and SOCKS exit addresses", facts
+        if facts["ip"] != facts["tunnel_ip"]:
+            return False, f"traffic bypasses tunnel ({facts['ip']} != {facts['tunnel_ip']})", facts
         return True, "", facts
     finally:
         session.close()
@@ -240,12 +283,14 @@ class SiteLog:
 
     MAX_SITES = 300
 
-    def __init__(self, stream, log: Callable[[str], None], show_direct: bool = False) -> None:
+    def __init__(self, stream, log: Callable[[str], None], show_direct: bool = False,
+                 observe_tunnel_host: Callable[[str], None] | None = None) -> None:
         # Direct lines are mostly our own cores (Psiphon fronting decoys);
         # only shown when the user has App Bypass entries.
         self._show_direct = show_direct
         self._stream = stream
         self._log = log
+        self._observe_tunnel_host = observe_tunnel_host
         self._domains: dict[str, str] = {}
         self._seen: set[str] = set()
         self._errors: dict[str, float] = {}
@@ -275,6 +320,8 @@ class SiteLog:
             host = self._domains.get(cid, host)
             if _IP.match(host) or port == "53":
                 return
+            if tag == "proxy" and self._observe_tunnel_host is not None:
+                self._observe_tunnel_host(host)
             key = host.lower()
             if key in self._seen or len(self._seen) >= self.MAX_SITES:
                 return

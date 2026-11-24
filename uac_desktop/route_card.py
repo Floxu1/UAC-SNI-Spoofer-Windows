@@ -1,12 +1,8 @@
-"""Active Route card: clean config titles + a tidy multi-line route detail."""
+"""Labels and connection hints for the active route."""
 from __future__ import annotations
 
 import re
 import unicodedata
-
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontMetrics
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from .verified_configs import COUNTRIES
 
@@ -82,66 +78,3 @@ def ping_color(ms) -> str:
     if ms <= 0:
         return "#8fa9bf"
     return "#45f3b4" if ms < 400 else "#ffd166" if ms < 1200 else "#ff8798"
-
-
-class _Elided(QLabel):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._full = ""
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-        self.setTextFormat(Qt.PlainText)
-
-    def set_full(self, text):
-        self._full = str(text or "")
-        self._sync()
-
-    def _sync(self):
-        width = self.contentsRect().width()
-        shown = QFontMetrics(self.font()).elidedText(self._full, Qt.ElideMiddle, width) if width > 0 else self._full
-        super().setText(shown)
-        self.setToolTip(self._full if shown != self._full else "")
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._sync()
-
-
-class RouteDetails(QWidget):
-    """Two rows: [pill] endpoint  /  SNI (elided). No ping here."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setObjectName("routeDetails")
-        self.setLayoutDirection(Qt.LeftToRight)   # IPs/hosts always LTR
-        root = QVBoxLayout(self); root.setContentsMargins(0, 0, 0, 0); root.setSpacing(3)
-        row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(6)
-        self.pill = QLabel(); self.pill.setObjectName("routePill"); self.pill.setAlignment(Qt.AlignCenter)
-        self.endpoint = _Elided(); self.endpoint.setObjectName("routeEndpoint")
-        self.ping = QLabel(); self.ping.setObjectName("routePing")
-        self.ping.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        row.addWidget(self.pill); row.addWidget(self.endpoint, 1)
-        self.ping.hide()  # ping lives in the Ping stat card, not here
-        self.sni = _Elided(); self.sni.setObjectName("routeSni")
-        root.addLayout(row); root.addWidget(self.sni)
-        self.setStyleSheet(
-            "QLabel#routePill { font-family: 'Inter', 'Segoe UI'; border-radius: 7px; padding: 1px 7px; font-size: 10px; font-weight: 800; }"
-            "QLabel#routeEndpoint { font-family: 'JetBrains Mono', 'Consolas'; color: #cfe3f2; font-size: 11px; }"
-            "QLabel#routePing { font-family: 'JetBrains Mono', 'Consolas'; font-size: 11px; font-weight: 700; }"
-            "QLabel#routeSni { font-family: 'JetBrains Mono', 'Consolas'; color: #8fa9bf; font-size: 10px; }")
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-
-    PILL_COLORS = {"ECH": "#c4b5fd", "Reality": "#62dcff", "Gene": "#ffd166", "Spoof": "#45f3b4"}
-
-    def set_route(self, kind, endpoint, ping_ms, sni_label, sni):
-        color = self.PILL_COLORS.get(kind, "#afc5dc")
-        self.pill.setText(kind)
-        self.pill.setStyleSheet(f"color: {color}; border: 1px solid {color}; background: rgba(255,255,255,0.04);")
-        self.endpoint.set_full(endpoint)
-        try:
-            ping_ok = float(ping_ms or 0) > 0
-        except (TypeError, ValueError):
-            ping_ok = False
-        self.ping.setText(f"{float(ping_ms):.0f} ms" if ping_ok else "\u2014")
-        self.ping.setStyleSheet(f"color: {ping_color(ping_ms)};")
-        self.sni.set_full(f"{sni_label} {sni}".strip() if sni else "")
-        self.sni.setVisible(bool(sni))
