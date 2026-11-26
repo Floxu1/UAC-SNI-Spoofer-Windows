@@ -1,4 +1,5 @@
 from . import __version__
+from .install_type import PORTABLE_ASSET
 
 
 UPDATE_REPOSITORY_URL = "https://github.com/Floxu1/UAC-SNI-Spoofer-Windows"
@@ -17,7 +18,7 @@ LATEST_VERSION_URL = github_latest_release_api(UPDATE_REPOSITORY_URL)
 UPDATE_CHECK_ENDPOINT = LATEST_VERSION_URL
 PORTABLE_DOWNLOAD_URL = (
     f"{GITHUB_RELEASES_URL}/latest/download/"
-    f"UAC-Spoofer-Desktop-v{CURRENT_VERSION}-Windows-x64-portable.zip"
+    f"{PORTABLE_ASSET}"
 )
 SUGGESTED_CONFIGS_URL = (
     "https://raw.githubusercontent.com/Floxu1/"

@@ -26,7 +26,8 @@ from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
                                QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
-PATTERNIHA_URL = "https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt"
+from .github_blob import DEFAULT_REPOSITORY_URL as PATTERNIHA_URL
+
 SETTING_KEY = "wizard_seen_version"
 ECH_OUTER_SNI = "cloudflare-ech.com"
 

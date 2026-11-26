@@ -247,22 +247,17 @@ def test_engine_option_on_routes_ech_via_pattern_core(monkeypatch, tmp_path):
 
 # ------------------------------------------------------------- settings toggle
 
-def test_tuning_dialog_toggle_default_off_and_round_trip(monkeypatch):
+def test_xray_settings_toggle_default_off_and_round_trip():
     import os
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication, QWidget
-    from uac_desktop import proxy_port_panel, ui
+    from PySide6.QtWidgets import QApplication
+    from uac_desktop import ui
     app = QApplication.instance() or QApplication([])
 
-    def fake_install(dialog):
-        dialog._proxy_ports_section = QWidget()
-
-    # The real panel needs a MainWindow parent (pre-existing test limitation).
-    monkeypatch.setattr(proxy_port_panel, "install_xray_ports_into_tuning", fake_install)
     tuning = Tuning.carrier_preset("auto")
-    default = ui.TuningDialog(None, tuning, "fa")
+    default = ui.XraySettingsPage(None, tuning, "fa")
     assert default.ech_via_pattern_value() is False
-    enabled = ui.TuningDialog(None, tuning, "en", ech_via_pattern=True)
+    enabled = ui.XraySettingsPage(None, tuning, "en", ech_via_pattern=True)
     assert enabled.ech_via_pattern_value() is True
     enabled.ech_via_pattern.setChecked(False)
     assert enabled.ech_via_pattern_value() is False

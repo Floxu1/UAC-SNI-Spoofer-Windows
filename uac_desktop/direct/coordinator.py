@@ -19,11 +19,14 @@ from .carrier import DirectCancelled, DirectCarrier, NativeAttempt, ensure_activ
 from .country import start_country
 from .output import (
     DIRECT_MASK, DIRECT_NATIVE, DIRECT_XRAY, OwnedHelper, OutputError,
-    activate_os_proxy, require_admin, start_masks, start_tun, start_xray, verify_tun,
-    xray_traffic,
+    require_admin, start_masks, start_tun, start_xray, verify_tun,
 )
+from ..traffic import loopback_ports, SessionTraffic, xray_traffic
 from .probe import ProbeResult, select_dns, trace, verify_http_proxy, verify_https, verify_payload
+from .resolvers import parse_resolver
 from .store import DirectSettings, DirectStore
+from ..application_settings import ConnectionPreferences
+from ..engine import WindowsProxy
 from .xray import build_config
 
 
@@ -38,7 +41,8 @@ class DirectOptions:
     mtu: int = 1400
     socks_port: int = 0
     http_port: int = 0
-    system_proxy: bool = True
+    system_proxy: bool | None = None
+    privacy: ConnectionPreferences | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +60,11 @@ class DirectStatus:
     protected: bool = False
     tx_bytes: int = 0
     rx_bytes: int = 0
+    probe_port: int = 0
+    dns_lab_port: int = 0
+    resolver_address: str = ""
+    dns_udp_supported: bool = True
+    disconnect_failed: bool = False
 
 
 @dataclass
@@ -63,6 +72,9 @@ class _Route:
     socks_port: int
     http_port: int
     stats_port: int
+    probe_port: int
+    dns_lab_port: int
+    traffic: SessionTraffic
     is_chained: bool
     carrier: NativeAttempt | None
     xray: OwnedHelper
@@ -100,7 +112,10 @@ class DirectCoordinator:
         self._pause_request = threading.Event()
         self._exit_refresh = threading.Event()
         self._paused = False
+        self._pending_dns: DirectSettings | None = None
         self._session_vpn: bool | None = None
+        self._proxy: WindowsProxy | None = None
+        self._system_proxy_requested = False
         self._status = DirectStatus()
         self._carrier = DirectCarrier(self.store, identity_path(pow_directory), _network_key, log)
 
@@ -119,6 +134,24 @@ class DirectCoordinator:
         with self._lock:
             return self._session_vpn if self._worker is not None else None
 
+    @property
+    def system_proxy_enabled(self) -> bool | None:
+        proxy = self._proxy
+        return proxy.session_enabled if proxy is not None else None
+
+    def set_system_proxy_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            proxy = self._proxy
+            if proxy is None or self._status.phase != "connected" or self._stop.is_set():
+                raise RuntimeError("Direct's local proxy is not ready.")
+            proxy.set_session_enabled(enabled)
+            self._system_proxy_requested = enabled
+
+    def _restore_system_proxy(self, proxy: WindowsProxy) -> None:
+        with self._lock:
+            self._proxy = None
+            proxy.restore_session()
+
     def connect(self, options: DirectOptions, *, settings: DirectSettings | None = None) -> bool:
         with self._lock:
             if self._worker is not None:
@@ -131,7 +164,9 @@ class DirectCoordinator:
             self._pause_request.clear()
             self._exit_refresh.clear()
             self._paused = False
+            self._pending_dns = None
             self._session_vpn = options.vpn
+            self._system_proxy_requested = not options.vpn if options.system_proxy is None else options.system_proxy
             self._status = DirectStatus(phase="starting", progress=5)
             settings = settings if settings is not None else self.store.settings()
             output = "VPN" if options.vpn else "Proxy"
@@ -163,6 +198,14 @@ class DirectCoordinator:
             if self._status.phase in ("connected", "paused"):
                 self._exit_refresh.set()
 
+    def reload_dns(self, settings: DirectSettings) -> bool:
+        with self._lock:
+            if self._worker is None or self._stop.is_set() or self._status.phase not in ("connected", "paused"):
+                return False
+            self._pending_dns = settings
+            self._network_event.set()
+            return True
+
     def set_paused(self, paused: bool, *, proxy_only: bool = False) -> bool:
         with self._lock:
             if proxy_only and self._session_vpn is not False:
@@ -192,6 +235,7 @@ class DirectCoordinator:
 
     def _run(self, options: DirectOptions, settings: DirectSettings) -> None:
         final = DirectStatus()
+        stop_error = None
         guard = None
         notifications = None
         try:
@@ -205,13 +249,18 @@ class DirectCoordinator:
             with tempfile.TemporaryDirectory(prefix="session-", dir=self.store.directory) as session:
                 directory = Path(session)
                 socks_port = options.socks_port or loopback_port()
-                http_port = 0 if options.vpn else (options.http_port or loopback_port())
+                http_port = options.http_port or loopback_port()
                 while http_port == socks_port:
                     http_port = loopback_port()
                 recovered = False
                 was_paused = False
                 while True:
                     ensure_active(self._stop)
+                    with self._lock:
+                        if self._pending_dns is not None:
+                            update, self._pending_dns = self._pending_dns, None
+                            settings = replace(settings, auto_select_dns=update.auto_select_dns,
+                                               pinned_dns=update.pinned_dns, unfiltered_dns=update.unfiltered_dns)
                     self._pause_request.clear()
                     if options.vpn and options.kill_switch:
                         if self._paused and guard:
@@ -231,9 +280,12 @@ class DirectCoordinator:
                         route = self._connect_route(active, settings, options, directory, socks_port,
                                                     http_port, self._paused, allow)
                         ensure_active(self._stop)
-                        if options.system_proxy and (not options.vpn or not self._paused):
-                            proxy = activate_os_proxy(options.vpn, socks_port, http_port, self._log)
-                            active.callback(proxy.disable)
+                        proxy = WindowsProxy(self._log)
+                        active.callback(self._restore_system_proxy, proxy)
+                        tun_active = route.tun is not None
+                        proxy.bind_session(http_port if tun_active else socks_port, http_port,
+                                           enabled=self._system_proxy_requested, tun=tun_active)
+                        self._proxy = proxy
                         ensure_active(self._stop)
                         if not route.healthy():
                             raise OutputError("Direct helper stopped before output activation")
@@ -244,26 +296,30 @@ class DirectCoordinator:
                                 self._log(f"Direct could not save the verified route: {error}")
                         self._publish(phase="paused" if self._paused else "connected", progress=100,
                                       detail="Direct connection paused" if self._paused else "Direct DNS and HTTPS verified",
-                                      socks_port=socks_port, http_port=http_port)
+                                      socks_port=socks_port, http_port=http_port, probe_port=route.probe_port,
+                                      dns_lab_port=route.dns_lab_port)
                         if not self._stop.is_set():
                             self._log("Direct paused" if self._paused else
                                       "Direct resumed" if was_paused else "Direct connected")
                         was_paused = self._paused
                         reason = self._monitor(route, network, options, guard)
-                        if reason == "pause":
+                        if reason in ("pause", "dns"):
                             recovered = False
                         elif recovered:
                             raise OutputError(f"Direct recovery stopped: {reason}")
                         else:
                             recovered = True
                             self._log(f"Direct recovering: {reason}")
-                        self._publish(phase="recovering", detail=reason, progress=5)
-                    if reason != "pause":
+                        self._publish(phase="recovering", detail="Applying the selected DNS" if reason == "dns" else reason, progress=5)
+                    if reason not in ("pause", "dns"):
                         self._stop.wait(1)
         except DirectCancelled:
             pass
         except Exception as error:
-            if not self._stop.is_set():
+            if self._stop.is_set():
+                stop_error = error
+                self._log(f"Direct disconnect failed: {error}")
+            else:
                 final = DirectStatus(phase="error", detail=str(error))
                 self._log(f"Direct failed: {error}")
                 if guard and guard.running and not self._paused:
@@ -281,13 +337,18 @@ class DirectCoordinator:
                     notifications.close()
                 if guard:
                     guard.close()
-            except (OSError, RuntimeError) as error:
+            except Exception as error:
+                stop_error = error
                 self._log(f"Direct cleanup failed: {error}")
             finally:
                 with self._lock:
                     if self._stop.is_set():
                         self._log("Direct stopped")
-                    self._status = DirectStatus() if self._stop.is_set() else final
+                    if self._stop.is_set():
+                        self._status = (DirectStatus(phase="error", detail=str(stop_error), disconnect_failed=True)
+                                        if stop_error is not None else DirectStatus())
+                    else:
+                        self._status = final
                     self._worker = None
                     self._report(self._status)
 
@@ -315,8 +376,8 @@ class DirectCoordinator:
                      directory: Path, socks: int, http: int, paused: bool,
                      allow_tunnel: Callable[[bool], None], skip: str | None) -> _Route:
         self._publish(phase="starting", progress=10, detail="Preparing Direct routes",
-                      socks_port=0, http_port=0, resolver="", dns_ms=0, carrier="", country="", exit_ip="",
-                      tx_bytes=0, rx_bytes=0)
+                      socks_port=0, http_port=0, resolver="", resolver_address="", dns_ms=0, carrier="", country="", exit_ip="",
+                      tx_bytes=0, rx_bytes=0, probe_port=0, dns_lab_port=0, dns_udp_supported=True)
         carrier = None
         country = None
         resolve = None
@@ -328,7 +389,7 @@ class DirectCoordinator:
             stack.callback(carrier.close)
             exit_port = carrier.port
             region = settings.exit_country_code.upper()
-            self._publish(carrier=carrier.selected_peer or "")
+            self._publish(carrier=carrier.selected_peer or "", dns_udp_supported=not region)
             if region:
                 exit_port = loopback_port()
 
@@ -347,22 +408,33 @@ class DirectCoordinator:
             selection = select_dns(exit_port, self._stop)
             if selection:
                 resolve, latency = selection
-                self._publish(resolver=resolve.label, dns_ms=latency)
+                self._publish(resolver=resolve.label, resolver_address=resolve.url, dns_ms=latency)
             else:
                 self._log("Direct resolver selection had no usable result; using configured DNS")
+        elif settings.pinned_dns and not paused:
+            resolve = parse_resolver(settings.pinned_dns)
+            if region and resolve.protocol == "UDP":
+                self._log("Direct selected country does not support UDP DNS; using fallback DNS")
+                resolve = None
+            else:
+                self._publish(resolver=resolve.label, resolver_address=resolve.url)
+        if resolve:
+            self._log(f"Direct DNS preference: {resolve.label} ({resolve.protocol})")
 
         self._publish(progress=50, detail="Starting Direct Xray routes")
         masks = start_masks(directory, settings.ipv6, stack, self._stop, self._log) if not carrier and not paused else {}
-        stats_port = loopback_port()
-        while stats_port in (socks, http, exit_port, *masks.values()):
-            stats_port = loopback_port()
+        stats_port, probe_port, dns_lab_port = loopback_ports(3, exclude=(socks, http, exit_port, *masks.values()))
+        native_http = 0 if options.vpn and not paused else http
+        guarded = options.vpn and options.kill_switch and not paused
+        routing_settings = replace(settings, iran_direct=False, domains_direct="", ips_direct="") if guarded else settings
         for noise in ((True, False) if settings.udp_noise else (False,)):
-            config = build_config(settings, socks, http_port=http, stats_port=stats_port,
+            config = build_config(routing_settings, socks, http_port=native_http, stats_port=stats_port,
+                                  probe_port=probe_port, dns_lab_port=dns_lab_port,
                                   exit_port=exit_port, country_exit=bool(region),
                                   session_dns=resolve, paused=paused, noise_allowed=noise,
-                                  mask_ports=masks, whitelist=options.whitelist)
+                                  mask_ports=masks, whitelist=() if guarded else options.whitelist)
             try:
-                xray = start_xray(directory, config, socks, http, self._stop, self._log)
+                xray = start_xray(directory, config, socks, native_http, self._stop, self._log)
                 stack.callback(xray.close)
                 break
             except OutputError:
@@ -373,7 +445,7 @@ class DirectCoordinator:
         if options.vpn and not paused:
             tun = start_tun(directory, settings, socks, options.dns_server, options.routing_mode,
                             options.processes, options.mtu, _physical_uplink_mtu(), self._stop,
-                            self._log, allow_tunnel)
+                            self._log, allow_tunnel, privacy=options.privacy, proxy_port=http)
             stack.callback(tun.close)
             stack.callback(allow_tunnel, False)
         if region and not settings.auto_select_dns:
@@ -382,11 +454,13 @@ class DirectCoordinator:
         self._publish(phase="checking", progress=75, detail="Checking DNS and HTTPS payload")
         rounds = 8 if region else 3 if settings.adaptive_client_hello else 2
         for index in range(rounds):
-            result = verify_payload(socks, options.dns_server, self._stop)
+            result = verify_payload(probe_port, options.dns_server, self._stop)
             if result.ok and http:
-                result = verify_http_proxy(http)
+                output = verify_http_proxy(http)
+                result = ProbeResult(output.ok, f"{result.detail}; {output.detail}")
             if result.ok and tun:
-                result = verify_tun(socks, options.dns_server, bool(carrier), self._stop)
+                output = verify_tun(probe_port, options.dns_server, bool(carrier), self._stop)
+                result = ProbeResult(output.ok, f"{result.detail}; {output.detail}")
             if result.ok:
                 break
             self._log(f"Direct startup check {index + 1}/{rounds} failed: {result.detail}")
@@ -397,8 +471,12 @@ class DirectCoordinator:
             peer = carrier.selected_peer if carrier else None
             raise _PayloadFailure(result, peer.partition(":")[0] if peer else None)
         self._log(f"Direct DNS and HTTPS verified: {result.detail}")
-        self._read_exit(socks, region)
-        return _Route(socks, http, stats_port, bool(carrier), carrier, xray, tun, country)
+        self._read_exit(probe_port, region)
+        traffic = SessionTraffic()
+        counts = xray_traffic(DIRECT_XRAY, stats_port)
+        if counts is not None:
+            traffic.update({stats_port: counts})
+        return _Route(socks, http, stats_port, probe_port, dns_lab_port, traffic, bool(carrier), carrier, xray, tun, country)
 
     def _read_exit(self, socks: int, region: str = "", *, manual=False) -> None:
         try:
@@ -422,13 +500,15 @@ class DirectCoordinator:
             ensure_active(self._stop)
             if self._pause_request.is_set():
                 return "pause"
+            if self._pending_dns is not None and not self._paused:
+                return "dns"
             if guard and not guard.running:
                 raise OutputError("Direct VPN protection stopped")
             if not route.healthy():
                 return "A Direct connection helper stopped"
             if self._exit_refresh.is_set():
                 self._exit_refresh.clear()
-                self._read_exit(route.socks_port, manual=True)
+                self._read_exit(route.probe_port, manual=True)
             if self._network_event.is_set():
                 self._network_event.clear()
                 resumed = self._resume.is_set()
@@ -440,21 +520,22 @@ class DirectCoordinator:
                     due = time.monotonic()
             now = time.monotonic()
             if now >= stats_due:
-                counts = xray_traffic(route.stats_port)
+                counts = xray_traffic(DIRECT_XRAY, route.stats_port)
                 if counts is not None:
-                    self._publish(tx_bytes=counts[0], rx_bytes=counts[1])
+                    upload, download = route.traffic.update({route.stats_port: counts})
+                    self._publish(tx_bytes=upload, rx_bytes=download)
                 stats_due = time.monotonic() + 2
             if now < due:
                 self._stop.wait(min(0.25, due - now))
                 continue
             if route.tun:
-                result = verify_tun(route.socks_port, options.dns_server, route.is_chained, self._stop)
+                result = verify_tun(route.probe_port, options.dns_server, route.is_chained, self._stop)
             elif failures == 0:
-                result = verify_https("https://www.cloudflare.com/cdn-cgi/trace", route.socks_port, timeout=2)
+                result = verify_https("https://www.cloudflare.com/cdn-cgi/trace", route.probe_port, timeout=2)
                 if not result.ok:
-                    result = verify_payload(route.socks_port, options.dns_server, self._stop)
+                    result = verify_payload(route.probe_port, options.dns_server, self._stop)
             else:
-                result = verify_payload(route.socks_port, options.dns_server, self._stop)
+                result = verify_payload(route.probe_port, options.dns_server, self._stop)
             if result.ok:
                 failures = 0
                 due = time.monotonic() + 30

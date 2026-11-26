@@ -1,0 +1,38 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <UI Id="UacInstallerOptions">
+      <Dialog Id="ShortcutOptionsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="Banner" Type="Bitmap" X="0" Y="0" Width="370" Height="44" Text="WixUI_Bmp_Banner" />
+        <Control Id="Title" Type="Text" X="18" Y="8" Width="290" Height="16" Transparent="yes"
+                 Text="{\WixUI_Font_Title}Shortcut options" />
+        <Control Id="HeaderRule" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Desktop" Type="CheckBox" X="24" Y="70" Width="315" Height="18"
+                 Property="UI_DESKTOP_CHECKED" CheckBoxValue="1" Text="Create &amp;desktop shortcut" />
+        <Control Id="StartMenu" Type="CheckBox" X="24" Y="97" Width="315" Height="18"
+                 Property="UI_STARTMENU_CHECKED" CheckBoxValue="1" Text="Create &amp;Start Menu shortcut" />
+        <Control Id="FooterRule" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back">
+          <Publish Event="NewDialog" Value="InstallDirDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="&amp;Next">
+          <?foreach Kind in DESKTOP;STARTMENU ?>
+            <Publish Property="UAC_$(var.Kind)_SHORTCUT" Value="0" Order="1" Condition="NOT UI_$(var.Kind)_CHECKED" />
+            <Publish Property="UAC_$(var.Kind)_SHORTCUT" Value="1" Order="2" Condition="UI_$(var.Kind)_CHECKED = &quot;1&quot;" />
+          <?endforeach?>
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Order="3" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+      <DialogRef Id="CancelDlg" />
+      <!-- These later navigation events retain WixUI's native path validation. -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="ShortcutOptionsDlg" Order="5"
+               Condition="NOT Installed AND WIXUI_INSTALLDIR_VALID = &quot;1&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="ShortcutOptionsDlg" Order="3"
+               Condition="NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchUacFromShell" Order="1"
+               Condition="UILevel = 5 AND NOT Installed AND WIXUI_EXITDIALOGOPTIONALCHECKBOX = &quot;1&quot; AND WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" />
+    </UI>
+  </Fragment>
+</Wix>

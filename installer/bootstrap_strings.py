@@ -1,0 +1,68 @@
+"""Text shared by every page and state of the graphical setup."""
+
+TEXT = {
+    "setup": ("Setup", "نصب برنامه"),
+    "edition": ("WINDOWS EDITION", "نسخهٔ ویندوز"),
+    "tagline": ("One application. Three powerful engines.", "یک برنامه با سه موتور اتصال"),
+    "welcome": ("Welcome", "خوش‌آمد"),
+    "options": ("Options", "گزینه‌ها"),
+    "install": ("Install", "نصب"),
+    "finish": ("Finish", "پایان"),
+    "ready": ("Ready to get started?", "آمادهٔ نصب هستید؟"),
+    "intro": ("Install UAC Spoofer Desktop on your computer.\nAll three engines are included in this offline package.",
+              "برنامهٔ UAC Spoofer Desktop را روی رایانه نصب کنید.\nهر سه موتور در این بستهٔ آفلاین قرار دارند."),
+    "offline": ("Offline installation  ·  Automatic updates", "نصب آفلاین  ·  به‌روزرسانی خودکار"),
+    "start": ("Get started", "شروع نصب"),
+    "cancel": ("Cancel", "انصراف"),
+    "back": ("Back", "بازگشت"),
+    "close": ("Close", "بستن"),
+    "keep": ("Continue installation", "ادامهٔ نصب"),
+    "retry": ("Try again", "تلاش دوباره"),
+    "folder": ("Installation folder", "پوشهٔ نصب"),
+    "browse": ("Browse…", "انتخاب پوشه…"),
+    "select": ("Select folder", "انتخاب پوشه"),
+    "desktop": ("Create desktop shortcut", "ایجاد میان‌بر روی دسکتاپ"),
+    "menu": ("Create Start Menu shortcut", "ایجاد میان‌بر در منوی شروع"),
+    "now": ("Install now", "اکنون نصب کن"),
+    "invalid": ("Choose a valid folder on a local drive.", "پوشه‌ای معتبر روی یکی از درایوهای محلی انتخاب کنید."),
+    "busy": ("Close UAC Spoofer Desktop before installing.", "پیش از نصب، برنامهٔ UAC Spoofer Desktop را ببندید."),
+    "installing": ("Installing UAC Spoofer Desktop", "در حال نصب UAC Spoofer Desktop"),
+    "waiting": ("Waiting for Windows Installer…", "در انتظار Windows Installer…"),
+    "cancel_title": ("Cancel installation?", "نصب لغو شود؟"),
+    "cancel_help": ("Windows Installer will roll back any changes it has made.",
+                    "Windows Installer تغییرات این نصب را بازمی‌گرداند."),
+    "canceling": ("Stopping installation and restoring files…", "در حال توقف نصب و بازگرداندن فایل‌ها…"),
+    "canceled": ("Installation was canceled.", "نصب لغو شد."),
+    "permission": ("Windows did not grant permission to install.", "ویندوز اجازهٔ نصب را صادر نکرد."),
+    "integrity": ("The installation package could not be verified or opened.",
+                  "بستهٔ نصب قابل باز کردن یا اعتبارسنجی نبود."),
+    "worker_failed": ("Could not communicate with Windows Installer.", "ارتباط با Windows Installer برقرار نشد."),
+    "failed": ("Installation could not finish", "نصب کامل نشد"),
+    "error": ("Windows Installer returned error {code}.", "Windows Installer خطای {code} را گزارش کرد."),
+    "code": ("Installer detail: {code}", "جزئیات نصب: {code}"),
+    "success": ("Installation complete", "نصب کامل شد"),
+    "installed": ("UAC Spoofer Desktop is ready to use.", "برنامهٔ UAC Spoofer Desktop آمادهٔ استفاده است."),
+    "reboot": ("Restart Windows to finish setup.", "برای تکمیل نصب، ویندوز را راه‌اندازی مجدد کنید."),
+    "launch": ("Launch UAC Spoofer Desktop", "اجرای UAC Spoofer Desktop"),
+    "launch_failed": ("Could not open UAC Spoofer Desktop.", "برنامهٔ UAC Spoofer Desktop باز نشد."),
+    "language_failed": ("Setup could not save the first-run language.", "ذخیرهٔ زبان اجرای اول ممکن نبود."),
+    "ExtractPayload": ("Verifying the offline package…", "در حال بررسی بستهٔ آفلاین…"),
+    "InstallInitialize": ("Preparing the installation…", "در حال آماده‌سازی نصب…"),
+    "CostFinalize": ("Checking disk space…", "در حال بررسی فضای درایو…"),
+    "InstallValidate": ("Checking files and folders…", "در حال بررسی فایل‌ها و پوشه‌ها…"),
+    "RemoveExistingProducts": ("Updating the previous installation…", "در حال ارتقای نصب قبلی…"),
+    "InstallFiles": ("Copying application files…", "در حال کپی فایل‌های برنامه…"),
+    "CreateShortcuts": ("Creating shortcuts…", "در حال ساخت میان‌برها…"),
+    "WriteRegistryValues": ("Saving installation choices…", "در حال ذخیرهٔ گزینه‌های نصب…"),
+    "RegisterProduct": ("Registering the installed application…", "در حال ثبت برنامه در ویندوز…"),
+    "InstallFinalize": ("Completing the installation…", "در حال تکمیل نصب…"),
+    "action": ("Windows Installer is running {action}…", "Windows Installer در حال اجرای مرحلهٔ {action} است…"),
+}
+
+
+def translate(language: str, key: str, **values) -> str:
+    text = TEXT[key][language == "fa"].format(**values)
+    if language == "fa":
+        for name in ("UAC Spoofer Desktop", "Windows Installer"):
+            text = text.replace(name, f"\u2066{name}\u2069")
+    return text

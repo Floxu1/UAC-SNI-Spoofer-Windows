@@ -215,6 +215,7 @@ def refresh_dummy(storage):
         tr=lambda _fa, en=None: en or _fa,
         _refresh_country_selector=lambda: None,
         _update_config_actions=lambda: None,
+        _update_route_card=lambda *_: None,
         _profile_route_label=lambda item, _carrier=None: (
             item.target_label if item is not None else ""
         ),

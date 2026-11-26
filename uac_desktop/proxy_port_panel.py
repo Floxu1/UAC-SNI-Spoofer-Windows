@@ -1,6 +1,6 @@
 """Local-proxy port editors for engine settings.
 
-Engine 1 (Xray): section inside TuningDialog (Advanced Settings).
+Engine 1 (Xray): card on the Xray settings page.
 Engine 2 (PoW): card on the PoW settings page.
 
 Reuses :mod:`uac_desktop.proxy_ports` for validation and persistence.
@@ -16,7 +16,7 @@ from . import proxy_ports as P
 
 
 def _numeric(window, value: int, minimum: int, maximum: int):
-    """Build a NumericInput (same control as TuningDialog) with LTR digits."""
+    """Build a NumericInput (same control as the engine settings) with LTR digits."""
     from uac_desktop.ui import NumericInput
 
     widget = NumericInput(value, minimum, maximum)
@@ -58,13 +58,13 @@ class PortEditor(QWidget):
                 w.plus.clicked.connect(self._commit_soon)
                 w.minus.clicked.connect(self._commit_soon)
 
-        self.note = QLabel()
+        self.note = QLabel(self)
         window._bind_text(self.note, "از اتصال بعدی اعمال می‌شود", "Applies on the next connect")
         self.note.setObjectName("proxyPortPanelNote")
         self.note.setWordWrap(True)
         self.note.setVisible(False)
 
-        self.error = QLabel("")
+        self.error = QLabel(self)
         self.error.setObjectName("proxyPortPanelError")
         self.error.setWordWrap(True)
         self.error.setStyleSheet("color: #ff6b6b;")
@@ -254,57 +254,27 @@ def build_pow_ports_section(window, controller) -> QFrame:
     return section
 
 
-def install_xray_ports_into_tuning(dialog, window=None) -> PortEditor | None:
-    """Add the ports editor when the settings dialog has an app storage owner."""
-    host = window
-    if host is None:
-        host = dialog.parent()
-    walk = host
-    while walk is not None and not hasattr(walk, "storage"):
-        walk = walk.parent() if hasattr(walk, "parent") else None
-    if walk is not None:
-        host = walk
-    if host is None or not hasattr(host, "storage"):
-        return None
-    editor = PortEditor(host, mode="xray", parent=dialog)
-    dialog.proxy_port_editor = editor
-    dialog.proxy_socks_input = editor.socks
-    dialog.proxy_http_input = editor.http
-
-    # Build section with same _section helper as the rest of the dialog
-    section = dialog._section(
-        dialog.t("پورت پروکسی محلی", "Local proxy ports"),
-        dialog.t(
-            "پورت‌هایی که پروکسی سیستم ویندوز به آن‌ها وصل می‌شود (موتور ۱ · Xray).",
-            "Ports the Windows system proxy uses (Engine 1 · Xray).",
-        ),
+def install_xray_ports_into_settings(page, window) -> QFrame:
+    editor = PortEditor(window, mode="xray", parent=page)
+    page.proxy_port_editor = editor
+    page.proxy_socks_input = editor.socks
+    page.proxy_http_input = editor.http
+    section = page._section(
+        ("پورت‌های پروکسی محلی", "Local proxy ports"),
+        ("درگاه اتصال به موتور Xray", "Ports used to connect to Xray"),
         [
-            (dialog.t("پورت SOCKS5", "SOCKS5 port"), editor.socks,
-             dialog.t(f"پیش‌فرض {P.XRAY_SOCKS_DEFAULT}", f"Default {P.XRAY_SOCKS_DEFAULT}")),
-            (dialog.t("پورت HTTP", "HTTP port"), editor.http,
-             dialog.t(f"پیش‌فرض {P.XRAY_HTTP_DEFAULT}", f"Default {P.XRAY_HTTP_DEFAULT}")),
+            (("پورت SOCKS5", "SOCKS5 port"), editor.socks,
+             (f"پیش‌فرض {P.XRAY_SOCKS_DEFAULT}", f"Default {P.XRAY_SOCKS_DEFAULT}")),
+            (("پورت HTTP", "HTTP port"), editor.http,
+             (f"پیش‌فرض {P.XRAY_HTTP_DEFAULT}", f"Default {P.XRAY_HTTP_DEFAULT}")),
         ],
-        dialog.t(
-            "با پایان ویرایش ذخیره می‌شود. وقتی وصل هستید از اتصال بعدی اعمال می‌شود.",
-            "Saved when you finish editing. Applies on the next connect if already connected.",
-        ),
+        ("با پایان ویرایش ذخیره می‌شود. وقتی وصل هستید از اتصال بعدی اعمال می‌شود.",
+         "Saved when you finish editing. Applies on the next connect if already connected."),
+        icon="network",
     )
-    # Defaults button + note/error under the section
-    extras = QHBoxLayout()
-    extras.setContentsMargins(18, 0, 18, 8)
-    extras.addWidget(editor.reset_btn)
-    extras.addStretch(1)
-    wrap = QFrame()
-    wrap.setObjectName("settingsSection")
-    wl = QVBoxLayout(wrap)
-    wl.setContentsMargins(0, 0, 0, 0)
-    wl.setSpacing(0)
-    wl.addWidget(section)
-    wl.addLayout(extras)
-    note_row = QVBoxLayout()
-    note_row.setContentsMargins(18, 0, 18, 10)
-    note_row.addWidget(editor.note)
-    note_row.addWidget(editor.error)
-    wl.addLayout(note_row)
-    dialog._proxy_ports_section = wrap
-    return editor
+    editor.reset_btn.setFixedHeight(34)
+    window._bind_text(editor.reset_btn, "پورت‌های پیش‌فرض", "Default ports")
+    section.body.addWidget(editor.reset_btn, 0, Qt.AlignLeading)
+    section.body.addWidget(editor.note)
+    section.body.addWidget(editor.error)
+    return section

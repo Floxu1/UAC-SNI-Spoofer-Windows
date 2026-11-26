@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import pytest
 
@@ -15,9 +16,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6.QtWidgets")
 
 from PySide6.QtCore import QEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from uac_desktop import ui as ui_module
+from uac_desktop.pow.status import PowPhase
 from uac_desktop.pow_ui import ENGINE_POW, ENGINE_XRAY
 
 
@@ -31,11 +34,12 @@ def app():
 def window(app, tmp_path, monkeypatch):
     monkeypatch.setattr(ui_module, "DATA_DIR", tmp_path / "data")
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-    from uac_desktop import paths, storage
+    from uac_desktop import paths, process_win, storage
     import uac_desktop.pow_ui as pow_ui
 
     monkeypatch.setattr(paths, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(pow_ui, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(process_win, "cleanup_bin_helpers", lambda: None)
     settings = tmp_path / "data" / "settings.json"
     settings.write_text(json.dumps({
         "engine_mode": ENGINE_XRAY, ui_module.ENGINE_DEFAULT_MARKER: True,
@@ -54,21 +58,34 @@ def _visible_icons(window):
     return [button.property("iconName") for button in window.nav if not button.isHidden()]
 
 
-def test_xray_sidebar_opens_individual_pages(window, monkeypatch):
+def test_xray_sidebar_opens_individual_pages(window):
     assert window.engine_mode == ENGINE_XRAY
     visible = _visible_icons(window)
     assert visible == [
-        "home", "file-cog", "sparkles", "flask", "activity", "shield", "wrench", "headphones", "settings",
+        "home", "file-cog", "sparkles", "flask", "activity", "shield", "wrench", "headphones", "settings", "xray-settings",
     ]
     for index, page in ((1, "configsPage"), (2, "sniMakerPage"), (3, "sniLabPage"), (6, "toolsPage")):
         window.nav[index].click()
         assert window.stack.currentWidget().objectName() == page
         assert window.nav[index].isChecked()
-    opened = []
-    monkeypatch.setattr(ui_module.TuningDialog, "exec", lambda dialog: opened.append(dialog) or 0)
     window.xray_settings_button.click()
-    assert len(opened) == 1
+    assert window.stack.currentWidget().objectName() == "xraySettingsPage"
+    assert window.xray_settings_button.isChecked()
+    form = window._xray_settings_form
+    assert form.tabs.count() == 3
+    saved = window.storage.settings.get("ech_via_pattern", False)
+    form.ech_via_pattern.setChecked(not saved)
+    form.cancel_button.click()
     assert window.nav[6].isChecked()
+    assert window.storage.settings.get("ech_via_pattern", False) == saved
+    window.xray_settings_button.click()
+    form = window._xray_settings_form
+    assert form.ech_via_pattern.isChecked() == saved
+    form.ech_via_pattern.setChecked(not saved)
+    form.save_button.click()
+    assert window.nav[6].isChecked()
+    assert window.storage.settings["ech_via_pattern"] == (not saved)
+    assert window.engine.ech_via_pattern == (not saved)
     window.nav[0].click()
     assert window.stack.currentWidget().objectName() == "homePage"
 
@@ -168,6 +185,39 @@ def test_toggle_routes_to_pow_while_pow_busy(window, monkeypatch):
     window.connecting = False
     window.toggle_connection()
     assert calls == ["pow-toggle"]
+
+
+def test_pow_disconnect_button_cancels_during_outer_connection(window, monkeypatch):
+    window._switch_engine()
+    controller = window.pow_controller
+    coordinator = controller.coordinator
+    entered = threading.Event()
+
+    def connect_outer(*_args):
+        controller.status.update(PowPhase.OUTER, 30, "Trying saved clean address")
+        entered.set()
+        if not coordinator._stop.wait(2):
+            raise TimeoutError("PoW startup did not receive cancellation")
+        coordinator._ensure_active()
+
+    monkeypatch.setattr(coordinator, "_connect_session", connect_outer)
+    window.connect_button.click()
+    assert entered.wait(1)
+    assert window.connect_button.property("state") == "cancel"
+
+    window.connect_button.click()
+    assert controller._connect_cancel.is_set()
+    assert coordinator._stop.is_set()
+    assert window.connect_button.property("state") == "loading"
+
+    for _ in range(100):
+        if not controller.busy:
+            break
+        QTest.qWait(10)
+    controller._refresh()
+    assert not controller.busy
+    assert controller.status.snapshot().phase == PowPhase.IDLE
+    assert window.connect_button.property("state") == "idle"
 
 
 def test_pow_settings_roundtrip_through_widgets(window):

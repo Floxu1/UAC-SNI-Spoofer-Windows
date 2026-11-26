@@ -13,10 +13,11 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QScrollArea, QToolButton
 
 import uac_desktop.storage as storage_module
+from uac_desktop.application_settings import ApplicationSettings
 from uac_desktop.models import Tuning
 from uac_desktop.network import ScanResult
 from uac_desktop.storage import Storage
-from uac_desktop.ui import STYLE, MainWindow, ToggleOptionFrame, ToggleSwitch, TuningDialog
+from uac_desktop.ui import STYLE, MainWindow, ToggleOptionFrame, ToggleSwitch, XraySettingsPage
 from uac_desktop.update_checker import UpdateInfo
 
 
@@ -128,7 +129,7 @@ def test_advanced_carrier_switch_preserves_each_draft_without_field_leak(qapp):
     mci.pattern_max_sessions = 9
     mci.xray_mux_enabled = False
 
-    dialog = TuningDialog(
+    dialog = XraySettingsPage(
         None,
         irancell,
         "en",
@@ -343,16 +344,19 @@ def test_app_bypass_changes_are_debounced_and_reconnect_once(qapp):
     engine = SimpleNamespace(running=True)
     timer = QTimer()
     timer.setSingleShot(True)
-    timer.setInterval(30)
+    timer.setInterval(120)
     dummy = SimpleNamespace(
-        storage=storage,
+        global_settings=ApplicationSettings(storage),
+        app_routing_view=SimpleNamespace(refresh=lambda: None),
+        engine_mode="xray",
         engine=engine,
         connecting=False,
         _closing=False,
         _bypass_apply_timer=timer,
         connection_error="old error",
-        selected_processes=lambda: ["Telegram.exe"],
-        _update_process_count=lambda: None,
+        _engine_busy=lambda: engine.running,
+        _protected_session=lambda: False,
+        _xray_output=lambda: "vpn",
         _set_activity=lambda *args: events.activities.append(args),
         _append_log=events.log.append,
         _set_state=events.states.append,
@@ -368,10 +372,11 @@ def test_app_bypass_changes_are_debounced_and_reconnect_once(qapp):
 
     dummy._cancel_connect_attempt = cancel_connect_attempt
     dummy.toggle_connection = toggle_connection
+    dummy._routing_selection_reconnects = lambda settings: MainWindow._routing_selection_reconnects(dummy, settings)
     timer.timeout.connect(lambda: MainWindow._apply_bypass_changes(dummy))
 
-    for _ in range(3):
-        MainWindow._save_process_selection(dummy)
+    for checked in (True, False, True):
+        MainWindow._save_process_selection(dummy, "Telegram.exe", checked)
         QTest.qWait(6)
 
     assert timer.isActive()
@@ -379,7 +384,7 @@ def test_app_bypass_changes_are_debounced_and_reconnect_once(qapp):
     assert storage.saves == 3
     assert events.reconnects == 0
 
-    QTest.qWait(260)
+    QTest.qWait(400)
     qapp.processEvents()
     assert len(events.log) == 1
     assert events.cancelled == [False]
@@ -428,6 +433,7 @@ def test_app_bypass_reconnects_pow_when_pow_engine_is_active(qapp):
         def __init__(self):
             self.running = True
             self.busy = False
+            self.coordinator = SimpleNamespace(session_proxy_mode=False)
 
         def disconnect(self, quiet=False):
             events.disconnects += 1
@@ -437,40 +443,42 @@ def test_app_bypass_reconnects_pow_when_pow_engine_is_active(qapp):
             events.connects += 1
             self.running = True
 
-    storage = SimpleNamespace(settings={"bypass_processes": ["Telegram.exe"]}, save_settings=lambda: None)
+    storage = SimpleNamespace(settings={}, save_settings=lambda: None)
     timer = QTimer()
     timer.setSingleShot(True)
     timer.setInterval(20)
     pow_controller = FakePow()
     dummy = SimpleNamespace(
-        storage=storage,
+        global_settings=ApplicationSettings(storage),
+        app_routing_view=SimpleNamespace(refresh=lambda: None),
         engine=SimpleNamespace(running=False),
         connecting=False,
         _closing=False,
         engine_mode="pow",
         pow_controller=pow_controller,
         _bypass_apply_timer=timer,
-        selected_processes=lambda: ["Telegram.exe"],
-        _update_process_count=lambda: None,
+        _engine_busy=lambda: pow_controller.running,
+        _protected_session=lambda: False,
         _set_activity=lambda *args: events.activities.append(args),
         _append_log=events.logs.append,
         _set_state=lambda *_: None,
         _cancel_connect_attempt=lambda **_: None,
         toggle_connection=lambda: None,
     )
-    # ENGINE_POW constant used inside method — patch via module attribute lookup on MainWindow
-    import uac_desktop.ui as ui_mod
-    original = getattr(ui_mod, "ENGINE_POW", "pow")
-    ui_mod.ENGINE_POW = "pow"
-    try:
-        timer.timeout.connect(lambda: MainWindow._apply_bypass_changes(dummy))
-        MainWindow._save_process_selection(dummy)
-        assert timer.isActive()
-        QTest.qWait(450)
-        qapp.processEvents()
-        assert events.disconnects == 1
-        assert events.connects == 1
-        assert any("UAC PoW" in line for line in events.logs)
-    finally:
-        ui_mod.ENGINE_POW = original
+    dummy._routing_selection_reconnects = lambda settings: MainWindow._routing_selection_reconnects(dummy, settings)
+    timer.timeout.connect(lambda: MainWindow._apply_bypass_changes(dummy))
+    MainWindow._save_process_selection(dummy, "Telegram.exe", True)
+    assert timer.isActive()
+    QTest.qWait(450)
+    qapp.processEvents()
+    assert events.disconnects == 1
+    assert events.connects == 1
+    assert any("UAC PoW" in line for line in events.logs)
+
+    MainWindow._save_process_selection(dummy, "Telegram.exe", False)
+    assert timer.isActive()
+    dummy._protected_session = lambda: True
+    QTest.qWait(80)
+    assert storage.settings["bypass_processes"] == []
+    assert events.disconnects == 1
 

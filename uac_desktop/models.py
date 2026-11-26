@@ -345,9 +345,21 @@ class Tuning:
         return cls(**{k: v for k, v in raw.items() if k in valid})
 
 
-def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
+UAC_LINK_FIELDS = {
+    "address": "uacEdge",
+    "fallback_address": "uacFallback",
+    "port": "uacPort",
+    "method": "uacMethod",
+    "spoof_fake_sni": "uacFakeSni",
+}
+UAC_ROUTE_METHODS = ("combined", "fragment", "half", "multi", "sni_split", "full5", "tls_sni_records")
+
+
+def parse_uri(uri: str, suggested: bool = False, *, trim_prose: bool = True) -> ProxyProfile | None:
     try:
-        raw = uri.strip().rstrip("\"'.,;)")
+        raw = uri.strip()
+        if trim_prose:
+            raw = raw.rstrip("\"'.,;)")
         parsed = urllib.parse.urlsplit(raw)
         protocol = parsed.scheme.lower()
         if protocol not in {"vless", "trojan", "vmess"} or not parsed.hostname:
@@ -372,7 +384,7 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
                                    "reality-direct"
                                    if query.get("security", "").lower() == "reality"
                                    else "ech-direct"
-                                   if (query.get("ech") or query.get("echcl"))
+                                   if (query.get("ech") or query.get("echcl") or query.get("echconfiglist"))
                                    else "sni"
                                ))
         match = SPOOF_META_RE.fullmatch(fragment)
@@ -395,6 +407,17 @@ def parse_uri(uri: str, suggested: bool = False) -> ProxyProfile | None:
             if profile.rotating_exit:
                 profile.country_code = "XX"
                 profile.name = f"Dynamic exit · Spoof {int(sequence):03d}"
+        for field_name, key in UAC_LINK_FIELDS.items():
+            value = query.get(key.lower())
+            if value is None:
+                continue
+            if field_name == "port":
+                if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 65535:
+                    return None
+                value = int(value)
+            elif field_name == "method" and value not in UAC_ROUTE_METHODS:
+                return None
+            setattr(profile, field_name, value)
         return profile
     except Exception:
         return None
@@ -428,30 +451,30 @@ def parse_outbound(profile: ProxyProfile) -> dict:
             parsed.query, keep_blank_values=True
         )
     }
+
+    def query_value(field):
+        return next((query[key.lower()] for key in _EDITABLE_QUERY[field] if query.get(key.lower())), "")
+
     host = parsed.hostname or profile.config_host
-    sni = next((
-        query.get(key, "") for key in (
-            "sni", "servername", "host", "authority"
-        ) if query.get(key)
-    ), host)
-    host_header = query.get("host") or query.get("authority") or sni or profile.sni
-    path = query.get("path") or "/"
+    sni = query_value("sni") or query_value("host_header") or query_value("authority") or host
+    host_header = query_value("host_header") or query_value("authority") or sni or profile.sni
+    path = query_value("path") or "/"
     if not path.startswith("/"):
         path = "/" + path
-    security = (query.get("security") or "tls").strip().lower()
+    security = (query_value("security") or "tls").strip().lower()
     network = (
-        query.get("type") or query.get("network")
+        query_value("network")
         or ("raw" if security == "reality" else "ws")
     ).strip().lower()
     if network == "tcp":
         network = "raw"
     try:
-        alter_id = max(0, int(query.get("aid") or query.get("alterid") or 0))
+        alter_id = max(0, int(query_value("alter_id") or 0))
     except (TypeError, ValueError):
         alter_id = 0
     alpn = [
         value.strip()
-        for value in (query.get("alpn") or "").split(",")
+        for value in query_value("alpn").split(",")
         if value.strip()
     ]
     insecure = str(
@@ -460,32 +483,109 @@ def parse_outbound(profile: ProxyProfile) -> dict:
     return {
         "protocol": parsed.scheme.lower(), "user": urllib.parse.unquote(parsed.username or ""),
         "host": host, "port": parsed.port or 443, "sni": sni, "host_header": host_header,
-        "path": path, "network": network, "fingerprint": query.get("fp") or query.get("fingerprint") or "",
-        "pinned": query.get("pinnedpeercertsha256") or query.get("pcs") or "",
-        "verify_name": query.get("verifypeercertbyname") or query.get("vcn") or "",
+        "path": path, "network": network, "fingerprint": query_value("fingerprint"),
+        "pinned": query_value("pinned"),
+        "verify_name": query_value("verify_name"),
         "alter_id": alter_id,
-        "user_security": query.get("scy") or query.get("cipher") or "auto",
+        "user_security": query_value("user_security") or "auto",
         "security": security,
-        "flow": query.get("flow") or "",
-        "encryption": query.get("encryption") or "none",
-        "reality_public_key": (
-            query.get("pbk") or query.get("publickey")
-            or query.get("password") or ""
-        ),
-        "reality_short_id": query.get("sid") or query.get("shortid") or "",
-        "reality_spider_x": query.get("spx") or query.get("spiderx") or "",
-        "service_name": query.get("servicename") or "",
-        "authority": query.get("authority") or "",
-        "mode": query.get("mode") or "",
-        "extra": query.get("extra") or "",
-        "header_type": query.get("headertype") or "none",
+        "flow": query_value("flow"),
+        "encryption": query_value("encryption") or "none",
+        "reality_public_key": query_value("reality_public_key"),
+        "reality_short_id": query_value("reality_short_id"),
+        "reality_spider_x": query_value("reality_spider_x"),
+        "service_name": query_value("service_name"),
+        "authority": query_value("authority"),
+        "mode": query_value("mode"),
+        "extra": query_value("extra"),
+        "header_type": query_value("header_type") or "none",
         "alpn": alpn,
         "insecure": insecure,
-        "ech": query.get("ech") or query.get("echcl") or query.get("echconfiglist") or "",
+        "ech": query_value("ech"),
     }
 
 
 DIRECT_ROUTE_MODES = ("reality-direct", "ech-direct")
+
+
+_EDITABLE_QUERY = {
+    "network": ("type", "network"),
+    "host_header": ("host",),
+    "path": ("path",),
+    "security": ("security",),
+    "sni": ("sni", "servername"),
+    "fingerprint": ("fp", "fingerprint"),
+    "alpn": ("alpn",),
+    "flow": ("flow",),
+    "encryption": ("encryption",),
+    "alter_id": ("aid", "alterId"),
+    "user_security": ("scy", "cipher"),
+    "service_name": ("serviceName",),
+    "authority": ("authority",),
+    "mode": ("mode",),
+    "extra": ("extra",),
+    "header_type": ("headerType",),
+    "reality_public_key": ("pbk", "publicKey", "password"),
+    "reality_short_id": ("sid", "shortId"),
+    "reality_spider_x": ("spx", "spiderX"),
+    "ech": ("ech", "echcl", "echconfiglist"),
+    "pinned": ("pinnedPeerCertSha256", "pcs"),
+    "verify_name": ("verifyPeerCertByName", "vcn"),
+    **{f"uac_{field_name}": (key,) for field_name, key in UAC_LINK_FIELDS.items()},
+}
+
+
+def edit_profile_uri(uri: str, changes: dict) -> str:
+    """Rewrite edited fields and preserve all other URI components verbatim."""
+    if not changes:
+        return uri
+    parts = urllib.parse.urlsplit(uri)
+    netloc = parts.netloc
+    if changes.keys() & {"user", "host", "port"}:
+        raw_user, at, server = netloc.rpartition("@")
+        if not at:
+            server = netloc
+        if "user" in changes:
+            raw_user = urllib.parse.quote(changes["user"], safe="")
+        if changes.keys() & {"host", "port"}:
+            if server.startswith("["):
+                end = server.index("]") + 1
+                raw_host, raw_port = server[:end], server[end:].removeprefix(":")
+            else:
+                raw_host, _, raw_port = server.partition(":")
+            if "host" in changes:
+                raw_host = changes["host"].removeprefix("[").removesuffix("]")
+                if ":" in raw_host:
+                    raw_host = f"[{raw_host}]"
+            raw_port = str(changes.get("port", raw_port))
+            server = raw_host + (f":{raw_port}" if raw_port else "")
+        netloc = (raw_user + "@" if raw_user or at else "") + server
+
+    query = parts.query.split("&") if parts.query else []
+    for field_name, value in changes.items():
+        aliases = _EDITABLE_QUERY.get(field_name)
+        if not aliases:
+            continue
+        keys = [urllib.parse.unquote_plus(entry.partition("=")[0]).lower() for entry in query]
+        matching = [[i for i, key in enumerate(keys) if key == alias.lower()] for alias in aliases]
+        # Clearing an alias group must also clear any lower-priority alternatives.
+        if not value and not field_name.startswith("uac_"):
+            removed = {index for indexes in matching for index in indexes}
+            query = [entry for index, entry in enumerate(query) if index not in removed]
+            continue
+        indexes = next((indices for indices in matching if indices and query[indices[-1]].partition("=")[2]),
+                       matching[0])
+        encoded = urllib.parse.quote(str(value), safe="")
+        if indexes:
+            index = indexes[-1]
+            query[index] = f"{query[index].partition('=')[0]}={encoded}"
+        else:
+            query.append(f"{aliases[0]}={encoded}")
+    fragment = urllib.parse.quote(changes["name"], safe="") if "name" in changes else parts.fragment
+    protocol = changes.get("protocol", parts.scheme)
+    return f"{protocol}://{netloc}{parts.path}" + (f"?{'&'.join(query)}" if query else "") + (
+        f"#{fragment}" if fragment else ""
+    )
 
 
 def uri_has_ech(uri) -> bool:

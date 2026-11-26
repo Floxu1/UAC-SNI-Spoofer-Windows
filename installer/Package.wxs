@@ -1,0 +1,84 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="UAC Spoofer Desktop" Manufacturer="UAC" Version="$(var.Version)" Codepage="65001"
+           UpgradeCode="$(var.UpgradeCode)" Scope="perMachine" Compressed="yes" InstallerVersion="500">
+    <MajorUpgrade Schedule="afterInstallExecute" AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of UAC Spoofer Desktop is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UIRef Id="UacInstallerOptions" />
+    <Icon Id="UacProduct.ico" SourceFile="$(var.BrandAssets)\UacProduct.ico" />
+    <Property Id="ARPPRODUCTICON" Value="UacProduct.ico" />
+    <Property Id="WixUnelevatedShellExecTarget" Value="[#ApplicationFile]" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Action="SetLaunchTextEnglish"
+                 Value="Launch UAC Spoofer Desktop" Before="CostFinalize" Sequence="ui"
+                 Condition="UILevel = 5 AND NOT Installed AND UserLanguageID &lt;&gt; 1065" />
+    <SetProperty Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Action="SetLaunchTextPersian"
+                 Value="اجرای UAC Spoofer Desktop" Before="CostFinalize" Sequence="ui"
+                 Condition="UILevel = 5 AND NOT Installed AND UserLanguageID = 1065" />
+    <CustomAction Id="LaunchUacFromShell" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  DllEntry="WixUnelevatedShellExec" Execute="immediate" Return="ignore" />
+    <Property Id="PREVIOUSINSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="PreviousInstallFolder" Root="HKLM" Key="Software\UAC\UAC Spoofer Desktop"
+                      Name="InstallFolder" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="INSTALLFOLDER" Value="[PREVIOUSINSTALLFOLDER]" Before="CostFinalize"
+                 Sequence="both" Condition="PREVIOUSINSTALLFOLDER AND NOT INSTALLFOLDER" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" Sequence="execute" />
+    <?foreach Kind in DESKTOP;STARTMENU ?>
+      <Property Id="UAC_$(var.Kind)_SHORTCUT" Secure="yes" />
+      <Property Id="SAVED_$(var.Kind)_SHORTCUT" Secure="yes">
+        <RegistrySearch Id="Saved$(var.Kind)Preference" Root="HKLM" Key="Software\UAC\UAC Spoofer Desktop"
+                        Name="$(var.Kind)Shortcut" Type="raw" Bitness="always64" />
+      </Property>
+      <SetProperty Id="UAC_$(var.Kind)_SHORTCUT" Action="Load$(var.Kind)Preference"
+                   Value="[SAVED_$(var.Kind)_SHORTCUT]" After="AppSearch" Sequence="both"
+                   Condition="NOT UAC_$(var.Kind)_SHORTCUT AND SAVED_$(var.Kind)_SHORTCUT" />
+      <SetProperty Id="UAC_$(var.Kind)_SHORTCUT" Action="Default$(var.Kind)Preference" Value="1"
+                   After="Load$(var.Kind)Preference" Sequence="both" Condition="NOT UAC_$(var.Kind)_SHORTCUT" />
+      <SetProperty Id="UI_$(var.Kind)_CHECKED" Value="1" Before="CostFinalize" Sequence="ui"
+                   Condition="UAC_$(var.Kind)_SHORTCUT = &quot;1&quot;" />
+    <?endforeach?>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="UAC Spoofer Desktop" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
+    <Feature Id="DesktopApplication" Title="UAC Spoofer Desktop" Level="1">
+      <ComponentGroupRef Id="DesktopFiles" />
+      <ComponentRef Id="DesktopShortcutComponent" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+    </Feature>
+  </Package>
+  <Fragment>
+    <ComponentGroup Id="DesktopFiles" Directory="INSTALLFOLDER">
+      <Component Id="ApplicationExe" Guid="$(var.AppComponent)" Bitness="always64">
+        <File Id="ApplicationFile" Source="$(var.Payload)\UAC-Spoofer-Desktop.exe" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\UAC\UAC Spoofer Desktop" Name="InstallFolder"
+                       Type="string" Value="[INSTALLFOLDER]" />
+        <?foreach Kind in DESKTOP;STARTMENU ?>
+          <RegistryValue Root="HKLM" Key="Software\UAC\UAC Spoofer Desktop" Name="$(var.Kind)Shortcut"
+                         Type="string" Value="[UAC_$(var.Kind)_SHORTCUT]" />
+        <?endforeach?>
+      </Component>
+      <Files Include="$(var.Payload)\**">
+        <Exclude Files="$(var.Payload)\UAC-Spoofer-Desktop.exe;$(var.Payload)\uac-package.json" />
+      </Files>
+    </ComponentGroup>
+    <Component Id="DesktopShortcutComponent" Directory="DesktopFolder" Bitness="always64" Transitive="yes"
+               Guid="{15B4BEE7-AA8A-491C-B7F0-787322B7783F}" Condition="UAC_DESKTOP_SHORTCUT = &quot;1&quot;">
+      <Shortcut Id="DesktopShortcut" Name="UAC Spoofer Desktop" Advertise="no"
+                Target="[#ApplicationFile]" WorkingDirectory="INSTALLFOLDER" Icon="UacProduct.ico" IconIndex="0" />
+      <RegistryValue Root="HKLM" Key="Software\UAC\UAC Spoofer Desktop" Name="DesktopLinkInstalled"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+    <Component Id="StartMenuShortcutComponent" Directory="ProgramMenuFolder" Bitness="always64" Transitive="yes"
+               Guid="{D737239E-CCE2-4199-A2FD-ADA09C8B9EFF}" Condition="UAC_STARTMENU_SHORTCUT = &quot;1&quot;">
+      <Shortcut Id="StartShortcut" Name="UAC Spoofer Desktop" Advertise="no"
+                Target="[#ApplicationFile]" WorkingDirectory="INSTALLFOLDER" Icon="UacProduct.ico" IconIndex="0" />
+      <RegistryValue Root="HKLM" Key="Software\UAC\UAC Spoofer Desktop" Name="StartLinkInstalled"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

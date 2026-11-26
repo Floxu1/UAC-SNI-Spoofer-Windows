@@ -426,6 +426,7 @@ class AetherProcess:
         self._tail: threading.Thread | None = None
         self._tail_stop = threading.Event()
         self._lock = threading.Lock()
+        self._traffic = (0, 0)
         from collections import deque
 
         self.recent_lines: deque = deque(maxlen=12)
@@ -436,6 +437,10 @@ class AetherProcess:
         with self._lock:
             process = self._process
         return process is not None and process.poll() is None
+
+    def traffic_snapshot(self):
+        with self._lock:
+            return self._process, self._traffic
 
     def start(
         self, outer_json: str, extra_env: dict | None = None, tail_core_log: bool = True
@@ -479,6 +484,7 @@ class AetherProcess:
         with self._lock:
             self._ready.clear()
             self._verified_h2_peer = ""
+            self._traffic = (0, 0)
             self._process = process
             self._config = session_config
         self._reader = threading.Thread(
@@ -537,6 +543,13 @@ class AetherProcess:
                     continue
                 if line.startswith("AETHER_EVENT "):
                     event = json.loads(line.removeprefix("AETHER_EVENT "))
+                    if event.get("type") == "traffic":
+                        tx, rx = event.get("tx"), event.get("rx")
+                        if type(tx) is int and type(rx) is int and min(tx, rx) >= 0:
+                            with self._lock:
+                                if process is self._process:
+                                    self._traffic = tx, rx
+                        continue
                     message = event.get("message")
                     saved = "Saved clean HTTP/2 address "
                     if event.get("type") == "log" and isinstance(message, str) and message.startswith(saved):
@@ -587,7 +600,7 @@ class AetherProcess:
             stop.wait(0.25)
         return False
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         self._tail_stop.set()
         with self._lock:
             process = self._process
@@ -595,7 +608,7 @@ class AetherProcess:
             config, self._config = self._config, None
             self._ready.clear()
         if process is None:
-            return
+            return True
         pid = getattr(process, "pid", None)
         try:
             if process.poll() is None:
@@ -627,3 +640,4 @@ class AetherProcess:
         self._tail = None
         if tail is not None and tail.is_alive():
             tail.join(timeout=1)
+        return process.poll() is not None

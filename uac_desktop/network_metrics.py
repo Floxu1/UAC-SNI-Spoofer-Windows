@@ -326,14 +326,15 @@ class SharedNetworkMetrics(QFrame):
         now = time.monotonic()
         if self._sample is not None:
             sampled, previous_up, previous_down = self._sample
-            if upload < previous_up or download < previous_down:
-                self.up_bars.clear()
-                self.down_bars.clear()
-            elif now - sampled < .2:
+            elapsed = now - sampled
+            if elapsed < .2:
                 return
-            else:
-                self.up_bars.add_rate((upload - previous_up) / (now - sampled))
-                self.down_bars.add_rate((download - previous_down) / (now - sampled))
+            for current, previous, bars in ((upload, previous_up, self.up_bars),
+                                            (download, previous_down, self.down_bars)):
+                if current < previous:
+                    bars.clear()
+                else:
+                    bars.add_rate((current - previous) / elapsed)
         self._sample = now, upload, download
 
     def set_latency(self, milliseconds, detail=""):

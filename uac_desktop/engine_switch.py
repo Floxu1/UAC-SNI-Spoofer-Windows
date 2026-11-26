@@ -16,14 +16,81 @@ the one of the original per-engine sheet.
 from __future__ import annotations
 
 import re
+from string import Template
 
 from PySide6.QtCore import Property, QEasingCurve, QPointF, QPropertyAnimation, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen, QRegion
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen, QRadialGradient, QRegion
+from PySide6.QtWidgets import QFrame, QWidget
+
+from .desktop_layout import ENGINE_OPTION_HEIGHT, ENGINE_SWITCH_HEIGHT
+from .theme import ENGINE_BRAND_PALETTES
 
 SWITCH_MS = 220          # pill slide (OutCubic)
 FADE_MS = 200            # content cross-fade
 ENGINE_PROPERTY = "engine"
+
+_BRAND_RADIUS = 18
+_BRAND_STYLE = Template("""
+QFrame#logoCard {
+    background: qlineargradient(x1:0,y1:1,x2:1,y2:0,stop:0 $surface,stop:0.38 $surface,stop:1 $tint);
+    border: 1px solid $edge; border-radius: ${card_radius}px;
+}
+QLabel#logoMark {
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 $glass,stop:1 $surface);
+    border: 1px solid $edge; border-top-color: $accent; border-radius: 14px;
+}
+QLabel#brand { color: #F4F7FA; font-size: 18px; font-weight: 600; }
+QLabel#brandEdition, QLabel#engineBadge { color: #AFBED0; font-size: 11px; font-weight: 500; }
+QFrame#engineSwitch { background: $tray; border: 1px solid $surface; border-radius: ${tray_radius}px; }
+QPushButton#engineOption { background: transparent; border: 1px solid transparent;
+    min-height: ${option_body}px; max-height: ${option_body}px;
+    border-radius: ${option_radius}px; padding: 0 2px; color: #B8C7D8; font-size: 11px; font-weight: 500; }
+QPushButton#engineOption:hover { color: #F4F7FA; background: rgba(255,255,255,0.055); }
+QPushButton#engineOption:focus { border-color: $edge; }
+QPushButton#engineOption:checked { color: #08141B; font-weight: 600; }
+QPushButton#engineOption:checked:hover { background: rgba(255,255,255,0.10); }
+""")
+
+
+def brand_style(engine: str) -> str:
+    return _BRAND_STYLE.substitute(
+        ENGINE_BRAND_PALETTES[engine], card_radius=_BRAND_RADIUS,
+        tray_radius=ENGINE_SWITCH_HEIGHT // 2, option_radius=ENGINE_OPTION_HEIGHT // 2,
+        option_body=ENGINE_OPTION_HEIGHT - 2,
+    )
+
+
+class EngineBrandCard(QFrame):
+    """Shared brand panel with a soft reflection behind the existing controls."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("logoCard")
+        self._accent = QColor(ENGINE_BRAND_PALETTES["xray"]["accent"])
+
+    def set_engine(self, engine: str):
+        accent = QColor(ENGINE_BRAND_PALETTES[engine]["accent"])
+        if self._accent != accent:
+            self._accent = accent
+            self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), _BRAND_RADIUS - 1, _BRAND_RADIUS - 1)
+        painter.setClipPath(clip)
+        painter.translate(self.width() * .97, self.height() * .07)
+        painter.rotate(-38)
+        painter.scale(self.width() * .56, 11)
+        reflection = QRadialGradient(QPointF(), 1)
+        for position, opacity in ((0, 61), (.45, 23), (1, 0)):
+            color = QColor(self._accent)
+            color.setAlpha(opacity)
+            reflection.setColorAt(position, color)
+        painter.fillRect(QRectF(-1, -1, 2, 2), reflection)
+
 
 _RULE = re.compile(r"([^{}]+)\{([^{}]*)\}", re.S)
 _SELF_TYPES = ("QMainWindow", "QWidget", "*", "")
@@ -101,11 +168,14 @@ class EngineThumb(QWidget):
     animated smoothly (a stylesheet change would snap).
     """
 
-    def __init__(self, parent: QWidget, palettes: dict[str, tuple[str, str, str]]):
+    def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setObjectName("engineThumb")
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self._palettes = {k: tuple(QColor(c) for c in v) for k, v in palettes.items()}
+        self._palettes = {
+            engine: tuple(QColor(tokens[key]) for key in ("pill_light", "accent", "pill_dark"))
+            for engine, tokens in ENGINE_BRAND_PALETTES.items()
+        }
         self._from = self._to = next(iter(self._palettes))
         self._mix = 1.0
 
@@ -132,16 +202,18 @@ class EngineThumb(QWidget):
         return tuple(_mix(x, y, self._mix) for x, y in zip(a, b))
 
     def paintEvent(self, _event):
-        start, end, border = self.colors()
+        start, accent, end = self.colors()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        gradient = QLinearGradient(rect.topLeft(), rect.topRight())
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
         gradient.setColorAt(0.0, start)
+        gradient.setColorAt(.52, accent)
         gradient.setColorAt(1.0, end)
         painter.setBrush(gradient)
-        painter.setPen(QPen(border, 1.0))
-        painter.drawRoundedRect(rect, 9, 9)
+        painter.setPen(QPen(QColor(255, 255, 255, 65), 1.0))
+        radius = rect.height() / 2
+        painter.drawRoundedRect(rect, radius, radius)
 
 
 class SwitchOverlay(QWidget):

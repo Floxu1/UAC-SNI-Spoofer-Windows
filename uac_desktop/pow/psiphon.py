@@ -68,6 +68,10 @@ class PsiphonProcess:
             process = self._process
         return process is not None and process.poll() is None
 
+    def traffic_snapshot(self):
+        with self._lock:
+            return self._process, (self.bytes_sent, self.bytes_received)
+
     def start(self, config_json: str, data_dir: Path, meek_only: bool = False) -> None:
         helper = find_helper()
         if helper is None:
@@ -174,10 +178,14 @@ class PsiphonProcess:
                     self.available_regions = [str(region) for region in regions]
             elif kind == "BytesTransferred":
                 try:
-                    self.bytes_sent = int(data.get("sent", self.bytes_sent))
-                    self.bytes_received = int(data.get("received", self.bytes_received))
+                    sent = max(0, int(data.get("sent", 0)))
+                    received = max(0, int(data.get("received", 0)))
                 except (TypeError, ValueError):
                     pass
+                else:
+                    # Each notice describes the interval since the previous notice.
+                    self.bytes_sent += sent
+                    self.bytes_received += received
             elif kind in ("Diagnostic", "ActiveTunnel", "ClientUpgradeAvailable"):
                 text = json.dumps(data, ensure_ascii=False)[:300]
                 if text and text != "{}":
@@ -202,14 +210,14 @@ class PsiphonProcess:
             stop.wait(0.3)
         return self.connected.is_set() and self.running and not stop.is_set()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         with self._lock:
             process, self._process = self._process, None
             reader, self._reader = self._reader, None
             self.connected.clear()
             self.socks_port = None
         if process is None:
-            return
+            return True
         pid = getattr(process, "pid", None)
         try:
             if process.poll() is None:
@@ -233,3 +241,4 @@ class PsiphonProcess:
                 pass
         if reader is not None and reader.is_alive():
             reader.join(timeout=2)
+        return process.poll() is not None

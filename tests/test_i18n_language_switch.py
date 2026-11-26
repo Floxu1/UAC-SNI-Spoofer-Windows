@@ -32,53 +32,23 @@ def _has_persian(text: str) -> bool:
 @pytest.mark.parametrize("language", ["fa", "en"])
 def test_settings_titles_have_real_width(app, language):
     ui_fonts.apply_app_font(app, language)
-    dialog = ui_module.TuningDialog(
+    dialog = ui_module.XraySettingsPage(
         None, Tuning.carrier_preset("auto"), language,
         multi_gene_enabled=True, strategy_locked=True, multi_gene_status="status",
     )
     dialog.resize(820, 760)
-    dialog.advanced_toggle.setChecked(True)
     dialog.show()
     app.processEvents()
     try:
-        titles = [label for label in dialog.findChildren(QLabel) if label.objectName() == "settingsTitle"]
-        assert titles
-        for title in titles:
-            assert title.width() >= 80, title.text()
-            assert title.sizeHint().width() >= 40, title.text()
-    finally:
-        dialog.close()
-
-
-@pytest.mark.parametrize("language", ["fa", "en"])
-def test_gene_toggles_align_with_stream_optimization(app, language):
-    ui_fonts.apply_app_font(app, language)
-    dialog = ui_module.TuningDialog(
-        None, Tuning.carrier_preset("auto"), language,
-        multi_gene_enabled=True, strategy_locked=True, multi_gene_status="status",
-    )
-    dialog.resize(820, 760)
-    dialog.advanced_toggle.setChecked(True)
-    dialog.show()
-    app.processEvents()
-    rtl = language == "fa"
-
-    def span(widget):
-        left = widget.mapTo(dialog, QPoint(0, 0)).x()
-        return left, left + widget.width()
-
-    def start_offset(toggle, field):
-        t_left, t_right = span(toggle)
-        f_left, f_right = span(field)
-        return (f_right - t_right) if rtl else (t_left - f_left)
-
-    try:
-        ref = start_offset(dialog.upload_optimized, dialog.keepalive_count)
-        for toggle, anchor in ((dialog.strategy_lock, dialog.gene_import_btn), (dialog.multi_gene, dialog.gene_combo)):
-            assert toggle.isVisible()
-            assert abs(start_offset(toggle, anchor) - ref) <= 2
-            assert toggle.size() == dialog.upload_optimized.size()
-        assert abs(span(dialog.upload_optimized)[0] - span(dialog.strategy_lock)[0]) <= 2
+        for index in range(dialog.tabs.count()):
+            dialog.tabs.setCurrentIndex(index)
+            app.processEvents()
+            titles = [label for label in dialog.tabs.currentWidget().findChildren(QLabel)
+                      if label.objectName() == "settingsCardTitle"]
+            assert titles
+            for title in titles:
+                assert title.width() >= 80, title.text()
+                assert title.width() >= title.sizeHint().width(), title.text()
     finally:
         dialog.close()
 

@@ -417,6 +417,7 @@ class PowController:
         self._thread: threading.Thread | None = None
         self._connecting = False
         self._disconnecting = False
+        self.disconnect_failed = False
         self._connect_cancel = threading.Event()
         self._failed_message = ""
         # Requested exit while a live switch runs (None when idle).
@@ -450,11 +451,8 @@ class PowController:
         self._attempt_open = False
         self._activity_kind = ""
         self._steps_signature: tuple | None = None
-        self._auto_next = 0.0
-        self._auto_attempt_network = ""
-        self._auto_network = None
-        self._auto_check = None
         self._lan_update_lock = threading.Lock()
+        self._last_lan_status = ("", "")
         self._poll = QTimer(window)
         self._poll.setInterval(600)
         self._poll.timeout.connect(self._refresh)
@@ -885,7 +883,7 @@ class PowController:
             (self.chain_toggle, settings.chain_psiphon),
             (self.optimized_toggle, settings.optimized_mode),
             (self.h2_toggle, settings.h2_fragmentation),
-            (self.proxy_toggle, self.requested_proxy_mode is True),
+            (self.proxy_toggle, self.system_proxy_enabled),
             (self.tun_toggle, self.requested_proxy_mode is False),
             *(
                 (getattr(self, f"speed_{key}_toggle", None), getattr(settings, field))
@@ -1069,51 +1067,22 @@ class PowController:
 
     def toggle(self) -> None:
         if self.busy:
-            # The button turns into Disconnect as soon as the click lands.
-            # Ignore that same double-click so it cannot cancel the attempt.
-            started = getattr(self, "_connect_started", 0.0)
-            if self._connecting and time.time() - started < 5.0:
-                return
             self.disconnect()
         else:
             self.connect()
-
-    def toggle_paused(self) -> None:
-        snapshot = self.status.snapshot()
-        if (self.coordinator.session_proxy_mode is not True
-                or snapshot.phase not in (PowPhase.CONNECTED, PowPhase.PAUSED)):
-            return
-        paused = snapshot.phase == PowPhase.CONNECTED
-
-        def apply():
-            try:
-                self.coordinator.set_paused(paused, proxy_only=True)
-            except Exception as exc:
-                self._thread_log(f"PoW pause/resume failed: {exc}")
-
-        threading.Thread(target=apply, name="pow-pause", daemon=True).start()
 
     def connect(self) -> None:
         window = self._window
         if self.busy:
             return
         proxy_mode = self.requested_proxy_mode
-        if proxy_mode is None:
-            window.show_toast(window.tr("برای اتصال، پروکسی ویندوز یا TUN را روشن کنید.",
-                                        "Turn on Windows Proxy or TUN to connect."), "warning")
-            return
         self._stop_xray_first()
-        try:
-            self.store.set_user_stopped(False)
-        except OSError as exc:
-            window.bridge.log.emit(f"PoW auto-connect state could not be saved: {exc}")
         preferences = window.global_settings.snapshot()
         settings = preferences.for_pow(self.store.snapshot())
         self._startup_switch_target = None
         bypass = list(window.global_settings.processes())
         self._connecting = True
         self._attempt_open = True
-        self._connect_started = time.time()
         self._failed_message = ""
         self._activity_kind = ""
         self.status.reset()
@@ -1125,7 +1094,8 @@ class PowController:
         def _work() -> None:
             try:
                 message = self.coordinator.connect(
-                    settings, proxy_mode=proxy_mode, bypass_processes=bypass, cancel=cancel
+                    settings, proxy_mode=proxy_mode is not False, bypass_processes=bypass, cancel=cancel,
+                    system_proxy=preferences.windows_proxy_enabled,
                 )
                 self._thread_log(message)
                 if self._startup_switch_target is not None and not cancel.is_set():
@@ -1155,17 +1125,13 @@ class PowController:
         if self._disconnecting or not self.busy:
             return
         self._disconnecting = True
+        self.disconnect_failed = False
         self._connect_cancel.set()
         self.coordinator.request_stop()
         self._startup_switch_target = self._switch_target = self._switch_token = None
         self._attempt_open = False
         self._failed_message = ""
         self._activity_kind = ""
-        if not quiet:
-            try:
-                self.store.set_user_stopped(True)
-            except OSError as exc:
-                window.bridge.log.emit(f"PoW stop preference could not be saved: {exc}")
         self._window._set_activity(
             "در حال قطع UAC PoW…", "Disconnecting UAC PoW…")
         if window.engine_mode == ENGINE_POW and not quiet:
@@ -1173,8 +1139,9 @@ class PowController:
 
         def _work() -> None:
             try:
-                self.coordinator.disconnect(quiet=quiet)
+                self.disconnect_failed = self.coordinator.disconnect(quiet=quiet) is False
             except Exception as exc:
+                self.disconnect_failed = True
                 window.bridge.log.emit(f"UAC PoW disconnect failed: {exc}")
             finally:
                 self._disconnecting = False
@@ -1211,14 +1178,15 @@ class PowController:
         except Exception:
             pass
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         self._connect_cancel.set()
+        stopped = False
         try:
             self._poll.stop()
         except Exception:
             pass
         try:
-            self.coordinator.disconnect(quiet=True)
+            stopped = self.coordinator.disconnect(quiet=True) is not False
         except Exception:
             pass
         try:
@@ -1226,7 +1194,11 @@ class PowController:
             cleanup_bin_helpers()
         except Exception:
             pass
-        self._connecting = False
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        self._connecting = bool(thread is not None and thread.is_alive())
+        return stopped and not self.busy
 
     def apply_language(self) -> None:
         """Refresh PoW labels that are rebuilt from the live language."""
@@ -1260,6 +1232,11 @@ class PowController:
         if actual is None and self.coordinator.paused:
             actual = self.coordinator.session_proxy_mode
         return requested if actual is None else actual
+
+    @property
+    def system_proxy_enabled(self) -> bool:
+        actual = self.coordinator.system_proxy_enabled
+        return self._window.global_settings.snapshot().windows_proxy_enabled if actual is None else actual
 
     @property
     def requested_proxy_mode(self) -> bool | None:
@@ -1342,14 +1319,6 @@ class PowController:
         except Exception:
             pass
 
-    def reset_auto_connect(self) -> None:
-        try:
-            self.store.set_user_stopped(False)
-        except OSError as exc:
-            self._thread_log(f"PoW auto-connect state could not be saved: {exc}")
-        self._auto_attempt_network = ""
-        self._auto_next = 0
-
     def apply_global_lan_share(self) -> None:
         if not self.running:
             return
@@ -1360,33 +1329,6 @@ class PowController:
                 self.coordinator.apply_lan_share(preferences.for_pow(self.store.snapshot()))
 
         threading.Thread(target=apply, name="pow-lan-settings", daemon=True).start()
-
-    def _auto_connect(self) -> None:
-        preferences = self._window.global_settings.snapshot()
-        if (
-            getattr(self._window, "engine_mode", None) != ENGINE_POW or self.busy
-            or not preferences.auto_connect or preferences.connection_mode == "local" or self.store.user_stopped()
-        ):
-            return
-        key, self._auto_network = self._auto_network, None
-        if key == "default":
-            self._auto_attempt_network = ""
-        elif key and key != self._auto_attempt_network:
-            self._auto_attempt_network = key
-            self.connect()
-            return
-        now = time.monotonic()
-        if now < self._auto_next or (self._auto_check and self._auto_check.is_alive()):
-            return
-        self._auto_next = now + 15
-
-        def check():
-            from .pow.coordinator import detect_network
-            key, _ = detect_network()
-            self._auto_network = key
-
-        self._auto_check = threading.Thread(target=check, name="pow-auto-network", daemon=True)
-        self._auto_check.start()
 
     def _refresh(self) -> None:
         window = self._window
@@ -1405,8 +1347,11 @@ class PowController:
         try:
             self._render_snapshot(snapshot)
             if window.engine_mode == ENGINE_POW:
-                window._sync_pause_action()
-            self._auto_connect()
+                window._refresh_app_routing_notice()
+                status = self.coordinator.lan_share_status
+                if status != self._last_lan_status:
+                    self._last_lan_status = status
+                    window.global_settings_page.refresh_capabilities()
         except RuntimeError:
             # Widgets already destroyed during shutdown.
             try:

@@ -166,6 +166,7 @@ class PowCoordinator:
         # True once this coordinator pointed the Windows proxy at itself; the
         # user's original proxy values are restored on disconnect.
         self._proxy_session = False
+        self._system_proxy_requested = False
         self._tun_process: subprocess.Popen | None = None
         self._tun_job = None
         self._kill_switch = None
@@ -195,6 +196,8 @@ class PowCoordinator:
         self._inner_strategy = ""
         self._lan_process = None
         self._lan_config = None
+        self._lan_endpoint = ("", "")
+        self._lan_error = ""
         self._inner_router = None
         self._psiphon_secondary = None
         self._psiphon_ghost = None
@@ -246,6 +249,24 @@ class PowCoordinator:
     def session_proxy_mode(self) -> bool | None:
         """Selected output, including while the session is paused."""
         return self._proxy_mode if self._connected.is_set() else None
+
+    @property
+    def system_proxy_enabled(self) -> bool | None:
+        proxy = self._proxy
+        return proxy.session_enabled if proxy is not None else None
+
+    def set_system_proxy_enabled(self, enabled: bool) -> None:
+        if not self._exit_lock.acquire(blocking=False):
+            raise RuntimeError("PoW is updating its route. Try again when connected.")
+        try:
+            proxy = self._proxy
+            if proxy is None or self.actual_proxy_mode is None or self._stop.is_set():
+                raise RuntimeError("PoW's local proxy is not ready.")
+            self._proxy_session = True
+            proxy.set_session_enabled(enabled)
+            self._system_proxy_requested = enabled
+        finally:
+            self._exit_lock.release()
 
     @property
     def protected(self) -> bool:
@@ -457,6 +478,15 @@ class PowCoordinator:
             self._emit_log(f"Exit now: {names[want_proxy]}")
             return "proxy" if want_proxy else "tun"
 
+    @property
+    def lan_share_status(self) -> tuple[str, str]:
+        process = self._lan_process
+        settings = self._lan_config
+        address, _ = self._lan_endpoint
+        if process is not None and process.poll() is None and settings is not None:
+            return f"{address}:{settings.lan_share_port}", ""
+        return "", self._lan_error
+
     def apply_lan_share(self, settings: PowSettings | None = None) -> None:
         from . import lan_share
 
@@ -464,6 +494,7 @@ class PowCoordinator:
             if settings is not None:
                 self._lan_config = settings
             self._stop_lan_share()
+            self._lan_error = ""
             settings = self._lan_config
             if not settings or not settings.lan_share or not self._connected.is_set() or self._paused:
                 return
@@ -471,11 +502,31 @@ class PowCoordinator:
                 self._ensure_active()
                 proc, endpoint = lan_share.start(self._data_dir, settings, self._exit_port, self._stop)
                 self._lan_process = proc
-                self._emit_log(f"LAN share ({settings.lan_share_mode}): {endpoint}")
+                self._lan_endpoint = endpoint
+                self._emit_log(f"LAN share ({settings.lan_share_mode}): {endpoint[0]}:{settings.lan_share_port}")
             except Exception as exc:
+                self._lan_error = str(exc)
                 self._emit_log(f"LAN share unavailable: {exc}")
 
-    def _stop_lan_share(self) -> None:
+    def _check_lan_interface(self) -> None:
+        from .lan_share import endpoint
+
+        process = self._lan_process
+        if process is None:
+            return
+        try:
+            current = endpoint()
+        except (RuntimeError, OSError, subprocess.TimeoutExpired):
+            current = None
+        with self._exit_lock:
+            if self._lan_process is not process:
+                return
+            if process.poll() is not None or current != self._lan_endpoint:
+                self._stop_lan_share()
+                self._lan_error = "The private network or LAN listener is no longer available."
+                self._emit_log(f"LAN share stopped: {self._lan_error}")
+
+    def _stop_lan_share(self) -> bool:
         with self._exit_lock:
             if self._lan_process is not None:
                 from .lan_share import close
@@ -484,29 +535,47 @@ class PowCoordinator:
                     close(proc)
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     self._emit_log(f"Could not stop the LAN listener: {exc}")
+                    return False
+        return True
 
-    def _teardown_exit(self) -> None:
+    def _teardown_exit(self) -> bool:
         """Stop whatever carries the exit: sing-box (TUN or App Bypass proxy),
         the HTTP forwarder and the Windows system proxy."""
+        success = True
         proxy, self._proxy = self._proxy, None
         if proxy is not None:
             try:
                 proxy.suspend()
             except Exception:
-                pass
+                success = False
         self._warmup.cancel()
-        self._stop_tun_process()
-        self._stop_lan_share()
+        success = self._stop_tun_process() is not False and success
+        success = self._stop_lan_share() is not False and success
         forwarder, self._forwarder = self._forwarder, None
         if forwarder is not None:
             try:
                 forwarder.stop()
             except Exception:
-                pass
+                success = False
+        return success
 
     @property
     def exit_port(self) -> int:
         return self._exit_port
+
+    def traffic_sources(self):
+        # In a chain the inner leg carries the user's traffic; counting Aether
+        # there too would add the same payload again with tunnel overhead.
+        lanes = (self._aether,) if self._warp_only else (
+            self._psiphon, self._psiphon_secondary, self._psiphon_ghost,
+        )
+        sources = {}
+        for lane in lanes:
+            if lane is not None:
+                owner, counts = lane.traffic_snapshot()
+                if owner is not None:
+                    sources[owner] = counts
+        return sources
 
     @property
     def forward_http_port(self) -> int:
@@ -529,17 +598,21 @@ class PowCoordinator:
         except Exception:
             return FORWARD_HTTP_PORT
 
-    def _restore_windows_proxy(self) -> None:
+    def _restore_windows_proxy(self) -> bool:
         """Give the user back their own proxy values after a PoW session."""
         if not self._proxy_session:
-            return
+            return True
         self._proxy_session = False
         try:
             from ..engine import WindowsProxy
 
-            WindowsProxy(log=self._emit_log).disable()
+            proxy = WindowsProxy(log=self._emit_log)
+            if proxy.disable() is False and proxy.has_pending_restore:
+                return False
         except Exception as exc:
             self._emit_log(f"Windows proxy restore pending: {exc}")
+            return False
+        return True
 
     @property
     def exit_region(self) -> str:
@@ -555,7 +628,7 @@ class PowCoordinator:
         settings: PowSettings,
         proxy_mode: bool = True,
         bypass_processes: list[str] | None = None,
-        *, cancel: threading.Event | None = None,
+        *, cancel: threading.Event | None = None, system_proxy: bool | None = None,
     ) -> str:
         """Blocking connect. Raises PowEngineError on failure."""
         settings = settings.validated()
@@ -605,6 +678,7 @@ class PowCoordinator:
         try:
             with self._session_work():
                 self._ensure_active()
+                self._system_proxy_requested = proxy_mode if system_proxy is None else system_proxy
                 return self._connect_session(settings, proxy_mode, bypass_processes)
         except Exception as exc:
             if self._epoch == my_epoch and not self._stop.is_set():
@@ -762,7 +836,7 @@ class PowCoordinator:
         with self._exit_lock:
             self._ensure_active()
             if proxy_mode:
-                status.update(PowPhase.BRIDGING, 88, "Pointing Windows proxy at UAC PoW")
+                status.update(PowPhase.BRIDGING, 88, "Preparing the local PoW proxy")
                 self._enable_proxy()
             else:
                 status.update(PowPhase.BRIDGING, 90, "Routing device traffic through UAC PoW")
@@ -830,13 +904,13 @@ class PowCoordinator:
 
     def disconnect(
         self, quiet: bool = False, epoch: int | None = None, *, keep_guard: bool = False
-    ) -> None:
+    ) -> bool:
         with self._lock:
             if epoch is None:
                 self._epoch += 1
             elif self._epoch != epoch:
                 # A newer connect owns the processes. This cancel is stale.
-                return
+                return False
             seen = self._epoch
             self.request_stop()
             self._route_pending.clear()
@@ -845,28 +919,34 @@ class PowCoordinator:
             watchdog, self._watchdog = self._watchdog, None
         with self._exit_lock:
             if self._epoch != seen:
-                return
+                return False
             try:
-                self._teardown_exit()
+                success = self._teardown_exit() is not False
             except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 self._emit_log(f"PoW output cleanup failed: {exc}")
-            self._restore_windows_proxy()
+                success = False
+            success = self._restore_windows_proxy() is not False and success
             if not keep_guard:
                 try:
                     self._close_kill_switch()
                 except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
                     self._emit_log(f"Could not close the PoW kill switch: {exc}")
-            self._stop_inner_pool()
+                    success = False
+            try:
+                success = self._stop_inner_pool() is not False and success
+            except Exception as exc:
+                self._emit_log(f"PoW inner pool cleanup failed: {exc}")
+                success = False
             self._inner_config = ""
             try:
-                self._psiphon.stop()
+                success = self._psiphon.stop() is not False and success
             except Exception:
-                pass
+                success = False
             try:
-                self._aether.stop()
+                success = self._aether.stop() is not False and success
             except Exception:
-                pass
-            self._stop_parallel_masque()
+                success = False
+            success = self._stop_parallel_masque() is not False and success
             self._exit_info = {}
             self._parallel_note = ""
             self._warmup.flush()
@@ -885,6 +965,8 @@ class PowCoordinator:
                     pass
         if watchdog is not None and watchdog is not threading.current_thread() and watchdog.is_alive():
             watchdog.join(timeout=2)
+            success = not watchdog.is_alive() and success
+        return success
 
     # -- outer leg ----------------------------------------------------------
     _last_outer_protocol: str = ""
@@ -1613,23 +1695,25 @@ class PowCoordinator:
             return {}
         return _work()
 
-    def _stop_parallel_masque(self) -> None:
+    def _stop_parallel_masque(self) -> bool:
         with self._lock:
             self._parallel_cancel.set()
             self._sessions = []
             router, self._router = self._router, None
             extras_now, self._extras = self._extras, []
             self._chain_port = CHAIN_SOCKS_PORT
+        success = True
         if router is not None:
             try:
                 router.stop()
             except Exception:
-                pass
+                success = False
         for process in extras_now:
             try:
-                process.stop()
+                success = process.stop() is not False and success
             except Exception:
-                pass
+                success = False
+        return success
 
     # -- key fetch (mobile parity: race, then one ECH retry) ------------------------
     _KEY_ROUTE_NAMES = {
@@ -2196,7 +2280,7 @@ class PowCoordinator:
 
         threading.Thread(target=_warm, name="pow-psiphon-secondary", daemon=True).start()
 
-    def _stop_inner_pool(self, keep_router: bool = False) -> None:
+    def _stop_inner_pool(self, keep_router: bool = False) -> bool:
         with self._lock:
             router = self._inner_router
             if router is not None and keep_router:
@@ -2206,12 +2290,12 @@ class PowCoordinator:
             process, self._psiphon_secondary = self._psiphon_secondary, None
             ghost, self._psiphon_ghost = self._psiphon_ghost, None
             self._ghost_serving = False
-        if ghost is not None:
-            ghost.stop()
+        success = ghost is None or ghost.stop() is not False
         if router is not None and not keep_router:
             router.stop()
         if process is not None:
-            process.stop()
+            success = process.stop() is not False and success
+        return success
 
     def _try_ghost_handover(self, reason: str) -> bool:
         from .tun_guard import verify_proxy
@@ -2412,8 +2496,16 @@ class PowCoordinator:
         return min(samples) if samples else 0
 
     # -- exit wiring ----------------------------------------------------------
+    def _bind_system_proxy(self, socks_port: int, http_port: int, *, tun: bool = False) -> None:
+        from ..engine import WindowsProxy
+
+        proxy = self._proxy = WindowsProxy(log=self._emit_log)
+        if tun or self._system_proxy_requested:
+            self._proxy_session = True
+        proxy.bind_session(socks_port, http_port, tun=tun, enabled=self._system_proxy_requested)
+
     def _enable_proxy(self) -> None:
-        from ..engine import WindowsProxy, build_singbox_proxy_bypass_config
+        from ..engine import build_singbox_proxy_bypass_config
         from ..paths import BIN
         from .forwarder import HttpToSocks
         from .routing import apply_rules
@@ -2427,7 +2519,8 @@ class PowCoordinator:
             raise PowEngineError("exit proxy is not listening")
 
         bypass = self._bypass_processes if self._speed.routing_mode == "bypass" else []
-        if bypass or self._speed.routing_mode == "only" or self._speed.iran_direct:
+        if (bypass or self._speed.routing_mode == "only" or self._speed.iran_direct
+                or self._speed.domains_direct or self._speed.ips_direct):
             # Process-aware local mixed proxy so App Bypass matches engine 1.
             binary = BIN / "sing-box.exe"
             if not binary.is_file():
@@ -2488,13 +2581,10 @@ class PowCoordinator:
                 if not ok:
                     raise PowEngineError(f"local {scheme} proxy could not carry traffic: {why}")
             self._ensure_active()
-            proxy = WindowsProxy(log=self._emit_log)
-            self._proxy = proxy
             # Mixed inbound serves both HTTP and SOCKS on the same port.
-            proxy.resume(socks_port=port, http_port=port)
-            self._proxy_session = True
+            self._bind_system_proxy(port, port)
             self._emit_log(
-                f"Windows system proxy → App Bypass mixed 127.0.0.1:{port} "
+                f"App Bypass mixed 127.0.0.1:{port} "
                 f"({len(bypass)} direct apps) → SOCKS 127.0.0.1:{self._exit_port}"
             )
             return
@@ -2514,12 +2604,9 @@ class PowCoordinator:
         if not ok:
             raise PowEngineError(f"local HTTP proxy could not carry traffic: {why}")
         self._ensure_active()
-        proxy = WindowsProxy(log=self._emit_log)
-        self._proxy = proxy
-        proxy.resume(socks_port=self._exit_port, http_port=port)
-        self._proxy_session = True
+        self._bind_system_proxy(self._exit_port, port)
         self._emit_log(
-            f"Windows system proxy → SOCKS 127.0.0.1:{self._exit_port} "
+            f"Local SOCKS 127.0.0.1:{self._exit_port} "
             f"HTTP 127.0.0.1:{port}"
         )
 
@@ -2538,6 +2625,7 @@ class PowCoordinator:
 
     def _enable_tun(self) -> None:
         """Whole-device TUN, verified for real before we call it connected."""
+        from ..proxy_ports import listener_pid
         from . import tun_guard
 
         self._require_tun_admin()
@@ -2593,6 +2681,10 @@ class PowCoordinator:
                     break
             if ok:
                 self._ensure_active()
+                port = self.forward_http_port
+                if started_tun is None or listener_pid(port) != started_tun.pid:
+                    raise PowEngineError("TUN local proxy did not start")
+                self._bind_system_proxy(port, port, tun=True)
                 self._tun_stack = (stack, mtu)
                 self._emit_log(
                     f"TUN verified: DNS {facts.get('dns_ms', 0)} ms, HTTPS {facts.get('https_ms', 0)} ms, "
@@ -2612,7 +2704,7 @@ class PowCoordinator:
         from ..engine import build_singbox_tun_config
         from ..paths import BIN
         from . import tun_guard
-        from .routing import apply_rules
+        from .routing import add_tun_proxy_listener, apply_rules
 
         bypass = self._bypass_processes if self._speed.routing_mode == "bypass" else []
         config = tun_guard.harden_config(
@@ -2631,6 +2723,8 @@ class PowCoordinator:
         )
         apply_rules(config, self._speed, self._bypass_processes, BIN / "geosite.dat",
                     tun=True, warp_only=self._warp_only)
+        add_tun_proxy_listener(config, self.forward_http_port, dns_sinkhole=self._speed.dns_sinkhole,
+                               ipv6_block=self._speed.ipv6_block)
         tmp = config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(config_path)
@@ -2674,13 +2768,6 @@ class PowCoordinator:
         if process.poll() is not None:
             raise PowEngineError(f"sing-box TUN exited immediately ({process.returncode})")
         self._allow_tun_under_guard()
-        # Traffic now leaves through TUN; the system proxy must not fight it.
-        proxy, self._proxy = self._proxy, None
-        if proxy is not None:
-            try:
-                proxy.suspend()
-            except Exception:
-                pass
         bypass_note = (
             f" · {len(self._bypass_processes)} App Bypass"
             if self._bypass_processes else ""
@@ -2709,7 +2796,8 @@ class PowCoordinator:
         ok, _reason, _facts = tun_guard.verify_tun(self._exit_port, stop=self._dial_stop())
         return ok
 
-    def _stop_tun_process(self) -> None:
+    def _stop_tun_process(self) -> bool:
+        success = True
         self._warmup.cancel()
         process, self._tun_process = self._tun_process, None
         if process is not None and self.protected:
@@ -2717,6 +2805,7 @@ class PowCoordinator:
                 self._kill_switch.set_tunnel(False)
             except (OSError, RuntimeError) as exc:
                 self._emit_log(f"Could not revoke the TUN interface permission: {exc}")
+                success = False
         job, self._tun_job = getattr(self, "_tun_job", None), None
         self._site_log = None
         if process is not None:
@@ -2727,10 +2816,12 @@ class PowCoordinator:
                         process.wait(timeout=6)
                     except subprocess.TimeoutExpired:
                         process.kill()
+                        process.wait(timeout=2)
             except Exception:
-                pass
+                success = False
         if job is not None:
             job.close()
+        return success
 
     def _identity_ready(self) -> bool:
         from .config import identity_path
@@ -3007,6 +3098,7 @@ class PowCoordinator:
                     self._resumed.clear()
                     if self._epoch != epoch or stop.is_set():
                         return
+                    self._check_lan_interface()
                     if key != uplink or resumed:
                         uplink = key
                         self._stop_lan_share()
@@ -3019,6 +3111,7 @@ class PowCoordinator:
                         strikes = 0
                 if time.monotonic() >= next_probe:
                     next_probe = time.monotonic() + 30
+                    self._check_lan_interface()
                     ok, why = verify_proxy(self._exit_port, "socks5h", timeout=2)
                     strikes = 0 if ok else strikes + 1
                     if strikes >= 2:

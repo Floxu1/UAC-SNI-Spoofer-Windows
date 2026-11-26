@@ -17,6 +17,24 @@ from functools import lru_cache
 
 XRAY_BLUE = "#2cc7ff"
 XRAY_HUD_BLUE = "#79B5FF"
+ENGINE_BRAND_PALETTES = {
+    "xray": {
+        "accent": "#27DFE9", "surface": "#0B1B29", "tint": "#123747",
+        "edge": "#185567", "tray": "#081521", "glass": "#155768",
+        "pill_light": "#8AF7FC", "pill_dark": "#11BDD1",
+    },
+    "pow": {
+        "accent": "#37E9AC", "surface": "#0C1B24", "tint": "#133934",
+        "edge": "#1A594C", "tray": "#08171D", "glass": "#155344",
+        "pill_light": "#9FFFE4", "pill_dark": "#17C797",
+    },
+    "direct": {
+        "accent": "#FF974D", "surface": "#16181C", "tint": "#35251D",
+        "edge": "#69452F", "tray": "#101316", "glass": "#5D3925",
+        "pill_light": "#FFC293", "pill_dark": "#F7893E",
+    },
+}
+
 XRAY_DASHBOARD = {
     "surface": "#0A1B30",
     "gradient": "#0C2338",
@@ -72,6 +90,18 @@ DIRECT_PALETTE = {
     "steel": "#9b9089",
 }
 
+IP_DETAILS_PALETTES = {
+    "xray": dict(background="#0C1826", panel="#0D1F2E", wash="#133342", edge="#214657",
+                 accent=XRAY_DASHBOARD["accent"], muted=XRAY_DASHBOARD["secondary"],
+                 text="#EBF5FC", button_text="#071722", error="#FF9BA9"),
+    "pow": dict(background="#0D1C1A", panel="#10261F", wash="#173C31", edge="#25493E",
+                accent=ENGINE_BRAND_PALETTES["pow"]["accent"], muted="#A1BBB3",
+                text="#EBF5FC", button_text="#092219", error="#FF9BA9"),
+    "direct": dict(background="#141618", panel="#1B1D1F", wash="#322820", edge="#493B30",
+                   accent=ENGINE_BRAND_PALETTES["direct"]["accent"], muted="#ABB0B8",
+                   text=DIRECT_PALETTE["text"], button_text="#22160D", error="#F18A98"),
+}
+
 NETWORK_METRICS = {
     # Panel, surface gradient, matte edge, icon tile, accent, text, dim text.
     "xray": (XRAY_DASHBOARD["surface"], XRAY_DASHBOARD["gradient"], XRAY_DASHBOARD["surface"],
@@ -80,6 +110,28 @@ NETWORK_METRICS = {
     "pow": ("#0C1921", "#172832", "#11212B", "#29404C", "#173039", "#43DCBB", "#F0F6F8", "#A7B9C2"),
     "direct": ("#111214", "#202224", "#191C1E", "#303236", "#302720", DIRECT_PALETTE["primary"],
                DIRECT_PALETTE["text"], "#ABB0B8"),
+}
+
+APP_ROUTING_PALETTES = {
+    "xray": {
+        "background": "#07111E", "surface": "#0B1B2D", "tile": "#102437", "border": "#1E4057",
+        "hover": "#152E43", "selected": "#102D39", "selected_border": "#287281",
+        "accent": XRAY_DASHBOARD["accent"], "text": "#E3EDF7", "muted": "#A6BCCF",
+        "vpn": "#92CAC3", "track_off": "#31465A", "thumb_on": "#E4FCFF",
+    },
+    "pow": {
+        "background": "#0B151D", "surface": "#0E1D29", "tile": "#122431", "border": "#293D4C",
+        "hover": "#192D38", "selected": "#153039", "selected_border": "#2E6959",
+        "accent": ENGINE_BRAND_PALETTES["pow"]["accent"], "text": "#E5EEF5", "muted": "#A2B5C2",
+        "vpn": "#9BD2C0", "track_off": "#304655", "thumb_on": "#D8FBF3",
+    },
+    "direct": {
+        "background": DIRECT_PALETTE["background"], "surface": DIRECT_PALETTE["surface"],
+        "tile": DIRECT_PALETTE["raised"], "border": "#34373A",
+        "hover": "#252729", "selected": "#26211D", "selected_border": "#835334",
+        "accent": ENGINE_BRAND_PALETTES["direct"]["accent"], "text": DIRECT_PALETTE["text"], "muted": "#A6ABB2",
+        "vpn": "#9CC6B6", "track_off": "#383B40", "thumb_on": "#FFF2E9",
+    },
 }
 
 def connection_wave_colors(engine):

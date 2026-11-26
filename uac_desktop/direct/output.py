@@ -12,7 +12,7 @@ from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from pathlib import Path
 
-from ..engine import WindowsProxy, build_singbox_tun_config
+from ..engine import build_singbox_tun_config
 from ..paths import BIN
 from ..pow.tun_guard import KillOnCloseJob, effective_mtu
 from ..proxy_ports import listener_pid
@@ -136,28 +136,9 @@ def start_xray(directory: Path, config: dict, socks_port: int, http_port: int,
         raise
 
 
-def xray_traffic(port: int) -> tuple[int, int] | None:
-    try:
-        output = subprocess.run(
-            [str(DIRECT_XRAY), "api", "statsquery", f"--server=127.0.0.1:{port}", "-pattern", "inbound>>>"],
-            capture_output=True, text=True, encoding="utf-8", timeout=2, creationflags=_NO_WINDOW,
-        )
-        if output.returncode:
-            return None
-        upload = download = 0
-        for item in json.loads(output.stdout).get("stat", []):
-            name, value = item.get("name", ""), int(item.get("value", 0))
-            if name.endswith(">>>uplink"):
-                upload += value
-            elif name.endswith(">>>downlink"):
-                download += value
-        return upload, download
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
-
-
 def build_tun_config(settings: DirectSettings, socks_port: int, dns_server: str,
-                     mtu: int, routing_mode: str, processes: Sequence[str], stack: str) -> dict:
+                     mtu: int, routing_mode: str, processes: Sequence[str], stack: str, *, privacy=None,
+                     proxy_port: int = 0) -> dict:
     helper_names = [DIRECT_XRAY.name, DIRECT_MASK.name, DIRECT_NATIVE.name, "uac-psiphon.exe"]
     cfg = build_singbox_tun_config(socks_port=socks_port, helper_processes=helper_names)
     cfg["inbounds"][0].update(interface_name=TUN_INTERFACE, mtu=mtu, stack=stack, strict_route=True,
@@ -175,10 +156,19 @@ def build_tun_config(settings: DirectSettings, socks_port: int, dns_server: str,
         allowed = [*names, Path(sys.executable).name]
         split.append({"process_name": allowed, "invert": True, "action": "route", "outbound": "direct"})
     rules[2:2] = split
-    if not settings.ipv6:
+    if privacy is not None:
+        from ..pow.routing import apply_tun_filters
+
+        apply_tun_filters(cfg, privacy, ipv6_block=not settings.ipv6, quic_block=settings.block_quic)
+    elif not settings.ipv6:
         rules.append({"ip_version": 6, "action": "reject"})
-    if settings.block_quic:
+    if privacy is None and settings.block_quic:
         rules.append({"network": "udp", "port": 443, "action": "reject"})
+    if proxy_port:
+        from ..pow.routing import add_tun_proxy_listener
+
+        add_tun_proxy_listener(cfg, proxy_port, dns_sinkhole=bool(privacy and privacy.dns_sinkhole),
+                               ipv6_block=not settings.ipv6 or bool(privacy and privacy.ipv6_block))
     return cfg
 
 
@@ -219,7 +209,8 @@ def verify_tun(socks_port: int, dns_server: str, chained: bool, cancel: threadin
 
 def start_tun(directory: Path, settings: DirectSettings, socks_port: int, dns_server: str,
               routing_mode: str, processes: Sequence[str], mtu: int, uplink_mtu: int,
-              cancel: threading.Event, log: Callable[[str], None], allow_tunnel: Callable[[bool], None]) -> OwnedHelper:
+              cancel: threading.Event, log: Callable[[str], None], allow_tunnel: Callable[[bool], None],
+              *, privacy=None, proxy_port: int = 0) -> OwnedHelper:
     require_admin()
     size = effective_mtu(mtu, uplink_mtu)
     binary = BIN / "sing-box.exe"
@@ -227,7 +218,8 @@ def start_tun(directory: Path, settings: DirectSettings, socks_port: int, dns_se
     last_error = ""
     for kind, mtu in (("mixed", size), ("gvisor", min(size, 1280)), ("system", min(size, 1280))):
         ensure_active(cancel)
-        config = build_tun_config(settings, socks_port, dns_server, mtu, routing_mode, processes, kind)
+        config = build_tun_config(settings, socks_port, dns_server, mtu, routing_mode, processes, kind,
+                                  privacy=privacy, proxy_port=proxy_port)
         write_json(path, config)
         runner = OwnedHelper([binary, "run", "-c", path], directory, "TUN", log)
         established = False
@@ -236,6 +228,8 @@ def start_tun(directory: Path, settings: DirectSettings, socks_port: int, dns_se
             while runner.running() and time.monotonic() < deadline:
                 ensure_active(cancel)
                 if _routes_through_tun():
+                    if proxy_port:
+                        runner.wait_listener(proxy_port, cancel, socks=False, timeout=3)
                     allow_tunnel(True)
                     established = True
                     return runner
@@ -248,13 +242,3 @@ def start_tun(directory: Path, settings: DirectSettings, socks_port: int, dns_se
             if not established:
                 runner.close()
     raise OutputError(f"Direct VPN could not establish a TUN route: {last_error}")
-
-
-def activate_os_proxy(vpn: bool, socks_port: int, http_port: int,
-                      log: Callable[[str], None]) -> WindowsProxy:
-    proxy = WindowsProxy(log)
-    if vpn:
-        proxy.suspend_for_tun(socks_port=socks_port, http_port=http_port)
-    else:
-        proxy.enable(socks_port=socks_port, http_port=http_port)
-    return proxy

@@ -58,6 +58,8 @@ def start(data_dir, settings, exit_port: int, stop):
 
     address, subnet = endpoint()
     port = settings.lan_share_port
+    if tcp_accepts(port, address, timeout=0.3):
+        raise RuntimeError(f"LAN share port {port} is already in use")
     path = data_dir / "pow-lan-share.json"
     path.write_text(json.dumps(config_for(address, subnet, port, exit_port, settings.lan_share_mode)),
                     encoding="utf-8")
@@ -70,7 +72,7 @@ def start(data_dir, settings, exit_port: int, stop):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline and not stop.is_set() and process.poll() is None:
             if tcp_accepts(port, address, timeout=0.3) and not stop.wait(0.1) and process.poll() is None:
-                return process, f"{address}:{port}"
+                return process, (address, subnet)
             stop.wait(0.1)
         raise RuntimeError(f"LAN share could not listen on {address}:{port}")
     except BaseException:

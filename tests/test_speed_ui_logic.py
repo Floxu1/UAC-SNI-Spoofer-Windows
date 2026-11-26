@@ -9,13 +9,9 @@ from uac_desktop.ui import MainWindow
 class ProgressStub:
     def __init__(self):
         self.values = []
-        self.formats = []
 
     def setValue(self, value):
         self.values.append(value)
-
-    def setFormat(self, value):
-        self.formats.append(value)
 
 
 class ActivityStub:
@@ -28,6 +24,7 @@ class ActivityStub:
 
 def _scan_dummy(generation=7):
     streamed = []
+    details = []
     dummy = SimpleNamespace(
         _scan_generation=generation,
         scanning=True,
@@ -43,6 +40,8 @@ def _scan_dummy(generation=7):
         },
         _scan_results_by_domain={},
         _upsert_scan_result=streamed.append,
+        scan_details=details,
+        _set_scan_detail=lambda _fa, en: details.append(en),
         tr=lambda fa, en=None: fa,
     )
     return dummy, streamed
@@ -61,7 +60,7 @@ def test_successful_sni_is_streamed_before_scan_done():
     MainWindow._scan_progress(dummy, 1, 20, result, 7)
 
     assert dummy.scan_progress.values == [1]
-    assert dummy.scan_progress.formats[-1].startswith("1/20")
+    assert dummy.scan_details[-1] == "1/20  •  support.cloudflare.com"
     assert streamed == [result]
     assert dummy._scan_results_by_domain[result.domain] is result
     assert result.carrier == "irancell"
@@ -70,12 +69,13 @@ def test_successful_sni_is_streamed_before_scan_done():
     assert result.tested_at > 0
 
 
-def test_failed_or_stale_sni_is_not_inserted_into_live_table():
+def test_failed_sni_is_displayed_but_excluded_from_working_routes():
     dummy, streamed = _scan_dummy()
     MainWindow._scan_progress(dummy, 1, 2, ScanResult(domain="failed.example"), 7)
     MainWindow._scan_progress(dummy, 2, 2, ScanResult(domain="stale.example", success=True), 6)
 
-    assert streamed == []
+    assert [result.domain for result in streamed] == ["failed.example"]
+    assert not dummy._scan_results_by_domain
     assert dummy.scan_progress.values == [1]
 
 

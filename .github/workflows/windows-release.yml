@@ -1,0 +1,68 @@
+name: Windows release packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pow_helper/go.mod
+          cache-dependency-path: pow_helper/go.sum
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build both distributions
+        run: |
+          $version = python -c "from uac_desktop import __version__; print(__version__)"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+            throw "The release tag must match v$version."
+          }
+          rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain setup failed' }
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'NASM installation failed' }
+            $env:Path = "$env:ProgramFiles\NASM;$env:Path"
+          }
+          if (-not $env:LIBCLANG_PATH) { $env:LIBCLANG_PATH = "$env:ProgramFiles\LLVM\bin" }
+          dotnet tool install wix --version 6.0.2 --tool-path "$env:RUNNER_TEMP\uac-wix"
+          if ($LASTEXITCODE -ne 0) { throw 'WiX installation failed' }
+          .\release.ps1 -WixPath "$env:RUNNER_TEMP\uac-wix\wix.exe"
+      - name: Verify updater and installation lifecycle
+        run: |
+          python -m pytest -q tests/test_update_checker.py tests/test_release_packaging.py tests/test_updater.py tests/test_installer_bootstrap.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m tools.test_release_install --wix "$env:RUNNER_TEMP\uac-wix\wix.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UAC-Spoofer-Windows-x64
+          if-no-files-found: error
+          compression-level: 0
+          path: |
+            github_release/UAC-Spoofer-Windows-Portable.zip
+            github_release/UAC-Spoofer-Windows-Setup.msi
+            github_release/UAC-Spoofer-Windows-Setup.exe
+            github_release/SHA256SUMS.txt
+            github_release/release-manifest.json

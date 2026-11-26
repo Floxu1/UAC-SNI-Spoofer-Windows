@@ -6,7 +6,7 @@
 
 **A one-click Windows network dashboard: Xray + Patterniha SNI spoofing, and a second Psiphon-over-WARP engine.**
 
-[![Version](https://img.shields.io/badge/version-1.1.2-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
+[![Version](https://img.shields.io/badge/version-1.1.3-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](#download--quick-start)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/Floxu1/UAC-SNI-Spoofer-Windows?style=flat-square&label=latest)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)
@@ -106,8 +106,8 @@ Options include Psiphon-over-WARP (default), HTTP/2 fragment, parallel MASQUE se
 
 ## Download & quick start
 
-1. Download `UAC-Spoofer-Desktop-v1.1.2-Windows-x64-portable.zip` from **[Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** (verify with `SHA256SUMS.txt`).
-2. Extract the whole ZIP; keep the `_internal` folder next to the exe.
+1. Download `UAC-Spoofer-Windows-Portable.zip` or `UAC-Spoofer-Windows-Setup.msi` from **[Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** and verify it with `SHA256SUMS.txt`.
+2. Run the MSI, or extract the complete Portable ZIP into its own folder.
 3. Run `UAC-Spoofer-Desktop.exe` and accept the UAC prompt (admin is needed for the spoofing driver, TUN and gateway).
 4. Follow the quick-start wizard, then press **Connect**.
 
@@ -136,6 +136,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | `uac-pow-guard.exe`, `uac-direct-guard.exe` | MSVC build of the Windows Filtering Platform helper in `tools/pow-guard.c` |
 
 Run from source without packaging: `python -m pip install -r requirements.txt`, `.\install-engine.ps1`, `python main.py`.
+
+To package a release, install WiX Toolset 6.0.2 with `dotnet tool install --global wix --version 6.0.2` and run `.\release.ps1`. The two Windows x64 packages and their hashes are written to `github_release`. Attach both packages to the GitHub release tagged `v<version>`. The in-app updater uses GitHub's published asset size and digest. Older Portable copies can move to the new updater by extracting a current Portable package. Both distributions keep settings in `%APPDATA%\UAC Spoofer Desktop`.
 
 ## FAQ & troubleshooting
 

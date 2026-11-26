@@ -44,7 +44,7 @@ def sidebar_overlaps(win):
     """List of problems: overlapping or out-of-bounds sidebar blocks."""
     side = win.sidebar
     blocks = [("logo", win.logo_card)]
-    blocks += [(b.text(), b) for b in (*win.nav, win.xray_settings_button) if b.isVisible()]
+    blocks += [(b.text(), b) for b in win.nav if b.isVisible()]
     if win.rating_card.isVisible():
         blocks.append(("rating", win.rating_card))
     blocks.append(("footer", win.sidebar_footer))
@@ -88,7 +88,7 @@ def test_sidebar_never_overlaps(window, engine, language, size):
     assert sidebar_overlaps(window) == []
     if engine == ENGINE_XRAY:
         rows = sorted(
-            (button for button in (*window.nav, window.xray_settings_button) if button.isVisible()),
+            (button for button in window.nav if button.isVisible()),
             key=lambda button: button.y(),
         )
         assert [row.property("iconName") for row in rows] == [
@@ -111,3 +111,61 @@ def test_star_card_shows_when_there_is_room(window):
     for _ in range(5):
         QApplication.processEvents()
     assert sidebar_overlaps(window) == []
+
+
+@pytest.mark.parametrize("engine", [ENGINE_XRAY, ENGINE_POW, "direct"])
+@pytest.mark.parametrize("language", ["en", "fa"])
+def test_dashboard_keeps_bounds_during_connection_activity(window, engine, language, monkeypatch):
+    monkeypatch.setattr(ui_module, "_animations_enabled", lambda: False)
+    monkeypatch.setattr(window, "_schedule_ip_refresh", lambda *_: None)
+    monkeypatch.setattr(window, "_queue_target_latency_probe", lambda: None)
+    window.language = language
+    window._apply_language()
+    window.engine_buttons[engine].click()
+    window.show_page(0)
+    window.show()
+    assert window.engine_mode == engine
+
+    error = "اتصال ناموفق بود / Connection failed\n" + "x" * 3000 + "\nNetwork probe timed out." * 60
+    for size in ((1080, 700), (1440, 900), (1600, 960)):
+        window.resize(*size)
+        page = window.home_page
+        body = page.widget()
+        panels = [window.home_root.itemAt(i).widget() for i in range(window.home_root.count())]
+        controls = (window.status_pill, window.wizard_restart_btn, window.orb_shell,
+                    window.connect_button, window.activity_bar.indicator, window.activity_bar.message)
+        baseline = None
+        for visual, state, message in (
+            ("disconnected", "idle", ""),
+            ("connecting", "running", "Connecting…"),
+            ("connected", "success", "Connected"),
+            ("connecting", "running", "Reconnecting…"),
+            ("error", "error", error),
+        ):
+            window._set_connection_visual(visual)
+            if visual == "error":
+                window.connecting = True
+                window._handle_error(message)
+            else:
+                window.activity_bar.set_activity(message, state, state == "running")
+            for _ in range(3):
+                QApplication.processEvents()
+
+            assert (window.width(), window.height()) == size
+            assert body.width() == page.viewport().width()
+            assert page.horizontalScrollBar().maximum() == 0
+            assert all(panel.x() >= 0 and panel.geometry().right() < body.width() for panel in panels)
+            geometry = [widget.geometry() for widget in (*panels, *controls) if widget.isVisible()]
+            if baseline is None:
+                baseline = geometry
+            assert geometry == baseline
+            if window.wizard_restart_btn.isVisible():
+                assert window.wizard_restart_btn.parentWidget().rect().contains(window.wizard_restart_btn.geometry())
+            if visual == "error":
+                activity = window.activity_bar.message
+                assert "…" in activity.text() and "\n" not in activity.text()
+                assert "x" * 3000 in activity.toolTip()
+                assert any(entry.engine == engine and error in entry.raw for entry in window.log_model.entries)
+                assert window.centralWidget().rect().contains(window._toast.geometry())
+                window._toast.hide()
+        window.connection_error = ""

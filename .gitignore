@@ -12,6 +12,8 @@ github_release_stage/
 *.exe
 *.sys
 *.zip
+*.msi
+*.wixpdb
 
 /bin/
 /core/**/target/

@@ -3,41 +3,56 @@
 from string import Template
 
 from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QColor, QLinearGradient, QPainterPath, QPen, QRadialGradient
+from PySide6.QtGui import QColor, QConicalGradient, QLinearGradient, QPainterPath, QPen, QRadialGradient
 
 from .paths import ASSETS
 from .theme import DIRECT_PALETTE
 
 
-CONNECTION_ACCENTS = {
-    "disconnected": DIRECT_PALETTE["primary"],
-    "connecting": "#FFAD62",
-    "connected": "#50DBA5",
-    "error": "#FF626C",
+# Gradient start, gradient end, button border, button text, status accent.
+CONNECTION_COLORS = {
+    "disconnected": ("#FFB477", "#FF8038", "#FFAA6D", "#17110D", "#FF974D"),
+    "connected": ("#287C60", "#1B5947", "#468F75", "#E1FFF2", "#65CBA3"),
+    "connecting": ("#493922", "#30261B", "#806039", "#F3CE91", "#E9BC60"),
+    "reconnecting": ("#493020", "#302219", "#956238", "#FFD0A3", "#E6A15C"),
+    "disconnecting": ("#303337", "#242628", "#494D52", "#C2C6CC", "#A1A8B0"),
+    "error": ("#803544", "#592630", "#A54C5B", "#FFE4E8", "#F18A98"),
 }
+CONNECTION_ACCENTS = {state: colors[4] for state, colors in CONNECTION_COLORS.items()}
+CONNECTION_ACCENTS["paused"] = DIRECT_PALETTE["primary"]
+HERO_CONNECTED_WORD = "#3CF0AF"
+BUTTON_TEXT_COLORS = {state: colors[3] for state, colors in CONNECTION_COLORS.items()}
+BUTTON_TEXT_COLORS["paused"] = DIRECT_PALETTE["text"]
+ORBIT_SPEEDS = {"disconnected": .38, "connecting": 4.5, "connected": 1.15, "error": .48, "paused": .28}
+ORBIT_INTENSITY = {"disconnected": 118, "connecting": 245, "connected": 224, "error": 235, "paused": 126}
 CARD_BORDERS = {
     "disconnected": "#38312C",
     "connected": "#2C3833",
     "error": "#382D30",
 }
 CONNECTION_BORDER_MS = 500
-CONNECTED_BUTTON_TEXT = DIRECT_PALETTE["text"]
-IDLE_BUTTON_TEXT = "#190F09"
+
+
+def _connection_style():
+    rules = []
+    for state, (start, end, border, text, accent) in CONNECTION_COLORS.items():
+        button = f'QPushButton#connectButton[directState="{state}"]'
+        rules.append(f"""
+{button}, {button}:hover, {button}:disabled {{
+    background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 {start},stop:1 {end});
+    border-color: {border};
+    color: {text};
+}}
+QFrame#statusPill[directState="{state}"] QLabel#statusPillText {{ color: {accent}; }}
+""")
+    return "".join(rules)
 
 
 STYLE = Template("""
 QMainWindow, QWidget#windowRoot { background: $background; }
 QFrame#sidebar { background: $sidebar; border-right-color: $border; }
 QFrame#sidebar[rtl="true"] { border-left-color: $border; }
-QFrame#logoCard { background: $surface; border-color: $border; }
 QFrame#sidebarFooter { background: $surface; border-color: $border; }
-QLabel#logoMark { background: $selected; border-color: $ember_border; }
-QLabel#brand { color: $text; }
-QLabel#brandEdition { color: $secondary; }
-QFrame#engineSwitch { background: $raised; border-color: $border; }
-QPushButton#engineOption { color: $secondary; }
-QPushButton#engineOption:hover { background: $surface; border-color: $border; color: $text; }
-QPushButton#engineOption:checked, QPushButton#engineOption:checked:hover { color: $accent; background: transparent; }
 QPushButton#navButton { color: $secondary; }
 QPushButton#navButton:hover { background: $surface; border-color: $border; color: $text; }
 QPushButton#navButton:checked { background: $selected; color: $accent; border-color: $ember_border; border-left-color: $primary; }
@@ -53,24 +68,17 @@ QFrame#pageHeader { background: $surface; border-color: $border; }
 QWidget#homePage QFrame#pageHeader { background: transparent; border-color: transparent; }
 QLabel#pageTitle { color: $text; }
 QLabel#pageSubtitle { color: $secondary; }
-QFrame#statusPill, QFrame#statusPill[state="connected"], QFrame#statusPill[state="connecting"] { background: $surface; border-color: $border; }
-QFrame#statusPill[state="connecting"] { border-color: $connecting; }
-QFrame#statusPill[state="connected"] { border-color: $connected; }
-QFrame#statusPill[state="error"] { background: $surface; border-color: $error; }
+QFrame#statusPill, QFrame#statusPill[state="connected"], QFrame#statusPill[state="connecting"], QFrame#statusPill[state="error"] { background: $surface; border-color: $border; }
 QLabel#statusPillText { color: $secondary; }
-QFrame#statusPill[state="connecting"] QLabel#statusPillText { color: $connecting; }
-QFrame#statusPill[state="connected"] QLabel#statusPillText { color: $connected; }
-QFrame#statusPill[state="error"] QLabel#statusPillText { color: $error; }
 QFrame#heroCard { background: #151618; border-color: transparent; }
 QFrame#orbShell { background: rgba(23,25,28,0.35); border-color: transparent; }
 QLabel#orbCaption { color: #baa492; }
 QLabel#heroBadge { color: $accent; }
 QLabel#heroStatus, QLabel#heroStatusOn, QLabel#heroStatusError { color: $text; }
+QLabel#heroStatusOn { color: #CFFFF9; }
 QLabel#heroHint { color: $secondary; }
-QPushButton#connectButton, QPushButton#connectButton[state="cancel"], QPushButton#connectButton[state="error"] { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 $accent,stop:1 $primary); color: $idle_button_text; border-color: #ffb889; }
-QPushButton#connectButton:hover, QPushButton#connectButton[state="cancel"]:hover, QPushButton#connectButton[state="error"]:hover { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #ffc393,stop:1 #ff8847); border-color: #ffd0ad; }
-QPushButton#connectButton[state="connected"], QPushButton#connectButton[state="loading"]:disabled { background: $raised; color: $connected_button_text; border-color: #4d5056; }
-QPushButton#connectButton[state="connected"]:hover { background: #303338; border-color: #65686f; }
+QPushButton#connectButton[directState="paused"] { background: $raised; color: $text; border-color: #4d5056; }
+QPushButton#connectButton[directState="paused"]:hover { background: #303338; border-color: #65686f; }
 QFrame#countrySelectorCard, QFrame#countrySelectorCard:hover, QFrame#countrySelectorCard[mode="manual"], QFrame#quickControls, QFrame#activityBar, QFrame#card, QFrame#settingsCard { background: $surface; border-color: $border; }
 QLabel#countryIcon { background: $selected; border-color: $ember_border; }
 QLabel#countryTitle { color: $text; }
@@ -85,10 +93,8 @@ QFrame#activityBar[state="success"], QFrame#activityBar[state="warning"], QFrame
 QLabel#activityMessage { color: $secondary; }
 QComboBox::down-arrow { image: url("$chevron"); }
 QCheckBox::indicator:checked { image: url("$check"); }
-""").substitute(DIRECT_PALETTE, **CONNECTION_ACCENTS,
-                idle_button_text=IDLE_BUTTON_TEXT,
-                connected_button_text=CONNECTED_BUTTON_TEXT, chevron=(ASSETS / "ui" / "lucide-direct-chevron-down.svg").as_posix(),
-                check=(ASSETS / "ui" / "lucide-direct-check.svg").as_posix())
+""").substitute(DIRECT_PALETTE, chevron=(ASSETS / "ui" / "lucide-direct-chevron-down.svg").as_posix(),
+                check=(ASSETS / "ui" / "lucide-direct-check.svg").as_posix()) + _connection_style()
 
 
 def paint_card_wash(painter, rect):
@@ -107,6 +113,26 @@ def connection_edge_colors(state):
         QColor(CARD_BORDERS.get(state, CARD_BORDERS["disconnected"])),
         QColor(CONNECTION_ACCENTS.get(state, CONNECTION_ACCENTS["disconnected"])),
     )
+
+
+def paint_orbit(painter, rect, color, rotation, state):
+    size = min(rect.width(), rect.height())
+    bounds = rect.adjusted(size * .028, size * .028, -size * .028, -size * .028)
+    track = QColor(color)
+    track.setAlpha(46)
+    painter.setBrush(Qt.NoBrush)
+    painter.setPen(QPen(track, max(.8, size / 224)))
+    painter.drawEllipse(bounds)
+
+    sweep = QConicalGradient(bounds.center(), rotation)
+    intensity = ORBIT_INTENSITY.get(state, ORBIT_INTENSITY["disconnected"])
+    for position, fraction in ((0, 0), (.56, 0), (.68, .16), (.89, .75), (.945, 1), (1, 0)):
+        tint = QColor(color)
+        tint.setAlpha(round(intensity * fraction))
+        sweep.setColorAt(position, tint)
+    width = 2.8 if state == "connecting" else 2.1
+    painter.setPen(QPen(sweep, max(1.3, width * size / 224)))
+    painter.drawEllipse(bounds)
 
 
 def paint_connection_edge(painter, rect, border, reflection):

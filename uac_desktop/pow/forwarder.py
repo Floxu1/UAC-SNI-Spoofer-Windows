@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import socket
 import threading
+from urllib.parse import urlsplit
+
+from ..routing_data import is_local_ipv4
 
 _BUFFER = 65536
 #: TCP keepalive for long idle tunnels (Telegram/MTProto): first probe after
@@ -176,20 +179,17 @@ class HttpToSocks:
                     port = int(port_text) if port_text else 443
                 except ValueError:
                     return
-                upstream = _socks5_connect(self._socks_host, self._socks_port, host, port)
+                upstream = self._connect_target(host, port)
                 conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 make_long_lived(conn, upstream)
                 _relay(conn, upstream, self._stop)
                 return
             # Origin-form or absolute-form plain HTTP: forward to port 80
             # (or the explicit port) and relay both directions.
-            if target.startswith("http://"):
-                without_scheme = target[len("http://") :]
-                host_port, _, _path = without_scheme.partition("/")
-                host, _, port_text = host_port.partition(":")
-                try:
-                    port = int(port_text) if port_text else 80
-                except ValueError:
+            url = urlsplit(target) if target.startswith("http://") else None
+            if url is not None:
+                host, port = url.hostname, url.port or 80
+                if host is None:
                     return
             else:
                 host_hdr = ""
@@ -204,11 +204,17 @@ class HttpToSocks:
                     port = int(port_text) if port_text else 80
                 except ValueError:
                     return
-            upstream = _socks5_connect(self._socks_host, self._socks_port, host, port)
+            upstream = self._connect_target(host, port)
+            if url is not None and is_local_ipv4(host) and len(parts) >= 3:
+                origin = url.path or "/"
+                if url.query:
+                    origin += "?" + url.query
+                _, separator, headers = request.partition(b"\r\n")
+                request = f"{parts[0]} {origin} {parts[2]}".encode("latin1") + separator + headers
             upstream.sendall(request)
             make_long_lived(conn, upstream)
             _relay(conn, upstream, self._stop)
-        except OSError:
+        except (OSError, ValueError):
             pass
         finally:
             try:
@@ -220,6 +226,11 @@ class HttpToSocks:
                     upstream.close()
                 except OSError:
                     pass
+
+    def _connect_target(self, host: str, port: int) -> socket.socket:
+        if is_local_ipv4(host):
+            return socket.create_connection((host, port), timeout=10)
+        return _socks5_connect(self._socks_host, self._socks_port, host, port)
 
     def stop(self) -> None:
         self._stop.set()

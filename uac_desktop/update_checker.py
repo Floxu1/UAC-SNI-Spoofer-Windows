@@ -135,6 +135,14 @@ class SemVersion:
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class UpdateInfo:
     repo_url: str
     current_version: str
@@ -148,6 +156,7 @@ class UpdateInfo:
     is_update_available: bool
     download_url: str = ""
     asset_name: str = ""
+    assets: tuple[ReleaseAsset, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +303,12 @@ def check_latest_release(
         if not release_url.lower().startswith((repository.canonical_url + "/releases/").lower()):
             raise UpdateServiceError("GitHub latest release response has an invalid release URL")
         asset_name, download_url = _preferred_asset(payload)
+        assets = payload.get("assets")
+        files = tuple(
+            ReleaseAsset(str(asset.get("name", "")), str(asset.get("browser_download_url", "")),
+                         asset["size"], str(asset.get("digest") or ""))
+            for asset in assets if isinstance(asset, dict) and type(asset.get("size")) is int
+        ) if isinstance(assets, list) else ()
         return UpdateInfo(
             repo_url=repository.canonical_url,
             current_version=str(installed),
@@ -307,6 +322,7 @@ def check_latest_release(
             is_update_available=latest > installed,
             download_url=download_url,
             asset_name=asset_name,
+            assets=files,
         )
     finally:
         if own_session:

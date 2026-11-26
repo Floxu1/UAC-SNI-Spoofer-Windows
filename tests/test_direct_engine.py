@@ -1,7 +1,9 @@
 from dataclasses import replace
+import socket
 import socketserver
 import struct
 import threading
+from types import SimpleNamespace
 
 import dns.message
 import dns.rrset
@@ -10,6 +12,7 @@ import pytest
 from uac_desktop.direct import carrier, coordinator, probe
 from uac_desktop.direct.coordinator import DirectCoordinator, DirectOptions
 from uac_desktop.direct.output import TUN_INTERFACE, build_tun_config
+from uac_desktop.direct.resolvers import MOZILLA_DOH, RESOLVERS, parse_resolver, resolver_catalog
 from uac_desktop.direct.store import DirectSettings, DirectStore, read_json, write_json
 from uac_desktop.direct.xray import build_config
 
@@ -84,6 +87,146 @@ def test_doh_verifies_question_transaction_and_public_a_record():
     unrelated = probe._query("www.example.com", 0)
     assert not probe.answers_with_public_ipv4(query, _dns_response(unrelated, "8.8.8.8"))
     assert not probe.answers_with_public_ipv4(query, _dns_response(query, "8.8.8.8")[:-1])
+
+
+def test_dns_lab_catalog_round_trip_and_real_tcp_measurements(tmp_path):
+    class DnsServer(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.settimeout(2)
+            size = struct.unpack("!H", probe.recv_exact(self.request, 2))[0]
+            response = _dns_response(probe.recv_exact(self.request, size), "8.8.8.8")
+            self.request.sendall(struct.pack("!H", len(response)) + response)
+
+    with socketserver.TCPServer(("127.0.0.1", 0), DnsServer) as server:
+        handler = threading.Thread(target=server.serve_forever, daemon=True)
+        handler.start()
+        try:
+            chosen = parse_resolver(f"tcp://127.0.0.1:{server.server_address[1]}")
+            scan = probe.scan_dns((chosen,), 0, threading.Event())
+            assert scan[0].attempts == len(scan[0].samples) == 4
+            assert scan[0].latency >= 1
+        finally:
+            server.shutdown()
+            handler.join(2)
+    assert parse_resolver("2001:4860:4860::8888").url == "tcp://[2001:4860:4860::8888]"
+    with pytest.raises(ValueError):
+        parse_resolver("https://user:secret@example.com/")
+    store = DirectStore(tmp_path)
+    store.save_settings(replace(store.settings(), auto_select_dns=False, custom_dns=(chosen.url, chosen.url),
+                                pinned_dns=chosen.url))
+    saved = store.settings()
+    assert saved.pinned_dns == chosen.url and saved.custom_dns == (chosen.url,)
+    assert resolver_catalog(saved.custom_dns)[-1] == chosen
+
+
+def test_aetherst_dns_catalog_and_pinned_resolver(tmp_path):
+    chosen = parse_resolver("udp://[2001:4860:4860::8888]:53")
+    assert chosen.label == "Google" and chosen.protocol == "UDP"
+    catalog = resolver_catalog((chosen.url,))
+    assert len({item.url for item in catalog if item.protocol == "UDP"}) == 30
+    assert parse_resolver("udp://10.202.10.10").label == "Radar"
+    assert all(item.protocol == "DoH" for item in RESOLVERS)
+
+    store = DirectStore(tmp_path)
+    store.save_settings(replace(store.settings(), pinned_dns=chosen.url, custom_dns=(chosen.url,)))
+    assert store.settings().pinned_dns == chosen.url
+    assert store.settings().custom_dns == ()
+    config = build_config(DirectSettings(iran_direct=False), 46501, exit_port=46503, session_dns=chosen)
+    server = config["dns"]["servers"][0]
+    assert (server["tag"], server["address"], server["port"]) == ("dns-unfiltered", chosen.host, 53)
+
+
+@pytest.mark.parametrize("host", ("127.0.0.1", "::1"))
+def test_dns_lab_measures_real_udp_answers(host):
+    class DnsServer(socketserver.BaseRequestHandler):
+        def handle(self):
+            query, sock = self.request
+            sock.sendto(_dns_response(query, "8.8.8.8"), self.client_address)
+
+    class LocalServer(socketserver.UDPServer):
+        address_family = socket.AF_INET6 if host == "::1" else socket.AF_INET
+
+    try:
+        server = LocalServer((host, 0), DnsServer)
+    except OSError:
+        if host == "::1":
+            pytest.skip("IPv6 loopback unavailable")
+        raise
+    with server:
+        handler = threading.Thread(target=server.serve_forever, daemon=True)
+        handler.start()
+        try:
+            address = "[::1]" if host == "::1" else host
+            chosen = parse_resolver(f"udp://{address}:{server.server_address[1]}")
+            scan, = probe.scan_dns((chosen,), 0, threading.Event())
+            assert scan.attempts == len(scan.samples) == 4
+        finally:
+            server.shutdown()
+            handler.join(2)
+
+
+def test_dns_lab_route_bypasses_interception_and_pinned_dns_reaches_tun():
+    settings = DirectSettings(iran_direct=False)
+    chosen = parse_resolver("https://dns.google/dns-query")
+    config = build_config(settings, 46501, exit_port=46503, dns_lab_port=46504, session_dns=chosen)
+    assert config["dns"]["servers"][0]["address"] == chosen.url
+    assert config["dns"]["hosts"][chosen.host] == list(chosen.bootstrap)
+    rules = config["routing"]["rules"]
+    assert "dns-lab-in" not in rules[0]["inboundTag"]
+    assert rules[1]["inboundTag"] == ["dns-lab-in"]
+    assert rules[1]["outboundTag"] == rules[2]["outboundTag"] == "direct-wireguard-dns"
+    assert next(o for o in config["outbounds"] if o["tag"] == "direct-wireguard")["targetStrategy"] == "UseIPv4"
+    tun = build_tun_config(settings, 46501, "1.1.1.1", 1280, "all", [], "mixed")
+    assert tun["dns"]["servers"][0]["detour"] == "proxy"
+    assert next(o for o in tun["outbounds"] if o["tag"] == "proxy")["server_port"] == 46501
+
+
+@pytest.mark.parametrize("iran_direct", (True, False))
+def test_pinned_dns_is_not_repeated_as_a_fallback(iran_direct):
+    config = build_config(DirectSettings(iran_direct=iran_direct), 46501, exit_port=46503,
+                          session_dns=parse_resolver(MOZILLA_DOH))
+    servers = config["dns"]["servers"]
+    pinned, = [server for server in servers if server["address"] == MOZILLA_DOH]
+    assert pinned["tag"] == "dns-unfiltered" and not pinned.get("skipFallback")
+    assert ("domain:youtube.com" in pinned.get("domains", [])) is iran_direct
+    assert any(server["address"] == "https://dns.google/dns-query" for server in servers)
+
+
+def test_dns_apply_rebuilds_the_existing_direct_session(tmp_path, monkeypatch):
+    ready = threading.Event()
+    rebuilt = threading.Event()
+    calls = []
+
+    def report(status):
+        if status.phase == "connected":
+            (rebuilt if len(calls) > 1 else ready).set()
+
+    def connect_route(_stack, settings, _options, _directory, socks, http, _paused, _allow):
+        calls.append(settings)
+        return SimpleNamespace(tun=None, carrier=None, healthy=lambda: True,
+                               socks_port=socks, http_port=http, probe_port=40000,
+                               dns_lab_port=40001, stats_port=40002)
+
+    current = DirectCoordinator(tmp_path / "direct", tmp_path, status=report, log=lambda _: None)
+    monkeypatch.setattr(coordinator, "_network_key", lambda: "wifi")
+    monkeypatch.setattr(coordinator, "xray_traffic", lambda *_args: None)
+    monkeypatch.setattr(coordinator, "NetworkNotifications", lambda _event: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(coordinator, "WindowsProxy", lambda _log: SimpleNamespace(
+        bind_session=lambda *args, **kwargs: None, restore_session=lambda: None,
+    ))
+    monkeypatch.setattr(current, "_connect_route", connect_route)
+    assert current.connect(DirectOptions(vpn=False, system_proxy=False))
+    try:
+        assert ready.wait(2)
+        worker = current._worker
+        dns_settings = replace(current.store.settings(), auto_select_dns=False, pinned_dns="tcp://9.9.9.9")
+        assert current.reload_dns(dns_settings)
+        assert rebuilt.wait(2)
+        assert current._worker is worker
+        assert calls[-1].pinned_dns == dns_settings.pinned_dns and not calls[-1].auto_select_dns
+    finally:
+        current.disconnect()
+        assert current.wait(3)
 
 
 def test_dns_verification_uses_real_socks_connect_and_tcp_framing():

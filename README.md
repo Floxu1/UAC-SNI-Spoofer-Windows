@@ -6,7 +6,7 @@
 
 <p dir="rtl"><b>داشبورد شبکه یک‌کلیکی برای ویندوز: <code>Xray</code> با متد SNI Spoofing گروه Patterniha، به‌همراه موتور دوم سایفون روی وارپ</b></p>
 
-[![Version](https://img.shields.io/badge/version-1.1.2-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
+[![Version](https://img.shields.io/badge/version-1.1.3-2ea44f?style=flat-square)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6?style=flat-square&logo=windows)](#دانلود-و-شروع-سریع)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/Floxu1/UAC-SNI-Spoofer-Windows?style=flat-square&label=latest)](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)
@@ -106,8 +106,8 @@
 
 ## دانلود و شروع سریع
 
-۱. فایل <code>UAC-Spoofer-Desktop-v1.1.2-Windows-x64-portable.zip</code> را از **[صفحه Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** دانلود کنید (با <code>SHA256SUMS.txt</code> بررسی کنید).<br>
-۲. کل فایل ZIP را استخراج کنید و پوشه <code>_internal</code> را کنار فایل اجرایی نگه دارید.<br>
+۱. بستهٔ <code>UAC-Spoofer-Windows-Portable.zip</code> یا نصب‌کنندهٔ <code>UAC-Spoofer-Windows-Setup.msi</code> را از **[صفحه Releases](https://github.com/Floxu1/UAC-SNI-Spoofer-Windows/releases/latest)** دریافت کنید و هش فایل را با <code>SHA256SUMS.txt</code> بسنجید.<br>
+۲. فایل MSI را اجرا کنید یا کل بستهٔ Portable را در یک پوشهٔ جدا استخراج کنید.<br>
 ۳. فایل <code>UAC-Spoofer-Desktop.exe</code> را اجرا کنید و پیام UAC ویندوز را تأیید کنید (دسترسی ادمین برای درایور Spoof، حالت TUN و درگاه لازم است).<br>
 ۴. دستیار شروع سریع را دنبال کنید و دکمه **اتصال** را بزنید.
 
@@ -132,7 +132,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 | فایل | منبع |
 |---|---|
-| <code>xray.exe</code>، <code>geoip.dat</code>، <code>geosite.dat</code> | ریلیز <code>Xray-core 26.3.27</code> با هش SHA-256 ثابت |
+| <code>xray.exe</code> | ریلیز رسمی <code>Xray-core 26.11.9</code> با هش SHA-256 ثابت |
+| <code>geoip.dat</code>، <code>geosite.dat</code> | فایل‌های موجود در <code>bin</code> یا، در نصب تازه، ریلیز <code>Xray-core 26.3.27</code> با هش SHA-256 ثابت |
 | <code>sing-box.exe</code>، <code>libcronet.dll</code> | ریلیز <code>sing-box 1.13.14</code> با هش SHA-256 ثابت |
 | <code>uac-psiphon.exe</code> | ساخت با <code>go build</code> از پوشه <code>pow_helper</code> (وابستگی‌ها با <code>go.sum</code>) |
 | <code>aether.exe</code> | ساخت بومی ویندوز از نسخهٔ ثابت PoW اندروید در <code>core/aether</code> و <code>core/quiche</code>، شامل مسیرهای H3 و پشتیبانی از مخزن گواهی ویندوز |
@@ -140,6 +141,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 | <code>uac-pow-guard.exe</code>، <code>uac-direct-guard.exe</code> | ساخت helper فیلترینگ ویندوز از <code>tools/pow-guard.c</code> با MSVC |
 
 اجرای مستقیم از سورس: <code>pip install -r requirements.txt</code>، سپس <code>install-engine.ps1</code> و در آخر <code>python main.py</code>.
+
+برای ساخت بسته‌های انتشار، WiX را با <code>dotnet tool install --global wix --version 6.0.2</code> نصب و <code>release.ps1</code> را اجرا کنید. هر دو بستهٔ Windows x64 و هش آن‌ها در <code>github_release</code> قرار می‌گیرند. هر دو بسته را به انتشار GitHub با تگ <code>v&lt;version&gt;</code> پیوست کنید. به‌روزرسانی داخل برنامه حجم و هش اعلام‌شده در GitHub را بررسی می‌کند. کاربران نسخه‌های Portable قدیمی با استخراج یک بستهٔ Portable جدید به به‌روزرسانی داخل برنامه دسترسی پیدا می‌کنند. تنظیمات هر دو نسخه در <code>%APPDATA%\UAC Spoofer Desktop</code> ذخیره می‌شوند.
 
 ## پرسش‌های رایج و رفع مشکل
 

@@ -13,39 +13,60 @@ function Get-RemoteFile([string]$Uri, [string]$OutFile) {
     Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
 }
 
-$xrayVersion = '26.3.27'
-$xraySha256 = 'd004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad'
+
+$xrayVersion = '26.11.9'
+$xraySha256 = '1262522266337b824f07beb8e1375786b437683b3890105469088f8e17e0a69d'
 $xrayExe = Join-Path $bin 'xray.exe'
 $needsXray = -not (Test-Path $xrayExe)
 if (-not $needsXray) {
     try {
         $installedXray = (& $xrayExe version 2>&1 | Out-String)
-        $needsXray = ($LASTEXITCODE -ne 0 -or $installedXray -notmatch "Xray $([regex]::Escape($xrayVersion))")
+        $needsXray = ($LASTEXITCODE -ne 0 -or $installedXray -notmatch "^Xray $([regex]::Escape($xrayVersion)) ")
     } catch {
         $needsXray = $true
     }
 }
-if ($needsXray) {
-    $xrayZip = Join-Path $env:TEMP "xray-$xrayVersion-windows-64.zip"
-    $xrayUrl = "https://github.com/XTLS/Xray-core/releases/download/v$xrayVersion/Xray-windows-64.zip"
-    Write-Host "Downloading Xray $xrayVersion for Windows x64..."
-    Get-RemoteFile $xrayUrl $xrayZip
-    $actualHash = (Get-FileHash -LiteralPath $xrayZip -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($actualHash -ne $xraySha256) {
-        throw "Xray archive checksum mismatch: $actualHash"
-    }
+
+function Install-XrayFiles([string]$Version, [string]$Sha256, [string[]]$Names) {
     $xrayTemp = Join-Path $env:TEMP ('uac-xray-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $xrayTemp | Out-Null
     try {
-        Expand-Archive -LiteralPath $xrayZip -DestinationPath $xrayTemp -Force
-        foreach ($name in @('xray.exe', 'geoip.dat', 'geosite.dat', 'LICENSE')) {
-            $source = Join-Path $xrayTemp $name
-            if (Test-Path $source) { Copy-Item -LiteralPath $source -Destination $bin -Force }
+        $xrayZip = Join-Path $xrayTemp 'Xray-windows-64.zip'
+        $extractDir = Join-Path $xrayTemp 'unpacked'
+        $xrayUrl = "https://github.com/XTLS/Xray-core/releases/download/v$Version/Xray-windows-64.zip"
+        Write-Host "Downloading Xray $Version files for Windows x64..."
+        Get-RemoteFile $xrayUrl $xrayZip
+        $actualHash = (Get-FileHash -LiteralPath $xrayZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualHash -ne $Sha256) {
+            throw "Xray $Version archive checksum mismatch: $actualHash"
+        }
+        Expand-Archive -LiteralPath $xrayZip -DestinationPath $extractDir -Force
+        foreach ($name in $Names) {
+            if (-not (Test-Path -LiteralPath (Join-Path $extractDir $name) -PathType Leaf)) {
+                throw "Xray $Version archive is missing $name."
+            }
+        }
+        foreach ($name in $Names) {
+            Copy-Item -LiteralPath (Join-Path $extractDir $name) -Destination $bin -Force
         }
     } finally {
-        Remove-Item -LiteralPath $xrayTemp -Recurse -Force
-        Remove-Item -LiteralPath $xrayZip -Force -ErrorAction SilentlyContinue
+        $resolved = Get-Item -LiteralPath $xrayTemp
+        $tempRoot = Get-Item -LiteralPath $env:TEMP
+        if ($resolved.Parent.FullName -eq $tempRoot.FullName) {
+            Remove-Item -LiteralPath $resolved.FullName -Recurse -Force
+        }
     }
+}
+
+# Keep the geodata used by both Xray and PoW, including on a fresh install.
+$missingXrayData = @('geoip.dat', 'geosite.dat' | Where-Object {
+    -not (Test-Path -LiteralPath (Join-Path $bin $_) -PathType Leaf)
+})
+if ($missingXrayData.Count) {
+    Install-XrayFiles '26.3.27' 'd004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad' $missingXrayData
+}
+if ($needsXray) {
+    Install-XrayFiles $xrayVersion $xraySha256 @('LICENSE', 'xray.exe')
 }
 
 if (-not (Test-Path $xrayExe)) {
@@ -56,6 +77,7 @@ if ($LASTEXITCODE -ne 0 -or $verifiedXray -notmatch "Xray $([regex]::Escape($xra
     throw "Xray $xrayVersion runtime validation failed."
 }
 Write-Host $verifiedXray.Trim()
+
 
 $singVersion = '1.13.14'
 $singSha256 = 'f580782c6dd10f7691c66cea1d7c421813c5fbf7e305d1ee7ce0c3a40d196341'

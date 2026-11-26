@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import json
 import threading
 import time
 import urllib.parse
 
 import pytest
+import requests
 
 import uac_desktop.sni_maker as maker_module
 from uac_desktop.models import ProxyProfile, parse_many
@@ -404,7 +406,9 @@ def test_file_and_github_blob_url_import(tmp_path):
 
     class Response:
         status_code = 200
-        content = _uri(2).encode()
+        content = ('<script type="application/json">' + json.dumps(
+            {"payload": {"blob": {"rawLines": [_uri(2), _uri(2)]}}}
+        ) + '</script>').encode()
         encoding = "utf-8"
         headers = {"ETag": '"source-v1"'}
 
@@ -426,12 +430,11 @@ def test_file_and_github_blob_url_import(tmp_path):
     )
     url_result = maker.import_url(blob_url, etag='"old"', session=session)
 
-    assert normalize_repository_url(blob_url) == (
-        "https://raw.githubusercontent.com/Delta-Kronecker/Sub/"
-        "refs/heads/main/config/sni/all_configs_sni.txt"
-    )
-    assert maker_module.DEFAULT_REPOSITORY_URL == "https://mifa.world/vless"
-    assert session.calls[0][0] == normalize_repository_url(blob_url)
+    assert normalize_repository_url(blob_url) == blob_url
+    assert maker_module.DEFAULT_REPOSITORY_URL == "https://github.com/patterniha/Free-Configs/blob/main/configs.txt"
+    assert session.calls[0][0] == blob_url.replace("/refs/heads/", "/")
+    assert len(session.calls) == 1
+    assert url_result.duplicate_count == 1
     assert session.calls[0][1]["headers"]["If-None-Match"] == '"old"'
     assert url_result.added_count == 1
     assert url_result.etag == '"source-v1"'
@@ -451,6 +454,46 @@ def test_url_import_supports_etag_not_modified():
     assert result.not_modified is True
     assert result.added_count == 0
     assert result.etag == '"same"'
+
+
+def test_github_html_cells_preserve_full_uri_and_ignore_page_links():
+    from html import escape
+    from uac_desktop.github_blob import file_content
+
+    uri = _uri(1) + "&extra=%2F&extra=x;"
+    page = (f'<nav>{_uri(2)}</nav><table><td id="LC1" class="blob-code">'
+            f'<span>{escape(uri)}</span></td></table>')
+    assert file_content("blob", page.encode()) == uri
+
+
+def test_blocked_raw_truncated_blob_api_fallback_and_preserve_previous_list():
+    from unittest.mock import Mock
+
+    uri = _uri(1) + "&custom=%2F&custom=end;"
+    raw = ("# ignored " + _uri(2) + "\n" + uri + "\n" + uri).encode()
+    page = '<script type="application/json">{"payload":{"blob":{"truncated":true}}}</script>'
+    client = Mock()
+    client.get.side_effect = [
+        requests.ConnectionError("blocked"),
+        Mock(status_code=200, headers={}, content=page.encode()),
+        Mock(status_code=200, headers={}, content=json.dumps({
+            "type": "file", "size": len(raw), "encoding": "base64",
+            "content": base64.b64encode(raw).decode()
+        }).encode())
+    ]
+    maker = SniConfigMaker()
+    url = "https://raw.githubusercontent.com/org/repo/refs/heads/main/sub/file.txt"
+    result = maker.import_url(url, session=client)
+    assert [p.source_uri for p in result.profiles] == [uri]
+    assert (result.detected_count, result.duplicate_count) == (2, 1)
+    assert [call.args[0] for call in client.get.call_args_list] == [
+        url, "https://github.com/org/repo/blob/main/sub/file.txt",
+        "https://api.github.com/repos/org/repo/contents/sub/file.txt?ref=main"
+    ]
+    client.get.side_effect = requests.ConnectionError("offline")
+    with pytest.raises(ValueError):
+        maker.import_url(url, session=client)
+    assert [p.source_uri for p in maker.profiles] == [uri]
 
 
 def test_default_preflight_probe_is_concurrent_and_does_not_invent_country(monkeypatch):

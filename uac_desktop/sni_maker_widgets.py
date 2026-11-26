@@ -303,7 +303,14 @@ class MakerResultsModel(QAbstractTableModel):
         self._rows: list[MakerResult] = []
         self._key_rows: dict[str, int] = {}
         self._headers = ("", "Country", "Status", "Ping", "Configuration")
+        self._rtl_headers = False
         self._status_labels: dict[str, str] = {}
+        self._uri_font = QFont()
+        self._uri_font.setFamilies(["JetBrains Mono", "Consolas"])
+        self._uri_font.setPixelSize(11)
+        self._ping_font = QFont(self._uri_font)
+        self._ping_font.setPixelSize(12)
+        self._ping_font.setWeight(QFont.Weight.Medium)
         if rows:
             self.append_batch(rows)
 
@@ -314,17 +321,22 @@ class MakerResultsModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(MakerColumns)
 
     def headerData(self, section: int, orientation: Qt.Orientation, role=Qt.ItemDataRole.DisplayRole):
+        if (role == Qt.ItemDataRole.TextAlignmentRole and orientation == Qt.Orientation.Horizontal
+                and section == MakerColumns.URI):
+            side = Qt.AlignmentFlag.AlignRight if self._rtl_headers else Qt.AlignmentFlag.AlignLeft
+            return int(side | Qt.AlignmentFlag.AlignVCenter)
         if role != Qt.ItemDataRole.DisplayRole:
             return None
         if orientation == Qt.Orientation.Horizontal:
             return self._headers[section] if 0 <= section < len(self._headers) else None
         return section + 1
 
-    def set_headers(self, headers: Iterable[object]) -> None:
+    def set_headers(self, headers: Iterable[object], *, rtl=False) -> None:
         values = tuple(str(value) for value in headers)
-        if len(values) != self.columnCount() or values == self._headers:
+        if len(values) != self.columnCount() or (values == self._headers and rtl == self._rtl_headers):
             return
         self._headers = values
+        self._rtl_headers = rtl
         self.headerDataChanged.emit(
             Qt.Orientation.Horizontal, 0, self.columnCount() - 1
         )
@@ -374,6 +386,10 @@ class MakerResultsModel(QAbstractTableModel):
             if column in {MakerColumns.MARK, MakerColumns.COUNTRY, MakerColumns.STATUS, MakerColumns.PING}:
                 return int(Qt.AlignmentFlag.AlignCenter)
             return int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        if role == Qt.ItemDataRole.FontRole and column == MakerColumns.URI:
+            return self._uri_font
+        if role == Qt.ItemDataRole.FontRole and column == MakerColumns.PING:
+            return self._ping_font
         if role == Qt.ItemDataRole.ForegroundRole:
             status_colors = {
                 "healthy": "#45f3b4",
@@ -386,9 +402,6 @@ class MakerResultsModel(QAbstractTableModel):
             }
             if column == MakerColumns.STATUS:
                 return QBrush(QColor(status_colors.get(result.status, "#afc5dc")))
-            if column == MakerColumns.PING and result.ping_ms is not None:
-                color = "#45f3b4" if result.ping_ms < 180 else "#ffd166" if result.ping_ms < 500 else "#ff8798"
-                return QBrush(QColor(color))
         if role == Qt.ItemDataRole.ToolTipRole:
             details = [result.label, result.uri] if result.label else [result.uri]
             if result.error:
@@ -883,15 +896,14 @@ class CountryRail(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sniMakerCountryRail")
-        self.setIconSize(QSize(32, 22))
-        self.setSpacing(4)
+        self.setIconSize(QSize(18, 13))
+        self.setSpacing(2)
         self.setFlow(QListView.Flow.LeftToRight)
         self.setWrapping(False)
         self.setResizeMode(QListView.ResizeMode.Adjust)
         self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setMinimumHeight(62)
-        self.setMaximumHeight(66)
+        self.setFixedHeight(38)
         self.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self._healthy_label = "healthy"
         self._total_label = "total"
@@ -903,26 +915,26 @@ class CountryRail(QListWidget):
                 background: transparent;
                 border: 0;
                 outline: 0;
-                padding: 2px;
+                padding: 0;
             }
             QListWidget#sniMakerCountryRail::item {
-                min-height: 46px;
-                background: rgba(8, 27, 51, 0.88);
-                border: 1px solid rgba(68, 122, 162, 0.34);
-                border-radius: 11px;
-                padding: 7px 10px;
-                margin: 2px;
-                color: #c9dced;
+                background: #102638;
+                border: 1px solid #2a4658;
+                border-radius: 6px;
+                padding: 0 8px;
+                margin: 0 2px;
+                color: #d0e2ed;
             }
             QListWidget#sniMakerCountryRail::item:hover {
-                background: rgba(11, 49, 70, 0.94);
-                border-color: rgba(54, 211, 255, 0.52);
+                background: #143349;
+                border-color: #3a6c80;
             }
             QListWidget#sniMakerCountryRail::item:selected {
-                background: rgba(7, 85, 91, 0.92);
-                border: 1px solid rgba(35, 245, 224, 0.82);
-                color: #ffffff;
+                background: #12373f;
+                border-color: #33818b;
+                color: #a9fff3;
             }
+            QListWidget#sniMakerCountryRail QScrollBar:horizontal { height: 6px; }
             """
         )
 
@@ -978,14 +990,14 @@ class CountryRail(QListWidget):
         suffix = f"{healthy} {self._healthy_label}  ·  {total} {self._total_label}"
         if testing:
             suffix += f"  ·  {testing} {self._live_label}"
-        item = QListWidgetItem(f"{label}\n{suffix}")
+        item = QListWidgetItem(label)
         item.setIcon(country_badge_icon(code))
         item.setData(self.CountryCodeRole, code)
         item.setData(self.HealthyCountRole, healthy)
         item.setData(self.TotalCountRole, total)
         item.setData(self.TestingCountRole, testing)
-        item.setToolTip(f"{label} · {healthy}/{total}")
-        item.setSizeHint(QSize(max(150, min(230, 108 + len(label) * 6)), 56))
+        item.setToolTip(f"{label} · {suffix}")
+        item.setSizeHint(QSize(self.fontMetrics().horizontalAdvance(label) + 60, 29))
         self.addItem(item)
 
     def selected_country(self) -> str:

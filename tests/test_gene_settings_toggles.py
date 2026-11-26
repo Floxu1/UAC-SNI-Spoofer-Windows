@@ -1,9 +1,4 @@
-﻿"""Settings → Advanced → Gene Lab: toggles sit exactly like the stream-optimization row.
-
-Each section has its own label-column width, so positions are compared as the
-offset from the start edge of the section's field column (right edge in RTL,
-left edge in LTR).
-"""
+"""Check the shared trailing control lane in each Xray settings tab."""
 from __future__ import annotations
 
 import os
@@ -28,34 +23,24 @@ def app():
     yield application
 
 
-def _span(widget, dialog):
-    left = widget.mapTo(dialog, QPoint(0, 0)).x()
-    return left, left + widget.width()
-
-
-def _start_offset(toggle, field, dialog, rtl):
-    t_left, t_right = _span(toggle, dialog)
-    f_left, f_right = _span(field, dialog)
-    return (f_right - t_right) if rtl else (t_left - f_left)
-
-
 @pytest.mark.parametrize("language", ["fa", "en"])
 def test_gene_toggles_align_with_stream_optimization(app, language):
     ui_fonts.apply_app_font(app, language)
-    dialog = ui_module.TuningDialog(None, Tuning.carrier_preset("auto"), language,
-                                    multi_gene_enabled=True, strategy_locked=True,
-                                    multi_gene_status="status")
-    dialog.resize(820, 760)
-    dialog.advanced_toggle.setChecked(True)
-    dialog.show()
-    app.processEvents()
-    rtl = language == "fa"
+    page = ui_module.XraySettingsPage(None, Tuning.carrier_preset("auto"), language,
+                                     multi_gene_enabled=True, strategy_locked=True,
+                                     multi_gene_status="status")
+    page.resize(820, 760)
+    page.show()
     try:
-        ref = _start_offset(dialog.upload_optimized, dialog.keepalive_count, dialog, rtl)
-        for toggle, anchor in ((dialog.strategy_lock, dialog.gene_import_btn), (dialog.multi_gene, dialog.gene_combo)):
+        offsets = []
+        for index, toggle in ((0, page.multi_gene), (1, page.upload_optimized), (2, page.strategy_lock)):
+            page.tabs.setCurrentIndex(index)
+            app.processEvents()
             assert toggle.isVisible()
-            assert abs(_start_offset(toggle, anchor, dialog, rtl) - ref) <= 2
-            assert toggle.size() == dialog.upload_optimized.size()
-        assert abs(_span(dialog.upload_optimized, dialog)[0] - _span(dialog.strategy_lock, dialog)[0]) <= 2
+            assert toggle.size() == page.upload_optimized.size()
+            row = toggle.parentWidget()
+            x = toggle.mapTo(row, QPoint()).x()
+            offsets.append(x if language == "fa" else row.width() - x - toggle.width())
+        assert max(offsets) - min(offsets) <= 2
     finally:
-        dialog.close()
+        page.close()

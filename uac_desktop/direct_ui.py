@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +15,6 @@ from .pow_ui import PowCountryPicker
 from .settings_ui import SettingsCard, SettingsGrid, SettingsPage, SettingsRow, SettingsSelect, engine_backup_card
 
 ENGINE_DIRECT = "direct"
-_DOMAIN = re.compile(r"[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}")
 
 
 class DirectPanel(QObject):
@@ -57,7 +55,9 @@ class DirectPanel(QObject):
         ), hint=("برای کشف مسیر وایرگارد استفاده می‌شود.", "Used for WireGuard route discovery."))
         dns = SettingsCard(w, "سامانهٔ نام دامنه", "DNS resolvers", icon="database")
         self._toggle(dns, "auto_select_dns", "انتخاب خودکار DNS", "Automatic DNS selection")
-        self._field(dns, "unfiltered_dns", "DNS بدون فیلتر", "Unfiltered DNS")
+        self._field(dns, "unfiltered_dns", "DNS جایگزین", "Fallback DNS",
+                    hint=("اگر در آزمایشگاه DNS سروری انتخاب نشده باشد، از این آدرس استفاده می‌شود.",
+                          "Used when no resolver is selected in DNS Lab."))
         self._field(dns, "domestic_dns", "DNS داخلی", "Domestic DNS")
         backup = engine_backup_card(w, lambda: self._export(page), lambda: self._import(page))
         page.category(0).addWidget(SettingsGrid((connection, dns, backup)))
@@ -96,7 +96,7 @@ class DirectPanel(QObject):
         self._toggles[name] = toggle
         group.add(SettingsRow(self.window, (fa, en), hint, toggle))
 
-    def _field(self, group, name, fa, en):
+    def _field(self, group, name, fa, en, *, hint=("", "")):
         if name == "tcp_max_split":
             control = QSpinBox()
             control.setObjectName("settingsNumber")
@@ -113,10 +113,17 @@ class DirectPanel(QObject):
         control.setProperty("technical", True)
         control.setLayoutDirection(Qt.LeftToRight)
         self._fields[name] = control
-        group.add(SettingsRow(self.window, (fa, en), ("", ""), control, stacked=True))
+        group.add(SettingsRow(self.window, (fa, en), hint, control, stacked=True))
 
     def effective_settings(self):
         return self.window.global_settings.snapshot().for_direct(self.store.settings())
+
+    def apply_dns(self, address: str) -> bool:
+        settings = replace(self.store.settings(), pinned_dns=address, auto_select_dns=not address)
+        saved = self.store.save_settings(settings, exclude=self.window.global_settings.direct_legacy_fields)
+        reload_requested = self.coordinator.reload_dns(saved)
+        self.refresh()
+        return reload_requested
 
     def refresh(self) -> None:
         if self.window.engine_mode != ENGINE_DIRECT or not hasattr(self.window, "home_header"):
@@ -148,22 +155,21 @@ class DirectPanel(QObject):
             self._toggles["tcp_fragment_enabled"].setEnabled(not settings.wireguard_over_direct)
             for key in ("tcp_lengths", "tcp_delays", "tcp_max_split"):
                 self._fields[key].setEnabled(not settings.wireguard_over_direct and settings.tcp_fragment_enabled)
-        w = self.window
-        actual_vpn = self.coordinator.session_vpn
-        output = settings.connection_mode
-        if actual_vpn is not None and self.coordinator.status.phase != "stopping":
-            output = "vpn" if actual_vpn else "proxy"
-        proxy_on, tun_on = output == "proxy", output == "vpn"
-        w._pow_set_toggle(w.auto_mode, settings.auto_select_dns)
-        w._pow_set_toggle(w.proxy_mode, proxy_on)
-        w._pow_set_toggle(w.tun_mode, tun_on)
-        for option, active in ((w.proxy_option, proxy_on), (w.tun_option, tun_on)):
-            option.setEnabled(True)
-            option.setProperty("active", active)
-            option.style().unpolish(option)
-            option.style().polish(option)
+        self.window._pow_set_toggle(self.window.auto_mode, settings.auto_select_dns)
+        self.refresh_output_controls()
         self.refresh_country(settings)
         self._show_status(self.coordinator.status, redraw=True)
+
+    def refresh_output_controls(self) -> None:
+        w = self.window
+        preferences = w.global_settings.snapshot()
+        actual_vpn = self.coordinator.session_vpn
+        if self.coordinator.status.phase == "stopping":
+            actual_vpn = None
+        tun_on = preferences.connection_mode == "vpn" if actual_vpn is None else actual_vpn
+        actual_proxy = self.coordinator.system_proxy_enabled
+        proxy_on = preferences.windows_proxy_enabled if actual_proxy is None else actual_proxy
+        w._sync_tun_proxy_controls(tun_on, proxy_on)
 
     def refresh_country(self, settings=None) -> None:
         from .ui import country_flag_badge, cyber_pixmap
@@ -225,17 +231,12 @@ class DirectPanel(QObject):
     def start(self) -> None:
         if self.busy or self.window.engine_mode != ENGINE_DIRECT or self.window._closing:
             return
-        settings = self.effective_settings()
-        if settings.connection_mode == "local":
-            self.window.show_toast(self.window.tr("برای اتصال، پروکسی ویندوز یا TUN را روشن کنید.",
-                                                  "Turn on Windows Proxy or TUN to connect."), "warning")
-            return
-        domains = tuple(dict.fromkeys(
-            "domain:" + item.lower() for item in re.split(r"[\s,;]+", settings.domains_direct) if _DOMAIN.fullmatch(item)
-        ))
+        preferences = self.window.global_settings.snapshot()
+        settings = preferences.for_direct(self.store.settings())
         options = DirectOptions(vpn=settings.connection_mode == "vpn", kill_switch=settings.kill_switch,
                                 routing_mode=settings.routing_mode, processes=self.window.global_settings.processes(),
-                                whitelist=domains)
+                                privacy=preferences,
+                                system_proxy=preferences.windows_proxy_enabled)
         self.coordinator.connect(options, settings=settings)
 
     def toggle(self) -> None:
@@ -253,12 +254,12 @@ class DirectPanel(QObject):
             self._reconnect = True
             self.coordinator.disconnect()
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
+        page = getattr(self.window, "dns_lab_page", None)
+        if page is not None:
+            page.stop_scan()
         self.stop()
-        self.coordinator.wait(12)
-
-    def toggle_pause(self) -> None:
-        self.coordinator.set_paused(self.coordinator.status.phase != "paused", proxy_only=True)
+        return self.coordinator.wait(12) and not self.coordinator.status.disconnect_failed
 
     def _show_status(self, status: DirectStatus, *, redraw=False) -> None:
         if status != self.coordinator.status:
@@ -266,15 +267,20 @@ class DirectPanel(QObject):
         w = self.window
         if w.engine_mode != ENGINE_DIRECT or w._closing:
             return
+        page = getattr(w, "dns_lab_page", None)
+        if page is not None:
+            page.set_route_status(status)
         from .ui import country_flag_icon, ltr_isolate
 
         phase = status.phase
         active = phase in ("connected", "paused")
         if redraw or phase != self._phase:
             self._phase = phase
+            if not redraw:
+                self.refresh_output_controls()
             visual = {"idle": "disconnected", "stopping": "disconnecting", "error": "error",
                       "connected": "connected", "paused": "paused"}.get(phase, "connecting")
-            w._set_connection_visual(visual)
+            w._set_connection_visual(visual, direct_color_state="reconnecting" if phase == "recovering" else None)
             if phase == "error" and self.busy:
                 w.connect_button.setText(w.tr("قطع اتصال", "Disconnect"))
                 w.connect_button.setProperty("i18nFa", "قطع اتصال")
@@ -287,9 +293,7 @@ class DirectPanel(QObject):
                 "error": ("اتصال Direct ناموفق بود.", "Direct connection failed.", "error", False),
             }
             w._set_activity(*activity.get(phase, ("در حال بررسی مسیر Direct…", "Checking the Direct route…", "running", True)))
-        if phase == "connected" and not redraw:
-            w.hero_card.set_wave_traffic(status.tx_bytes, status.rx_bytes)
-        w._sync_pause_action()
+        w._refresh_app_routing_notice()
         progress = f" · {status.progress}%" if 0 < status.progress < 100 and phase != "stopping" else ""
         if phase in ("starting", "checking", "recovering"):
             hints = {"starting": ("در حال آماده‌سازی مسیر Direct", "Preparing the Direct route"),
@@ -314,7 +318,7 @@ class DirectPanel(QObject):
             if phase == "connected" and status.resolver else "",
         )
         if active:
-            w.network_metrics.set_traffic(status.tx_bytes, status.rx_bytes, sample=not redraw)
+            w._display_traffic(status.tx_bytes, status.rx_bytes, sample=phase == "connected" and not redraw)
         w.ip_label.setText(status.exit_ip if active and status.exit_ip else "—")
         code = status.country.upper() if active and status.exit_ip else ""
         w.ip_card.set_secondary(region_name(code) if code else "")

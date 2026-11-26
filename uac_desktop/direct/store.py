@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from ..pow.regions import normalize_region
+from .resolvers import BUILTIN_RESOLVERS, parse_resolver, resolver_catalog
 
 STARTUP_BUDGET = {"turbo": 75, "balanced": 90, "thorough": 105}
 DEFAULT_UNFILTERED_DNS = "https://1.1.1.1/dns-query"
@@ -69,10 +70,13 @@ class DirectSettings:
     iran_direct: bool = True
     unfiltered_dns: str = DEFAULT_UNFILTERED_DNS
     domestic_dns: str = "localhost"
+    pinned_dns: str = ""
+    custom_dns: tuple[str, ...] = ()
     connection_mode: str = "vpn"
     kill_switch: bool = False
     routing_mode: str = "all"
     domains_direct: str = ""
+    ips_direct: str = ""
 
     @property
     def adaptive_client_hello(self) -> bool:
@@ -108,6 +112,13 @@ class DirectSettings:
         )
         values["unfiltered_dns"] = _dns(values["unfiltered_dns"])
         values["domestic_dns"] = values["domestic_dns"].strip() or defaults.domestic_dns
+        addresses = raw.get("custom_dns")
+        if isinstance(addresses, (list, tuple)):
+            values["custom_dns"] = tuple(resolver.url for resolver in resolver_catalog(addresses)[len(BUILTIN_RESOLVERS):])
+        try:
+            values["pinned_dns"] = parse_resolver(values["pinned_dns"]).url
+        except ValueError:
+            values["pinned_dns"] = ""
         return cls(**values)
 
 

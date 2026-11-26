@@ -45,35 +45,50 @@ def gateway_watchdog_mode(arguments: list[str]) -> int | None:
 def run_event_loop(app, window) -> int:
     """Guarantee a final in-process restore; the watchdog is the hard-kill fallback."""
     owner = WindowsProxy.process_identity()
+    cleanup_ok = True
     try:
-        return int(app.exec())
+        code = int(app.exec())
     finally:
 
 
         try:
             window.shutdown()
         except Exception:
-            pass
+            cleanup_ok = False
         try:
             window.engine.stop(notify=False)
         except Exception:
-            pass
+            cleanup_ok = False
         try:
             gateway = getattr(window.engine, "gateway", None)
             if gateway is not None:
-                gateway.recover(force=True)
+                cleanup_ok = gateway.recover(force=True) is not False and cleanup_ok
         except Exception:
-            pass
+            cleanup_ok = False
         try:
             from uac_desktop.process_win import cleanup_bin_helpers
             cleanup_bin_helpers()
         except Exception:
-            pass
+            cleanup_ok = False
         try:
             WindowsProxy.recover_stale(expected_pid=int(owner["pid"]),
                                        expected_create_time=float(owner["create_time"]))
         except Exception:
-            pass
+            cleanup_ok = False
+
+    update = getattr(window, "_prepared_update", None)
+    if update is not None:
+        from uac_desktop.updater import discard_update, launch_worker
+
+        try:
+            if (not cleanup_ok or not window._update_shutdown_ok or window._engine_busy()
+                    or window.engine.system_proxy.has_pending_restore):
+                raise RuntimeError("Connection or Windows proxy cleanup is still pending")
+            launch_worker(update)
+        except Exception as error:
+            discard_update(update)
+            ctypes.windll.user32.MessageBoxW(None, f"Update cancelled.\n{error}", "UAC Spoofer Desktop", 0x30)
+    return code
 
 
 def main() -> int:

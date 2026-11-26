@@ -292,13 +292,6 @@ def test_pow_settings_page_has_ports_section():
     assert "_build_proxy_port_card()" not in page
 
 
-def test_tuning_dialog_installs_xray_ports():
-    import inspect
-    import uac_desktop.ui as U
-    src = inspect.getsource(U.TuningDialog._build_simple_layout)
-    assert "install_xray_ports_into_tuning" in src
-
-
 def test_proxy_port_editor_xray_saves(tmp_path, monkeypatch):
     pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtWidgets import QApplication
@@ -314,7 +307,10 @@ def test_proxy_port_editor_xray_saves(tmp_path, monkeypatch):
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
     win = ui_module.MainWindow()
     assert not hasattr(win, "xray_proxy_port_panel") or getattr(win, "xray_proxy_port_panel", None) is None
-    editor = PortEditor(win, mode="xray")
+    win.engine_buttons["xray"].click()
+    win.open_tuning()
+    editor = win._xray_settings_form.proxy_port_editor
+    assert win.stack.currentWidget() is win.xray_settings_page
     editor.socks.setValue(30808)
     editor.http.setValue(30809)
     editor._loading = False

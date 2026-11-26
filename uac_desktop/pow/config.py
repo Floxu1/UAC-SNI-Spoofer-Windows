@@ -336,6 +336,8 @@ class PowSettings:
     psiphon_tunnel_pool: bool = False
     routing_mode: str = "bypass"
     iran_direct: bool = True
+    domains_direct: str = ""
+    ips_direct: str = ""
     dns_sinkhole: bool = True
     webrtc_block: bool = True
     quic_block: bool = False
@@ -386,6 +388,8 @@ class PowSettings:
             psiphon_tunnel_pool=bool(self.psiphon_tunnel_pool),
             routing_mode=_choice(self.routing_mode, ("all", "bypass", "only"), "bypass"),
             iran_direct=bool(self.iran_direct),
+            domains_direct=self.domains_direct if isinstance(self.domains_direct, str) else "",
+            ips_direct=self.ips_direct if isinstance(self.ips_direct, str) else "",
             dns_sinkhole=bool(self.dns_sinkhole),
             webrtc_block=bool(self.webrtc_block),
             quic_block=bool(self.quic_block),

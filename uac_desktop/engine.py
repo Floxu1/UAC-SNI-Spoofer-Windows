@@ -15,17 +15,21 @@ import winreg
 from collections.abc import Callable
 from contextlib import contextmanager
 from ctypes import wintypes
+from urllib.parse import urlsplit
 
 import psutil
 import requests
 
 from . import __version__
+from .application_settings import ConnectionPreferences, direct_domains, direct_ips
 from .gateway import GatewayManager
 from .npcap import npcap_available
 from .models import ProxyProfile, Tuning, parse_outbound
 from .pattern_core import PatternSniCore
 from .paths import (BIN, DATA_DIR, SING_BOX_CONFIG, SING_BOX_OWNER_FILE,
                     XRAY_CONFIG, XRAY_OWNER_FILE)
+from .routing_data import LOCAL_IPV4_NETWORKS
+from .traffic import enable_xray_traffic, loopback_ports, xray_traffic
 
 
 
@@ -389,6 +393,7 @@ class WindowsProxy:
         self.log = log
         self._previous: dict[str, object] = {}
         self._state_token = ""
+        self._session_uses_tun = False
 
     @staticmethod
     def _read(name: str, default=None):
@@ -594,13 +599,17 @@ class WindowsProxy:
         return state
 
     @staticmethod
+    def _app_proxy_server(socks_port: int, http_port: int) -> str:
+        return f"http=127.0.0.1:{http_port};https=127.0.0.1:{http_port};socks=127.0.0.1:{socks_port}"
+
+    @staticmethod
     def _write_app_proxy_values(bypass: str, enabled: bool,
                                 socks_port: int = SOCKS_PORT,
                                 http_port: int = HTTP_PORT) -> None:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ,
-                              f"http=127.0.0.1:{http_port};https=127.0.0.1:{http_port};socks=127.0.0.1:{socks_port}")
+                              WindowsProxy._app_proxy_server(socks_port, http_port))
             winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, bypass)
             if enabled:
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
@@ -627,6 +636,37 @@ class WindowsProxy:
             self._refresh()
             self.log("Windows system proxy suspended")
             return True
+
+    @property
+    def session_enabled(self) -> bool:
+        socks, http = self._resolved_ports()
+        return (self._read("ProxyEnable") == 1
+                and self._read("ProxyServer") == self._app_proxy_server(socks, http))
+
+    def set_session_enabled(self, enabled: bool) -> None:
+        if enabled:
+            if self._session_uses_tun:
+                raise RuntimeError("Turn off TUN before enabling Windows Proxy.")
+            self.resume()
+        elif not self.suspend() and self.session_enabled:
+            self.suspend_for_tun()
+        if self.session_enabled != enabled:
+            raise RuntimeError("Windows did not apply the requested proxy state")
+
+    def bind_session(self, socks_port: int, http_port: int, *, enabled: bool, tun: bool) -> None:
+        self.socks_port, self.http_port = socks_port, http_port
+        self._session_uses_tun = tun
+        if tun:
+            self.suspend_for_tun()
+        elif enabled:
+            try:
+                self.set_session_enabled(True)
+            except (OSError, RuntimeError) as exc:
+                self.log(f"Windows proxy could not be enabled: {exc}")
+
+    def restore_session(self) -> None:
+        if self._state_token and not self.disable() and self.has_pending_restore:
+            raise RuntimeError("Windows proxy restore is still pending")
 
     def suspend_for_tun(self, bypass: str = "<local>;localhost;127.*",
                         socks_port: int | None = None, http_port: int | None = None) -> None:
@@ -899,7 +939,8 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
                       socks_port: int = SOCKS_PORT, http_port: int = HTTP_PORT,
                       direct_edge: bool | None = None,
                       ech_config: str | None = None,
-                      xray_outbound_port: int | None = None) -> dict:
+                      xray_outbound_port: int | None = None,
+                      domains_direct: str = "", ips_direct: str = "") -> dict:
     tuning = tuning or Tuning()
     parsed = parse_outbound(profile)
     inferred_direct_edge = (
@@ -1034,6 +1075,7 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
 
     if bypass_processes:
         rules.insert(0, {"type": "field", "process": bypass_processes, "outboundTag": "direct"})
+    rules.append({"type": "field", "ip": list(LOCAL_IPV4_NETWORKS), "outboundTag": "direct"})
     requested_log_level = str(tuning.log_level or "normal").strip().lower()
     xray_log_level = {
         "debug": "debug", "verbose": "info", "info": "info",
@@ -1057,8 +1099,16 @@ def build_xray_config(profile: ProxyProfile, bypass_processes: list[str] | None 
             ),
             "xudpProxyUDP443": "allow",
         }
-    if bool(getattr(tuning, "iran_direct", True)):
+    iran_direct = bool(getattr(tuning, "iran_direct", True))
+    domains = direct_domains(domains_direct)
+    if domains:
+        rules.append({"type": "field", "domain": [f"domain:{domain}" for domain in domains],
+                      "outboundTag": "direct"})
+    if addresses := direct_ips(ips_direct):
+        rules.append({"type": "field", "ip": list(addresses), "outboundTag": "direct"})
+    if iran_direct:
         rules.extend(iran_direct_rules())
+    if iran_direct or domains:
         for inbound in inbounds:
             # routeOnly: the sniffed domain is used for routing only; the
             # destination (and ECH / spoof dial) is never rewritten.
@@ -1296,7 +1346,7 @@ def build_singbox_proxy_bypass_config(
         if (name and name.lower() not in protected
                 and name.lower() not in {item.lower() for item in processes}):
             processes.append(name)
-    rules = []
+    rules = [{"ip_cidr": list(LOCAL_IPV4_NETWORKS), "action": "route", "outbound": "direct"}]
     if helpers:
         rules.append({
             "process_name": helpers,
@@ -1358,6 +1408,7 @@ class Engine:
         self._gateway_restore_proxy = False
         self._tun_gateway_networks: tuple[str, ...] = ()
         self._bypass_processes: list[str] = []
+        self.connection_preferences: ConnectionPreferences | None = None
         self._fragment_required = False
         self.active_upstream_address = ""
         # ECH via Pattern core (default off); set from settings by the UI.
@@ -1366,6 +1417,7 @@ class Engine:
         self._log_level = "normal"
         self.socks_port = SOCKS_PORT
         self.http_port = HTTP_PORT
+        self._traffic_ports = (0, 0, 0)
         # User choice from Network Tools > Proxy Port (default = the pair above).
         self.preferred_ports: tuple[int, int] = (SOCKS_PORT, HTTP_PORT)
         self.last_probe_ms: float | None = None
@@ -1412,9 +1464,24 @@ class Engine:
     def run_id(self) -> int:
         return self._run_id
 
-    def _local_http_proxies(self) -> dict[str, str]:
-        return {"http": f"http://127.0.0.1:{self.http_port}",
-                "https": f"http://127.0.0.1:{self.http_port}"}
+    def _local_http_proxies(self, *, port=None) -> dict[str, str]:
+        return dict.fromkeys(("http", "https"), f"http://127.0.0.1:{port or self.http_port}")
+
+    def _probe_http_proxies(self) -> dict[str, str]:
+        return self._local_http_proxies(port=self.probe_http_port)
+
+    @property
+    def probe_http_port(self) -> int:
+        return self._traffic_ports[2] or self.http_port
+
+    @property
+    def probe_socks_port(self) -> int:
+        return self._traffic_ports[1] or self.socks_port
+
+    def traffic_sources(self):
+        run_id, port = self._run_id, self._traffic_ports[0]
+        result = xray_traffic(self._binary(), port) if port and self.running else None
+        return {run_id: result} if result is not None and self.running and self._run_id == run_id else None
 
     def _check_run_id(self, expected_run_id: int | None) -> None:
         if expected_run_id is not None and int(expected_run_id) != self._run_id:
@@ -2108,6 +2175,7 @@ class Engine:
                     resolution = ech_keys.resolve(ech_value, ech_cache, self.log)
                     ech_config = resolution.value
                     self.ech_state = resolution.state
+                preferences = self.connection_preferences
                 config = build_xray_config(
                     profile, bypass_processes, tuning,
                     upstream_address=upstream_address,
@@ -2115,7 +2183,11 @@ class Engine:
                     direct_edge=mci_builtin_finalmask,
                     ech_config=ech_config,
                     xray_outbound_port=xray_outbound_port,
+                    domains_direct=preferences.domains_direct if preferences else "",
+                    ips_direct=preferences.ips_direct if preferences else "",
                 )
+                self._traffic_ports = loopback_ports(3, exclude=(self.socks_port, self.http_port, xray_outbound_port, profile.config_port))
+                enable_xray_traffic(config, *self._traffic_ports)
                 XRAY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
                 creation = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 process = subprocess.Popen([str(self._binary()), "run", "-config", str(XRAY_CONFIG)],
@@ -2163,8 +2235,7 @@ class Engine:
         try:
             response = requests.get(
                 "https://www.gstatic.com/generate_204", timeout=6,
-                proxies={"http": f"http://127.0.0.1:{self.http_port}",
-                         "https": f"http://127.0.0.1:{self.http_port}"})
+                proxies=self._probe_http_proxies())
             if response.status_code in (200, 204):
                 return
         except Exception:
@@ -2177,11 +2248,15 @@ class Engine:
             self.log("ECH KEY: cached key probe failed; no newer key available")
             return
         self.log("ECH KEY: cached key rejected; reconnecting once with the fresh key")
+        preferences = self.connection_preferences
         config = build_xray_config(
             profile, bypass_processes, tuning, upstream_address=upstream_address,
             socks_port=self.socks_port, http_port=self.http_port,
             direct_edge=direct_edge, ech_config=resolution.value,
-            xray_outbound_port=xray_outbound_port)
+            xray_outbound_port=xray_outbound_port,
+            domains_direct=preferences.domains_direct if preferences else "",
+            ips_direct=preferences.ips_direct if preferences else "")
+        enable_xray_traffic(config, *self._traffic_ports)
         XRAY_CONFIG.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
         old = self.process
         try:
@@ -2282,6 +2357,19 @@ class Engine:
                 gateway_interface,
                 socks_port=self.socks_port,
             )
+            if not gateway_networks:
+                # Some Xray exits reject DNS over port 53. Keep DNS inside the tunnel over HTTPS.
+                config["dns"]["servers"] = [{
+                    "type": "https",
+                    "tag": "remote-dns",
+                    "server": "1.1.1.1",
+                    "tls": {"enabled": True, "server_name": "cloudflare-dns.com"},
+                    "detour": "proxy",
+                }]
+            if self.connection_preferences:
+                from .pow.routing import apply_tun_filters
+
+                apply_tun_filters(config, self.connection_preferences)
             SING_BOX_CONFIG.write_text(
                 json.dumps(config, indent=2, ensure_ascii=False),
                 encoding="utf-8",
@@ -2549,6 +2637,17 @@ class Engine:
             "https://www.gstatic.com/generate_204",
             "https://www.cloudflare.com/cdn-cgi/trace",
         )))
+        if self.connection_preferences:
+            bypass = direct_domains(self.connection_preferences.domains_direct)
+            tunneled_urls = []
+            for url in urls:
+                host = (urlsplit(url).hostname or "").rstrip(".")
+                if not any(host == domain or host.endswith(f".{domain}") for domain in bypass):
+                    tunneled_urls.append(url)
+            urls = tunneled_urls
+            if not urls:
+                return False, "All TUN connectivity check destinations are routed directly"
+            require_preferred = require_preferred and preferred_url in urls
         errors = []
         for url in urls:
             self._check_cancel(cancel_event)
@@ -2592,7 +2691,7 @@ class Engine:
         """Verify usable page traffic through the newly started local proxy."""
         self.last_probe_ms = None
         self.last_probe_url = ""
-        proxies = self._local_http_proxies()
+        proxies = self._probe_http_proxies()
         urls = ("https://www.gstatic.com/generate_204",
                 "https://www.cloudflare.com/cdn-cgi/trace",
                 "https://api.ipify.org?format=json")
@@ -2654,7 +2753,7 @@ class Engine:
             url: str = "https://www.gstatic.com/generate_204") -> float | None:
         if not self.running:
             return None
-        proxies = self._local_http_proxies()
+        proxies = self._probe_http_proxies()
         session = requests.Session()
         session.trust_env = False
         response = None
@@ -2702,7 +2801,7 @@ class Engine:
             self.last_download_reason = "engine stopped"
             return False, "engine stopped"
 
-        proxies = self._local_http_proxies()
+        proxies = self._probe_http_proxies()
         endpoint = f"{DOWNLOAD_PROBE_URL}?bytes={requested}"
         session = requests.Session()
         session.trust_env = False
@@ -2825,7 +2924,7 @@ class Engine:
         if not self.running:
             self.last_download_reason = "engine stopped"
             return False, "engine stopped"
-        proxies = self._local_http_proxies()
+        proxies = self._probe_http_proxies()
         targets = (
             ("YouTube", "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"),
             ("Google", "https://www.google.com/robots.txt"),
@@ -3017,7 +3116,7 @@ class Engine:
 
 
         requested = max(4 * 1024, min(int(size), 16 * 1024))
-        proxies = self._local_http_proxies()
+        proxies = self._probe_http_proxies()
         endpoints = ("https://postman-echo.com/post",)
         attempts: list[str] = []
         for endpoint in endpoints:
@@ -3096,7 +3195,7 @@ class Engine:
         try:
             self._check_cancel(cancel_event)
             started = time.perf_counter()
-            response = session.get(url, proxies=self._local_http_proxies(),
+            response = session.get(url, proxies=self._probe_http_proxies(),
                                    timeout=timeout, headers={"User-Agent": USER_AGENT,
                                                             "Connection": "close"})
             self._check_cancel(cancel_event)
@@ -3156,6 +3255,7 @@ class Engine:
         self._active = False
         self._fragment_required = False
         self.active_upstream_address = ""
+        self._traffic_ports = (0, 0, 0)
         self._run_id += 1
         process = self.process
         self.process = None
@@ -3169,8 +3269,8 @@ class Engine:
                     process.kill()
                     try:
                         process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    except subprocess.TimeoutExpired as exc:
+                        errors.append(exc)
             except Exception as exc:
                 errors.append(exc)
             try:
@@ -3184,7 +3284,8 @@ class Engine:
         self._bypass_processes = []
         if self._proxy_enabled or self.system_proxy.has_pending_restore:
             try:
-                self.system_proxy.disable()
+                if self.system_proxy.disable() is False and self.system_proxy.has_pending_restore:
+                    errors.append(RuntimeError("Windows proxy restore is still pending"))
             except Exception as exc:
                 errors.append(exc)
             finally:

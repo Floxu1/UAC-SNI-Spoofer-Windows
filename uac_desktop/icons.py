@@ -125,6 +125,8 @@ _ICONS: Final[dict[str, str]] = {
         <path d="M1 14h6M9 8h6M17 16h6"/>
     """,
     "chevron-right": """<path d="m9 18 6-6-6-6"/>""",
+    "arrow-right": """<path d="M4 12h16m-7-7 7 7-7 7"/>""",
+    "arrow-right-left": """<path d="M3 7h18m-5-5 5 5-5 5M21 17H3m5-5-5 5 5 5"/>""",
     "arrow-down": """<path d="M12 5v14M6 13l6 6 6-6"/>""",
     "chevron-left": """<path d="m15 18-6-6 6-6"/>""",
     "search": """<circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/>""",
@@ -175,6 +177,8 @@ _ICONS: Final[dict[str, str]] = {
     "eye": """<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/>""",
     "info": """<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>""",
     "clock": """<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>""",
+    "hash": """<path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/>""",
+    "x": """<path d="m18 6-12 12M6 6l12 12"/>""",
     "filter": """<path d="M3 5h18l-7 8v6l-4 2v-8L3 5Z"/>""",
     "undo": """<path d="M9 7 4 12l5 5M5 12h8a6 6 0 0 1 6 6v1"/>""",
     "sparkles": """<path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3ZM19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14ZM5 13l.8 2.2L8 16l-2.2.8L5 19l-.8-2.2L2 16l2.2-.8L5 13Z"/>""",

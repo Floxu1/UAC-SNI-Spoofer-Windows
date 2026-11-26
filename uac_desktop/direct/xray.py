@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from urllib.parse import urlsplit
 
-from .probe import Resolver
+from ..application_settings import direct_domains, direct_ips
+from ..routing_data import LOCAL_IPV4_NETWORKS
+from .resolvers import MOZILLA_DOH, Resolver
 from .store import DEFAULT_UNFILTERED_DNS, DirectSettings
 
 _PLAIN = "direct-plain"
 _UDP = "direct-udp"
 _NOISE = "direct-udp-noise"
 _WIREGUARD = "direct-wireguard"
+_WIREGUARD_DNS = "direct-wireguard-dns"
 _ADAPTIVE = "direct-hello-"
 _BALANCER = "direct-clienthello"
 _YOUTUBE = [
@@ -54,7 +58,7 @@ def _route(tag: str, **criteria) -> dict:
 
 def build_config(
     settings: DirectSettings, socks_port: int, *, http_port: int = 0,
-    stats_port: int = 0,
+    stats_port: int = 0, probe_port: int = 0, dns_lab_port: int = 0,
     exit_port: int = 0, country_exit: bool = False, session_dns: Resolver | None = None,
     paused: bool = False, noise_allowed: bool = True,
     mask_ports: Mapping[str, int] | None = None, whitelist: Sequence[str] = (),
@@ -77,8 +81,14 @@ def build_config(
         _freedom(_PLAIN, happy),
         _freedom(_UDP, ip),
     ]
+    raw_exit = _WIREGUARD
     if chained:
-        outbounds.append(_socks(_WIREGUARD, exit_port))
+        tunnel = _socks(_WIREGUARD, exit_port)
+        if session_dns:
+            tunnel["targetStrategy"] = "UseIP" if settings.ipv6 else "UseIPv4"
+            raw_exit = _WIREGUARD_DNS
+            outbounds.append(_socks(raw_exit, exit_port))
+        outbounds.append(tunnel)
     tls_tag = _PLAIN
     if use_frag:
         tls_tag = "direct-tls"
@@ -117,8 +127,12 @@ def build_config(
     dns_record = _ADAPTIVE + "record-sni" if adaptive and "record-sni" in mask_ports else tls_tag
     dns_oob = _ADAPTIVE + "oob" if adaptive and "oob" in mask_ports else dns_record
     rules = [_route("dns-out", inboundTag=[item["tag"] for item in inbounds], port="53")]
+    if dns_lab_port:
+        inbounds.append({**inbounds[0], "tag": "dns-lab-in", "port": dns_lab_port})
+        # The lab must reach each candidate, including TCP/53, without the normal DNS interception.
+        rules.append(_route(raw_exit if chained else _PLAIN, inboundTag=["dns-lab-in"]))
     if chained:
-        rules.append(_route(_WIREGUARD, inboundTag=["dns-unfiltered", "dns-cloudflare", "dns-google"]))
+        rules.append(_route(raw_exit, inboundTag=["dns-unfiltered", "dns-cloudflare", "dns-google"]))
     else:
         rules.extend([
             _route(tls_tag, inboundTag=["dns-unfiltered"]),
@@ -128,8 +142,17 @@ def build_config(
     rules.append(_route(_PLAIN, inboundTag=["dns-domestic", "dns-fallback"]))
     if paused:
         rules.append(_route(_PLAIN, network="tcp,udp"))
-    if whitelist:
-        rules.append(_route(_PLAIN, network="tcp,udp", domain=list(whitelist)))
+    rules.append(_route("block", ip=["10.10.34.0/24"]))
+    rules.append(_route(_PLAIN, network="tcp", ip=list(LOCAL_IPV4_NETWORKS)))
+    if not settings.ipv6:
+        rules.append(_route("block", ip=["::/0"]))
+    if settings.block_quic:
+        rules.extend([_route("block", network="udp", protocol=["quic"]), _route("block", network="udp", port="443")])
+    domains = list(dict.fromkeys((*whitelist, *(f"domain:{domain}" for domain in direct_domains(settings.domains_direct)))))
+    if domains:
+        rules.append(_route(_PLAIN, network="tcp,udp", domain=domains))
+    if addresses := direct_ips(settings.ips_direct):
+        rules.append(_route(_PLAIN, network="tcp,udp", ip=list(addresses)))
     if settings.iran_direct:
         if chained:
             rules.append(_route(_WIREGUARD, network="tcp", domain=_YOUTUBE))
@@ -140,14 +163,9 @@ def build_config(
             _route(_UDP, network="udp", ip=["geoip:ir"]),
         ])
     rules.extend([
-        _route("block", ip=["10.10.34.0/24"]),
         _route(_PLAIN, network="tcp", ip=["geoip:private"]),
         _route(_UDP, network="udp", ip=["geoip:private"]),
     ])
-    if not settings.ipv6:
-        rules.append(_route("block", ip=["::/0"]))
-    if settings.block_quic:
-        rules.extend([_route("block", network="udp", protocol=["quic"]), _route("block", network="udp", port="443")])
     if chained:
         if country_exit:
             rules.append(_route("block", network="udp"))
@@ -167,9 +185,9 @@ def build_config(
         "policy": {"levels": {"8": {"handshake": 8, "connIdle": 300, "uplinkOnly": 2, "downlinkOnly": 5}}},
     }
     if stats_port:
-        config["api"] = {"tag": "direct-stats", "listen": f"127.0.0.1:{stats_port}", "services": ["StatsService"]}
-        config["stats"] = {}
-        config["policy"]["system"] = {"statsInboundUplink": True, "statsInboundDownlink": True}
+        from ..traffic import enable_xray_traffic
+
+        enable_xray_traffic(config, stats_port, probe_socks=probe_port)
     if adaptive:
         selector = [_PLAIN, _ADAPTIVE]
         routing["balancers"] = [{
@@ -189,31 +207,43 @@ def _dns_server(tag: str, address: str, timeout: int, **options) -> dict:
 
 def _dns(settings: DirectSettings, chained: bool, preferred: Resolver | None) -> dict:
     address = preferred.url if preferred else settings.unfiltered_dns
-    if not chained and preferred and not preferred.bootstrap:
+    options = {}
+    if preferred and preferred.protocol == "UDP":
+        address = preferred.host
+        options["port"] = urlsplit(preferred.url).port or 53
+    elif not chained and preferred and preferred.protocol == "DoH" and not preferred.bootstrap:
         address = address.replace("https://", "https+local://", 1)
     elif chained and "://" not in address:
         host = f"[{address.strip('[]')}]" if ":" in address else address
         address = f"tcp://{host}"
     servers = []
+    primary = preferred is not None or settings.unfiltered_dns != DEFAULT_UNFILTERED_DNS
+    youtube_priority = settings.iran_direct and chained
+    if youtube_priority:
+        servers.append(_dns_server("dns-unfiltered", address, 2500, domains=_YOUTUBE,
+                                   skipFallback=not primary, **options))
     if settings.iran_direct:
-        if chained:
-            servers.append(_dns_server("dns-unfiltered", address, 2500, domains=_YOUTUBE, skipFallback=True))
         servers.append(_dns_server("dns-domestic", settings.domestic_dns, 3000,
                                    domains=_IR_DOMAINS, skipFallback=True, finalQuery=True))
-    if preferred or settings.unfiltered_dns != DEFAULT_UNFILTERED_DNS:
-        servers.append(_dns_server("dns-unfiltered", address, 2000))
-    servers.extend([
+    if primary and not youtube_priority:
+        servers.append(_dns_server("dns-unfiltered", address, 2000, **options))
+    fallbacks = [
         _dns_server("dns-cloudflare", "https://cloudflare-dns.com/dns-query", 1800),
         _dns_server("dns-google", "https://dns.google/dns-query", 1800),
-        _dns_server("dns-cloudflare", "https://mozilla.cloudflare-dns.com/dns-query", 1800),
-    ])
+        _dns_server("dns-cloudflare", MOZILLA_DOH, 1800),
+    ]
     if chained:
-        servers.append(_dns_server("dns-unfiltered", DEFAULT_UNFILTERED_DNS, 2500))
+        fallbacks.append(_dns_server("dns-unfiltered", DEFAULT_UNFILTERED_DNS, 2500))
     else:
-        servers.extend([
+        fallbacks.extend([
             _dns_server("dns-unfiltered", "https+local://1.1.1.1/dns-query", 1800),
             _dns_server("dns-fallback", settings.domestic_dns, 1200, unexpectedIPs=["10.10.34.0/24"]),
         ])
+    used = {server["address"] for server in servers if not server.get("skipFallback")}
+    for server in fallbacks:
+        if server["address"] not in used:
+            servers.append(server)
+            used.add(server["address"])
     hosts = {
         "cloudflare-dns.com": ["104.16.248.249", "104.16.249.249"],
         "mozilla.cloudflare-dns.com": ["172.64.41.4", "162.159.61.4"],

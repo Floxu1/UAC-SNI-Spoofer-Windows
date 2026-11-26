@@ -16,12 +16,12 @@ from pathlib import Path
 
 import requests
 
-from .models import ProxyProfile, parse_many
+from .github_blob import DEFAULT_REPOSITORY_URL, file_content, source_routes
+from .models import ProxyProfile, parse_many, parse_uri
 from .network import GeoLocation, profile_ping
 from .verified_configs import COUNTRIES, VERIFIED_SPOOF_EDGE, VERIFIED_SPOOF_FAKE_SNI
 
 
-DEFAULT_REPOSITORY_URL = "https://gitverse.ru/api/repos/flaafix/AetrisVPN_Black_list/raw/branch/master/configs.txt"
 SUPPORTED_PROTOCOLS = frozenset({"vless", "trojan"})
 KNOWN_UNSUPPORTED_PROTOCOLS = frozenset(
     {"ss", "ssr", "hysteria", "hysteria2", "hy2", "tuic", "wireguard"}
@@ -267,16 +267,7 @@ def country_name(country_code: str, supplied: str = "") -> str:
 
 
 def normalize_repository_url(url: str) -> str:
-    value = str(url or DEFAULT_REPOSITORY_URL).strip()
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.hostname and parsed.hostname.lower() == "github.com":
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) >= 5 and parts[2] == "blob":
-            owner, repository = parts[0], parts[1]
-            tail = parts[3:]
-            raw_path = "/".join([owner, repository, *tail])
-            return f"https://raw.githubusercontent.com/{raw_path}"
-    return value
+    return str(url or DEFAULT_REPOSITORY_URL).strip()
 
 
 def config_signature(value: ProxyProfile | str) -> str:
@@ -662,10 +653,18 @@ class SniConfigMaker:
             self,
             text: str,
             source: str = "text",
-            suggested: bool = False) -> SniImportResult:
+            suggested: bool = False, *, subscription_file: bool = False) -> SniImportResult:
         decoded_input = decode_config_payload(text)
         value = decoded_input.text
-        parsed_all = parse_many(value, suggested=suggested)
+        if subscription_file:
+            # Repository subscriptions contain one complete URI per record.
+            records = [uri for line in value.splitlines() if URI_TOKEN_RE.match(line.strip())
+                       for uri in re.split(r"\s+(?=[a-z][a-z0-9+.-]*://)", line.strip(), flags=re.I)]
+            value = "\n".join(records)
+            parsed_all = [profile for line in records
+                          if (profile := parse_uri(line, suggested, trim_prose=False)) is not None]
+        else:
+            parsed_all = parse_many(value, suggested=suggested)
         parsed = [
             profile for profile in parsed_all
             if not _unsupported_parsed_profile(profile)
@@ -698,7 +697,7 @@ class SniConfigMaker:
             profile.source_uri for profile in rejected_parsed
         )
         merged.input_format = decoded_input.input_format
-        merged.detected_count = decoded_input.config_count
+        merged.detected_count = supported_tokens if subscription_file else decoded_input.config_count
         return merged
 
     def import_file(
@@ -726,22 +725,33 @@ class SniConfigMaker:
         if str(etag or "").strip():
             headers["If-None-Match"] = str(etag).strip()
         client = session or requests
-        response = client.get(source_url, headers=headers, timeout=timeout)
-        if response.status_code == 304:
-            return SniImportResult(
-                source=source_url,
-                etag=str(response.headers.get("ETag", "") or ""),
-                not_modified=True,
-            )
-        response.raise_for_status()
-        content = response.content
-        if len(content) > max(1, int(max_bytes)):
-            raise ValueError("Remote config source is too large")
-        encoding = response.encoding or "utf-8"
-        text = content.decode(encoding, errors="replace")
-        imported = self.import_text(text, source=source_url, suggested=suggested)
-        imported.etag = str(response.headers.get("ETag", "") or "")
-        return imported
+        last_error = None
+        for index, (kind, endpoint) in enumerate(source_routes(source_url)):
+            request_headers = headers.copy()
+            if index:
+                request_headers.pop("If-None-Match", None)
+            if kind == "api":
+                request_headers["Accept"] = "application/vnd.github.raw+json"
+            try:
+                response = client.get(endpoint, headers=request_headers, timeout=timeout,
+                                      allow_redirects=kind != "blob")
+                tag = response.headers.get("ETag", "") if index == 0 else ""
+                if response.status_code == 304:
+                    return SniImportResult(source=source_url, etag=tag, not_modified=True)
+                response.raise_for_status()
+                if len(response.content) > max(1, int(max_bytes)):
+                    raise ValueError("Remote config source is too large")
+                value = file_content(kind, response.content)
+                imported = self.import_text(value, source=source_url, suggested=suggested, subscription_file=True)
+                if not imported.parsed_count:
+                    raise ValueError("No supported configurations found in the remote file")
+                imported.etag = tag
+                return imported
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if kind == "api" and getattr(getattr(exc, "response", None), "status_code", None) != 404:
+                    break
+        raise ValueError(f"Could not read the config source: {last_error}") from last_error
 
     def convert_profile(self, profile: ProxyProfile) -> SniConversionResult:
         return convert_to_sni(

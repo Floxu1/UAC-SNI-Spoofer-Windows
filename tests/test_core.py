@@ -9,11 +9,13 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
 import requests
 
 from pydivert import WinDivert
 
 from uac_desktop import __version__
+from uac_desktop.application_settings import ConnectionPreferences
 from uac_desktop.engine import (Engine, EngineCancelled, HTTP_PORT, SOCKS_PORT,
                                 USER_AGENT, XRAY_CONFIG, allocate_local_ports,
                                 build_singbox_tun_config, build_singbox_proxy_bypass_config, build_xray_config,
@@ -847,7 +849,8 @@ def test_engine_cancel_token_aborts_lifecycle_boundary():
         pass
 
 
-def test_engine_starts_validated_singbox_after_xray(monkeypatch, tmp_path):
+@pytest.mark.parametrize("gateway_networks", [None, ["192.168.70.0/24"]])
+def test_engine_starts_validated_singbox_after_xray(monkeypatch, tmp_path, gateway_networks):
     engine = Engine(lambda _line: None, lambda _running: None,
                     lambda _up, _down: None)
     engine._active = True
@@ -909,10 +912,17 @@ def test_engine_starts_validated_singbox_after_xray(monkeypatch, tmp_path):
     monotonic = iter((0.0, 2.0))
     monkeypatch.setattr("uac_desktop.engine.time.monotonic", lambda: next(monotonic))
 
-    engine.enable_tun()
+    engine.enable_tun(gateway_networks=gateway_networks)
 
     written = json.loads(config_path.read_text(encoding="utf-8"))
     assert written["route"]["final"] == "proxy"
+    dns = written["dns"]["servers"][0]
+    assert dns["server"] == "1.1.1.1" and dns["detour"] == "proxy"
+    if gateway_networks:
+        assert dns["type"] == "tcp" and dns["server_port"] == 53
+    else:
+        assert dns["type"] == "https"
+        assert dns["tls"] == {"enabled": True, "server_name": "cloudflare-dns.com"}
     assert "route_exclude_address" not in written["inbounds"][0]
     assert calls[0][0] == "check"
     assert calls[1] == "job-create"
@@ -959,6 +969,28 @@ def test_tun_process_is_atomically_created_inside_job(tmp_path):
             process.stdout.close()
         if job:
             Engine._close_tun_job(job)
+
+
+@pytest.mark.parametrize("domains, expected", [
+    ("", "https://www.youtube.com/generate_204"),
+    ("YouTube.com", "https://www.gstatic.com/generate_204"),
+    ("youtube.com, gstatic.com, cloudflare.com", None),
+])
+def test_tun_probe_excludes_direct_domains(monkeypatch, domains, expected):
+    engine = Engine(lambda _line: None, lambda _running: None,
+                    lambda _up, _down: None)
+    engine.tun_process = RunningProcess()
+    engine.connection_preferences = ConnectionPreferences(domains_direct=domains)
+    visited = []
+
+    def get(_session, url, **_kwargs):
+        visited.append(url)
+        return SimpleNamespace(status_code=204, text="")
+
+    monkeypatch.setattr(requests.Session, "get", get)
+    ok, _ = engine.probe_tun()
+    assert ok is (expected is not None)
+    assert visited == ([expected] if expected else [])
 
 
 def test_failed_tun_stop_preserves_process_and_owner_for_recovery(monkeypatch):

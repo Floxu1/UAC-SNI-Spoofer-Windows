@@ -7,7 +7,7 @@ from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QSpinBox,
-    QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStylePainter, QTabWidget, QVBoxLayout, QWidget,
+    QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStylePainter, QTabWidget, QToolTip, QVBoxLayout, QWidget,
 )
 
 from .fonts import DASHBOARD_HEADING_QSS, DASHBOARD_LABEL_QSS, DASHBOARD_WEIGHT
@@ -48,6 +48,8 @@ QFrame#globalSettingsSection { background: $surface; border: 1px solid $border; 
 QFrame#globalSettingsDivider { background: $border; }
 QFrame#globalSettingsTile { background: $row; border: 1px solid $border; border-radius: 6px; }
 QFrame#globalSettingsTile:hover { border-color: $hover_border; background: $hover; }
+QPushButton#globalRoutingLink { background: $action; border: 1px solid $border; border-radius: 6px; padding: 0; }
+QPushButton#globalRoutingLink:hover, QPushButton#globalRoutingLink:focus { border-color: $icon; background: $hover; }
 QLabel#globalSettingsHeading { color: $text; font-size: 25px; font-weight: $weight; }
 QLabel#globalSettingsSectionTitle { color: $text; $heading_font }
 QLabel#globalSettingsLabel { color: $text; $label_font }
@@ -83,35 +85,44 @@ def shared_global_settings_style(engine):
     )
 
 class SettingsPage(QWidget):
-    def __init__(self, window, *heading, categories):
+    def __init__(self, window, *heading, categories, compact_name=None):
         super().__init__()
+        compact = bool(compact_name)
         self.window = window
         self.categories = categories
         rail = QWidget()
-        rail.setMaximumWidth(1000)
+        if not compact:
+            rail.setMaximumWidth(1000)
         root = QHBoxLayout(self)
-        root.setContentsMargins(26, 18, 26, 6)
-        root.addStretch(1)
+        root.setContentsMargins(*((14, 8, 14, 10) if compact else (26, 18, 26, 6)))
+        if not compact:
+            root.addStretch(1)
         root.addWidget(rail, 30)
-        root.addStretch(1)
+        if not compact:
+            root.addStretch(1)
         body = QVBoxLayout(rail)
+        self.body = body
         body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(12)
-        header = window._page_header(*heading)
+        body.setSpacing(8 if compact else 12)
+        header = (window._page_header(*heading, compact_name=compact_name) if compact
+                  else window._page_header(*heading))
         header.findChild(QLabel, "pageEyebrow").hide()
-        header.setMinimumHeight(94)
+        if not compact:
+            header.setMinimumHeight(94)
         body.addWidget(header)
         self.tabs = QTabWidget()
         self.tabs.setObjectName("settingsTabs")
         self.tabs.setDocumentMode(True)
-        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setExpanding(compact)
+        if compact:
+            self.tabs.tabBar().setFixedHeight(48)
         body.addWidget(self.tabs, 1)
         self._category_layouts = []
         for title in categories:
             scroll, content = self.window._scroll_page()
             layout = QVBoxLayout(content)
-            layout.setContentsMargins(4, 12, 4, 8)
-            layout.setSpacing(12)
+            layout.setContentsMargins(*((0, 8, 0, 0) if compact else (4, 12, 4, 8)))
+            layout.setSpacing(8 if compact else 12)
             self._category_layouts.append(layout)
             self.tabs.addTab(scroll, window.tr(*title))
 
@@ -134,7 +145,7 @@ class SettingsPage(QWidget):
 
 
 class SettingsCard(QFrame):
-    def __init__(self, window, fa, en, *, icon=None, trailing=None):
+    def __init__(self, window, fa, en, *, icon=None, trailing=None, subtitle=None):
         super().__init__()
         self.setObjectName("settingsCard")
         self.setAttribute(Qt.WA_StyledBackground)
@@ -144,7 +155,7 @@ class SettingsCard(QFrame):
         title = window._bind_text(QLabel(), fa, en)
         title.setObjectName("settingsCardTitle")
         title.setContentsMargins(5, 0, 5, 3)
-        if icon or trailing is not None:
+        if icon or trailing is not None or subtitle:
             from .ui import cyber_pixmap
 
             header = QHBoxLayout()
@@ -155,7 +166,17 @@ class SettingsCard(QFrame):
                 glyph.setPixmap(cyber_pixmap(icon, "#79e9e3", 17))
                 header.addWidget(glyph, 0, Qt.AlignVCenter)
             title.setContentsMargins(0, 0, 0, 0)
-            header.addWidget(title, 1)
+            if subtitle:
+                copy = QVBoxLayout()
+                copy.setSpacing(1)
+                copy.addWidget(title)
+                hint = window._bind_text(QLabel(), *subtitle)
+                hint.setObjectName("settingsRowHelp")
+                hint.setWordWrap(True)
+                copy.addWidget(hint)
+                header.addLayout(copy, 1)
+            else:
+                header.addWidget(title, 1)
             if trailing is not None:
                 header.addWidget(trailing)
             self.body.addLayout(header)
@@ -172,7 +193,8 @@ class SettingsCard(QFrame):
 
 
 class SettingsRow(QFrame):
-    def __init__(self, window, title, help_text, control, *, icon=None, stacked=False):
+    def __init__(self, window, title, help_text, control, *, icon=None, stacked=False,
+                 trailing=False, help_button=None):
         from .ui import cyber_pixmap
 
         super().__init__()
@@ -194,7 +216,16 @@ class SettingsRow(QFrame):
         self.label.setObjectName("settingsRowTitle")
         self.label.setWordWrap(stacked)
         self.label.setBuddy(control)
-        if stacked:
+        if trailing:
+            row.setContentsMargins(2, 5, 2, 5)
+            title_row = QHBoxLayout()
+            title_row.setSpacing(5)
+            title_row.addWidget(self.label)
+            if help_button is not None:
+                title_row.addWidget(help_button)
+            title_row.addStretch(1)
+            copy.addLayout(title_row)
+        elif stacked:
             copy.addWidget(self.label)
         else:
             title_row = QHBoxLayout()
@@ -219,24 +250,28 @@ class SettingsRow(QFrame):
                         or control.sizePolicy().horizontalPolicy() == QSizePolicy.Fixed) else Qt.Alignment()
             copy.addWidget(control, alignment=alignment)
         row.addLayout(copy, 1)
+        if trailing:
+            row.addWidget(control, 0, Qt.AlignVCenter)
 
 
 class SettingsGrid(QWidget):
     """Keep the card order when the settings viewport drops to one column."""
 
-    def __init__(self, cards):
+    def __init__(self, cards, *, spacing=12, two_column_width=790, placements=None):
         super().__init__()
         self.cards = cards
         self.columns = 0
+        self.two_column_width = two_column_width
+        self.placements = placements
         self.grid = QHBoxLayout(self)
         self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setSpacing(12)
+        self.grid.setSpacing(spacing)
         self.stacks = []
         for _ in range(2):
             column = QWidget()
             stack = QVBoxLayout(column)
             stack.setContentsMargins(0, 0, 0, 0)
-            stack.setSpacing(12)
+            stack.setSpacing(spacing)
             stack.addStretch()
             self.grid.addWidget(column, 1)
             self.stacks.append(stack)
@@ -244,7 +279,7 @@ class SettingsGrid(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._reflow(2 if event.size().width() >= 790 else 1)
+        self._reflow(2 if event.size().width() >= self.two_column_width else 1)
 
     def _reflow(self, columns):
         if self.columns == columns:
@@ -255,7 +290,8 @@ class SettingsGrid(QWidget):
                 stack.removeWidget(card)
         self.stacks[1].parentWidget().setVisible(columns == 2)
         for index, card in enumerate(self.cards):
-            stack = self.stacks[index % columns]
+            column = self.placements[index] if self.placements and columns == 2 else index % columns
+            stack = self.stacks[column]
             stack.insertWidget(stack.count() - 1, card)
             card.show()
 
@@ -382,6 +418,8 @@ class _GlobalSettingsTile(QFrame):
         super().__init__()
         self.setObjectName("globalSettingsTile")
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.control = control
+        self._disabled_reason = ""
         row = QHBoxLayout(self)
         row.setContentsMargins(10, 7, 10, 7)
         row.setSpacing(10)
@@ -408,10 +446,27 @@ class _GlobalSettingsTile(QFrame):
         self.refresh_labels()
 
     def refresh_labels(self):
-        control = self.label.buddy()
-        control.setAccessibleName(self.label.text())
-        control.setAccessibleDescription(self.help.text())
-        control.setToolTip(self.help.text())
+        self.control.setAccessibleName(self.label.text())
+        self.control.setAccessibleDescription(self.help.text())
+        self.control.setToolTip(self.help.text())
+
+    def set_availability(self, enabled, note):
+        self._disabled_reason = "" if enabled else note
+        # Let the enabled tile receive clicks over a disabled control.
+        self.control.setAttribute(Qt.WA_TransparentForMouseEvents, not enabled)
+        self.control.setEnabled(enabled)
+        description = " ".join(filter(None, (self.help.text(), note)))
+        self.control.setAccessibleDescription(description)
+        self.control.setToolTip(description)
+        self.setToolTip(self._disabled_reason)
+
+    def mouseReleaseEvent(self, event):
+        if (self._disabled_reason and event.button() == Qt.LeftButton
+                and self.control.geometry().contains(event.position().toPoint())):
+            QToolTip.showText(event.globalPosition().toPoint(), self._disabled_reason, self, self.rect(), 3500)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class SharedGlobalSettings(QWidget):
@@ -482,10 +537,12 @@ class SharedGlobalSettings(QWidget):
         for control in (self.motion, *self.controls.values()):
             if isinstance(control, QCheckBox):
                 control.set_quick_style(palette)
+        self.refresh_capabilities()
 
     def refresh_labels(self):
         for tile in self.findChildren(_GlobalSettingsTile):
             tile.refresh_labels()
+        self.refresh_capabilities()
 
     def _build_appearance(self):
         from .ui import ToggleSwitch
@@ -493,41 +550,57 @@ class SharedGlobalSettings(QWidget):
         section = self._section(("ظاهر برنامه", "Appearance"), ("رابط کاربری و پویانمایی", "Interface and motion"), "monitor")
         self.motion = ToggleSwitch()
         self.motion.toggled.connect(self._motion_changed)
-        section.set_rows((self._row(("کاهش پویانمایی ناوبری", "Reduce navigation motion"),
+        section.set_rows((self._row(("کاهش انیمیشن‌ها", "Reduce animations"),
                                     ("جابه‌جایی صفحه‌ها و موتورها بدون پویانمایی.",
                                      "Skip animations when switching pages or engines."), self.motion),))
 
     def _build_connection(self):
         section = self._section(("اتصال و مسیریابی", "Connection & routing"),
                                 ("مدیریت ارتباطات شبکه", "Network connections"), "route")
-        iran = self._toggle("iran_direct", ("عبور مستقیم مقصدهای ایران", "Iran domestic bypass"),
-                            ("برای هر سه موتور", "Applies to all three engines"))
+        iran = self._toggle("iran_direct", ("عبور مستقیم سایت‌های ایرانی", "Bypass VPN for Iranian sites"),
+                            ("سایت‌های ایرانیِ شناسایی‌شده مستقیم باز شوند.",
+                             "Open recognized Iranian sites directly."))
         startup = self._toggle("auto_connect", ("اتصال خودکار", "Auto-connect"),
-                               ("اتصال PoW هنگام شروع برنامه و بازگشت شبکه",
-                                "Connect PoW at startup and when the network returns"))
-        domains = QLineEdit()
-        domains.setObjectName("settingsInput")
-        domains.setProperty("technical", True)
-        domains.setLayoutDirection(Qt.LeftToRight)
-        domains.setAlignment(Qt.AlignLeft | Qt.AlignAbsolute)
-        domains.setMinimumWidth(160)
-        domains.setMaximumWidth(360)
-        domains.setPlaceholderText("example.com, cdn.example.net")
-        domains.editingFinished.connect(lambda: self._change("domains_direct", domains.text()))
-        self.controls["domains_direct"] = domains
-        bypass = self._row(("دامنه‌های عبور مستقیم", "Domains to bypass"),
-                           ("در موتور Direct، دامنه‌ها را با ویرگول یا فاصله جدا کنید.",
-                            "For Direct. Separate domains with commas or spaces."), domains)
-        section.set_rows((iran, startup), (bypass,))
+                               ("با اجرای برنامه یا بازگشت اینترنت، موتور انتخاب‌شده وصل شود.",
+                                "Connect the selected engine at startup or when Internet returns."))
+        self.routing_link = link = QPushButton()
+        link.setObjectName("globalRoutingLink")
+        link.setCursor(Qt.PointingHandCursor)
+        link.setFixedHeight(58)
+        link.clicked.connect(lambda: self.window.show_page(self.window.DIRECT_ROUTING_PAGE))
+        row = QHBoxLayout(link)
+        row.setContentsMargins(10, 5, 10, 5)
+        row.setSpacing(8)
+        globe = QLabel()
+        globe.setObjectName("globalSettingsPageIcon")
+        globe.setFixedSize(34, 34)
+        globe.setAlignment(Qt.AlignCenter)
+        self._icons.append((globe, "globe", 19))
+        row.addWidget(globe)
+        copy = QVBoxLayout()
+        copy.setSpacing(1)
+        for name, fa, en in (
+                ("globalSettingsLabel", "تنظیمات بیشتر عبور مستقیم", "More direct routing settings"),
+                ("globalSettingsHelp", "مدیریت دامنه‌ها، آی‌پی‌ها و فایل‌های مسیریابی", "Manage domains, IPs and routing files")):
+            label = self.window._bind_text(QLabel(), fa, en)
+            label.setObjectName(name)
+            label.setAttribute(Qt.WA_TransparentForMouseEvents)
+            copy.addWidget(label)
+        row.addLayout(copy, 1)
+        arrow = QLabel("›")
+        arrow.setObjectName("globalSettingsHelp")
+        row.addWidget(arrow)
+        link.setAccessibleName("More direct routing settings")
+        section.set_rows((startup, iran), (link,))
 
     def _build_sharing(self):
         section = self._section(("اشتراک شبکه", "Network sharing"),
                                 ("شبکهٔ محلی و پروکسی", "Local network and proxy"), "network")
-        sharing = self._toggle("lan_share", ("اشتراک در شبکهٔ خصوصی", "Share on private LAN"),
-                               ("تغییرات در نشست فعال PoW اعمال می‌شوند.",
-                                "Changes apply during an active PoW session."))
+        sharing = self._toggle("lan_share", ("اشتراک اتصال", "Share connection"),
+                               ("دستگاه‌های شبکهٔ خصوصی از اتصال PoW استفاده کنند.",
+                                "Let devices on a private network use the PoW connection."))
         protocol = self._choice("lan_share_mode", ("پروتکل اشتراک", "LAN share protocol"),
-                                (("socks5", "SOCKS5", "SOCKS5"), ("ps5", "HTTP / PS5", "HTTP / PS5")))
+                                (("socks5", "SOCKS5", "SOCKS5"), ("ps5", "HTTP CONNECT", "HTTP CONNECT")))
         self.controls["lan_share_mode"].setProperty("technical", True)
         port = QSpinBox()
         port.setObjectName("settingsNumber")
@@ -541,18 +614,23 @@ class SharedGlobalSettings(QWidget):
         section.set_rows((sharing,), (protocol, self._row(("درگاه اشتراک", "LAN share port"), ("", ""), port)))
 
     def _build_security(self):
-        section = self._section(("امنیت", "Security"), ("محافظت و فیلتر ترافیک", "Traffic protection and filters"), "shield")
-        kill = self._toggle("kill_switch", ("قطع اضطراری VPN", "VPN kill switch"),
-                            ("در صورت قطع VPN، ترافیک PoW و Direct مسدود می‌شود.",
-                             "Blocks traffic if the PoW or Direct VPN drops."))
+        section = self._section(("امنیت و حریم خصوصی", "Security & privacy"),
+                                ("فیلترها فقط روی ترافیک TUN اعمال می‌شوند.",
+                                 "Filters apply to traffic captured by TUN."), "shield")
+        kill = self._toggle("kill_switch", ("قطع اضطراری اینترنت", "Internet kill switch"),
+                            ("در قطع ناخواستهٔ VPN در PoW و Direct، دسترسی مستقیم قطع شود.",
+                             "Block direct Internet access if the PoW or Direct VPN drops."))
         ipv6 = self._toggle("ipv6_block", ("جلوگیری از نشت IPv6", "Block IPv6 leaks"),
-                            ("برای VPN موتور PoW", "Applies to PoW VPN"))
-        dns = self._toggle("dns_sinkhole", ("مسدودسازی ردیاب DNS", "Block DNS trackers"),
-                           ("ردیاب‌های شناخته‌شده در VPN موتور PoW", "Known trackers in PoW VPN"))
+                            ("ترافیک IPv6 عبوری از TUN مسدود شود.", "Block IPv6 traffic captured by TUN."))
+        dns = self._toggle("dns_sinkhole", ("مسدودسازی ردیاب‌ها", "Block trackers"),
+                           ("درخواست‌های DNS برای ردیاب‌های شناخته‌شده مسدود شوند.",
+                            "Block DNS requests for known trackers."))
         stun = self._toggle("webrtc_block", ("مسدودسازی STUN", "Block WebRTC STUN"),
-                            ("درخواست‌های STUN در VPN موتور PoW", "STUN requests in PoW VPN"))
+                            ("احتمال افشای آی‌پی واقعی از طریق STUN کاهش یابد.",
+                             "Reduce the risk of exposing your IP through STUN."))
         quic = self._toggle("quic_block", ("مسدودسازی QUIC", "Block QUIC"),
-                            ("فیلتر ترافیک UDP درگاه ۴۴۳ در PoW", "Filter UDP traffic on port 443 in PoW"))
+                            ("ترافیک QUIC شناسایی‌شده و UDP درگاه ۴۴۳ مسدود شود.",
+                             "Block detected QUIC and UDP traffic on port 443."))
         section.set_rows((kill, ipv6), (dns, stun), (quic,))
 
     def _build_tools(self):
@@ -568,7 +646,7 @@ class SharedGlobalSettings(QWidget):
         data = self._action(("پوشهٔ داده‌ها", "Data folder"),
                             ("فایل‌های محلی و گزارش‌های برنامه را ببینید.", "Browse local app files and logs."),
                             ("باز کردن", "Open"), self.window.data_button.click)
-        reset = self._action(("بازنشانی ترجیحات اتصال", "Reset connection preferences"),
+        reset = self._action(("بازنشانی تنظیمات اتصال", "Reset connection settings"),
                              ("زبان و فهرست برنامه‌ها حفظ می‌شوند.", "Keeps your language and app list."),
                              ("بازنشانی", "Reset"), self._reset_connection, destructive=True)
         section.set_rows((export, restore), (data, reset))
@@ -615,6 +693,54 @@ class SharedGlobalSettings(QWidget):
                     control.setValue(value)
                 else:
                     window._pow_set_toggle(control, value)
+        self.refresh_capabilities()
+
+    def refresh_capabilities(self):
+        from .application_settings import LAN_SETTINGS, TUN_FILTERS
+
+        window = self.window
+        mode = window.global_settings.snapshot().connection_mode
+        busy = window._engine_busy()
+        next_connect = window.tr("در اتصال بعدی اعمال می‌شود.", "Applies on the next connection.")
+        tun_only = window._ui_text("برای تغییر این گزینه، حالت TUN را روشن کنید.",
+                                   "Turn on TUN mode to change this setting.")
+        for key, control in self.controls.items():
+            enabled = True
+            note = ""
+            if key in LAN_SETTINGS:
+                enabled = window.engine_mode == "pow"
+                if not enabled:
+                    note = window._ui_text("برای تنظیم اشتراک اتصال، موتور PoW را انتخاب کنید.",
+                                           "Select PoW to configure connection sharing.")
+                elif key == "lan_share" and control.isChecked():
+                    endpoint, error = window.pow_controller.coordinator.lan_share_status
+                    if endpoint:
+                        note = window.tr(f"اشتراک فعال است: {endpoint}", f"Sharing is active: {endpoint}")
+                    elif error:
+                        note = window.tr("اشتراک فعال نشد. لاگ زنده را ببینید.",
+                                         "Sharing failed. See Live Log.")
+                    else:
+                        note = window.tr("اشتراک هنوز فعال نیست.", "Sharing is not active yet.")
+            elif key in TUN_FILTERS or key == "kill_switch":
+                enabled = mode == "vpn"
+                note = (next_connect if busy else "") if enabled else tun_only
+                if key == "kill_switch":
+                    enabled = enabled and window.engine_mode != "xray" and not busy
+                    if window.engine_mode == "xray":
+                        note = window._ui_text("برای قطع اضطراری، PoW یا Direct را در حالت TUN انتخاب کنید.",
+                                               "Use PoW or Direct in TUN mode for the kill switch.")
+                    elif busy and mode == "vpn":
+                        note = window.tr("برای تغییر قطع اضطراری، ابتدا اتصال را قطع کنید.",
+                                         "Disconnect first to change the kill switch.")
+                    elif busy:
+                        note = window._ui_text("ابتدا اتصال را قطع کنید و حالت TUN را روشن کنید.",
+                                               "Disconnect first, then turn on TUN mode.")
+                elif key in ("ipv6_block", "quic_block") and window.engine_mode == "direct" and enabled:
+                    note += " " + window.tr("تنظیمات اختصاصی Direct هم ممکن است این ترافیک را مسدود کنند.",
+                                            "Dedicated Direct settings can also block this traffic.")
+            elif busy and key in ("iran_direct", "domains_direct"):
+                note = next_connect
+            control.parentWidget().set_availability(enabled, note)
 
     def _change(self, key, value):
         self.window._change_global_settings(**{key: value})
@@ -628,6 +754,9 @@ class SharedGlobalSettings(QWidget):
 
     def _exchange(self, restore):
         window = self.window
+        if restore and window._engine_busy():
+            window._reject_guarded_change()
+            return
         picker = QFileDialog.getOpenFileName if restore else QFileDialog.getSaveFileName
         name, _ = picker(self, window.tr("تنظیمات کلی", "Global Settings"),
                          "uac-global-settings.json", "JSON (*.json)")
@@ -637,6 +766,8 @@ class SharedGlobalSettings(QWidget):
             path = Path(name)
             if restore:
                 before = window.global_settings.snapshot()
+                if path.stat().st_size > 1024 * 1024:
+                    raise ValueError("Global Settings backup is larger than 1 MB.")
                 window.global_settings.restore(json.loads(path.read_text(encoding="utf-8-sig")))
                 window.language = window.storage.settings.get("language", "fa")
                 window._apply_language()
@@ -645,11 +776,17 @@ class SharedGlobalSettings(QWidget):
             else:
                 path.write_text(json.dumps(window.global_settings.export(), ensure_ascii=False, indent=2),
                                 encoding="utf-8")
-        except (OSError, ValueError) as error:
+        except ValueError:
+            window.show_toast(window.tr("محتوای فایل پشتیبان معتبر نیست.",
+                                        "The settings backup is invalid."), "danger")
+        except OSError as error:
             window.show_toast(str(error), "danger")
 
     def _reset_connection(self):
         window = self.window
+        if window._engine_busy():
+            window._reject_guarded_change()
+            return
         answer = QMessageBox.question(
             self, window.tr("بازنشانی ترجیحات اتصال", "Reset connection preferences"),
             window.tr("ترجیحات مشترک اتصال و امنیت به پیش‌فرض‌ها بازگردند؟",
