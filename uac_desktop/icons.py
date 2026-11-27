@@ -181,6 +181,13 @@ _ICONS: Final[dict[str, str]] = {
     "x": """<path d="m18 6-12 12M6 6l12 12"/>""",
     "filter": """<path d="M3 5h18l-7 8v6l-4 2v-8L3 5Z"/>""",
     "undo": """<path d="M9 7 4 12l5 5M5 12h8a6 6 0 0 1 6 6v1"/>""",
+    "tor": """
+        <circle cx="12" cy="12" r="9"/>
+        <path d="M12 3a9 9 0 0 1 0 18"/>
+        <path d="M12 6.5a5.5 5.5 0 0 1 0 11"/>
+        <path d="M12 9.5a2.5 2.5 0 0 1 0 5"/>
+        <line x1="12" y1="3" x2="12" y2="21"/>
+    """,
     "sparkles": """<path d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2L12 3ZM19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8L19 14ZM5 13l.8 2.2L8 16l-2.2.8L5 19l-.8-2.2L2 16l2.2-.8L5 13Z"/>""",
 }
 
@@ -226,7 +233,7 @@ def _lucide_icons():
 
 
 def _svg(name: str, colour: QColor, lucide: bool = False) -> bytes:
-    body = (_lucide_icons() if lucide else _ICONS).get(name)
+    body = (_lucide_icons().get(name) if lucide else None) or _ICONS.get(name)
     if body is None:
         body = _ICONS["alert"]
     rgb = escape(colour.name(QColor.NameFormat.HexRgb), quote=True)

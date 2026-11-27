@@ -1,5 +1,44 @@
 from __future__ import annotations
 
+# --- UAC-TOR-RELAUNCH-WAIT-START ---
+def _uac_wait_relaunch_parent() -> None:
+    import ctypes as _ct
+    import os as _os
+    import tempfile as _tf
+    import time as _tm
+    from pathlib import Path as _P
+
+    marker = _P(_tf.gettempdir()) / "uac_spoofer_relaunch.pid"
+    if not marker.is_file():
+        return
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+        pid_s, _, ts_s = raw.partition(":")
+        old_pid = int(pid_s)
+        ts = float(ts_s or 0)
+        if old_pid == _os.getpid():
+            return
+        if abs(_tm.time() - ts) <= 30.0 and _os.name == "nt":
+            handle = _ct.windll.kernel32.OpenProcess(0x00100000, False, old_pid)
+            if handle:
+                try:
+                    _ct.windll.kernel32.WaitForSingleObject(handle, 12000)
+                finally:
+                    _ct.windll.kernel32.CloseHandle(handle)
+                _tm.sleep(0.2)
+    except Exception:
+        pass
+    finally:
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_uac_wait_relaunch_parent()
+# --- UAC-TOR-RELAUNCH-WAIT-END ---
+
+
 import os
 import concurrent.futures
 import ctypes
@@ -97,6 +136,8 @@ from .settings_ui import (
 )
 from .pow_ui import ENGINE_POW, ENGINE_XRAY, PowController
 from .direct_ui import ENGINE_DIRECT, DirectPanel
+from .tor_ui import ENGINE_TOR, TorPanel
+from . import tor_theme as _tor_theme
 from .icons import icon as _raw_cyber_icon, pixmap as _raw_cyber_pixmap
 from . import theme as _theme
 from . import fonts as _fonts
@@ -110,8 +151,8 @@ def QColor(*args):
     switch with the engine without per-widget code. A factory (not a
     subclass) so Qt overload resolution stays exact."""
     color = _BaseQColor(*args)
-    if (_theme.is_pow() or _theme.is_direct()) and color.isValid():
-        mapper = _theme.direct_rgba if _theme.is_direct() else _theme.map_rgba
+    if (_theme.is_pow() or _theme.is_direct() or _theme.is_tor()) and color.isValid():
+        mapper = _theme.tor_rgba if _theme.is_tor() else (_theme.direct_rgba if _theme.is_direct() else _theme.map_rgba)
         r, g, b = mapper(color.red(), color.green(), color.blue(), color.alpha())
         color.setRgb(r, g, b, color.alpha())
     return color
@@ -214,6 +255,8 @@ def _cube_pixmap(size: int = 46) -> QPixmap:
 def _engine_mark(engine, size, accent):
     if engine == ENGINE_POW:
         return _cube_pixmap(size)
+    if engine == ENGINE_TOR:
+        return _raw_cyber_pixmap("tor", accent, size, lucide=False)
     return _raw_cyber_pixmap("zap" if engine == ENGINE_DIRECT else "shield", accent, size, lucide=True)
 
 
@@ -228,6 +271,9 @@ def _accent_state_word(text: str) -> str:
         connected = plain == "VPN is ON" or "متصل" in plain
         accent = _direct_theme.HERO_CONNECTED_WORD if connected else _direct_theme.CONNECTION_ACCENTS["disconnected"]
         words = ("ON", "متصل") if connected else ("OFF", "خاموش")
+    elif _theme.is_tor():
+        accent = _theme.TOR_PALETTE["accent"]
+        words = ("OFF", "ON", "خاموش", "روشن", "متصل")
     else:
         return plain
     for word in words:
@@ -2276,7 +2322,7 @@ def resolve_startup_engine(settings) -> tuple:
         settings[ENGINE_DEFAULT_MARKER] = True
         return ENGINE_POW, True
     mode = str(settings.get("engine_mode", ENGINE_POW) or ENGINE_POW)
-    return (mode if mode in (ENGINE_XRAY, ENGINE_POW, ENGINE_DIRECT) else ENGINE_POW), False
+    return (mode if mode in (ENGINE_XRAY, ENGINE_POW, ENGINE_DIRECT, ENGINE_TOR) else ENGINE_POW), False
 
 
 class XraySettingsPage(SettingsPage):
@@ -2927,7 +2973,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
     DIRECT_SETTINGS_PAGE = 11
     XRAY_SETTINGS_PAGE = 12
     DIRECT_DNS_PAGE = 13
-    DIRECT_ROUTING_PAGE = 14
+    TOR_SETTINGS_PAGE = 14
+    DIRECT_ROUTING_PAGE = 15
 
     def __init__(self):
         super().__init__(); self.setWindowTitle("UAC Spoofer Desktop"); self.resize(1440, 900); self.setMinimumSize(*_layout.MIN_WINDOW_SIZE)
@@ -3029,7 +3076,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         # exists, so start-up pays for one cheap install and a later engine
         # switch never has to replace the application stylesheet.
         self.global_settings = ApplicationSettings(self.storage)
-        self.setProperty(_eswitch.ENGINE_PROPERTY, ENGINE_POW if self.engine_mode == ENGINE_DIRECT else self.engine_mode)
+        self.setProperty(_eswitch.ENGINE_PROPERTY, ENGINE_POW if self.engine_mode in (ENGINE_DIRECT, ENGINE_TOR) else self.engine_mode)
         try:
             _startup_app = QApplication.instance()
             if _startup_app is not None and is_app_style(_startup_app.styleSheet()):
@@ -3038,6 +3085,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             pass
         self.pow_controller = PowController(self)
         self.direct_controller = DirectPanel(self)
+        self.tor_controller = TorPanel(self)
         self.global_settings.migrate(self.engine_mode, self.pow_controller.store, self.direct_controller.store)
         self._xray_session_mode = None
         gateway = getattr(self.engine, "gateway", None)
@@ -3117,6 +3165,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             "PoW Settings": ("zap", "موتور PoW", "POW ENGINE"),
             "Xray Settings": ("sliders", "تنظیم مسیر", "XRAY / SETTINGS"),
             "Direct Settings": ("route", "موتور Direct", "DIRECT ENGINE"),
+            "Tor Settings": ("tor", "موتور Tor", "TOR ENGINE"),
             "DNS Lab": ("flask", "", ""),
             "Direct site routing": ("globe", "", ""),
         }
@@ -3193,7 +3242,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         switch.setFixedHeight(_layout.ENGINE_SWITCH_HEIGHT)
         from PySide6.QtWidgets import QButtonGroup
         self.engine_group = QButtonGroup(self); self.engine_group.setExclusive(True); self.engine_buttons = {}
-        modes = ((ENGINE_XRAY, "Xray"), (ENGINE_POW, "UAC\u00a0PoW"), (ENGINE_DIRECT, "UAC\u00a0Direct"))
+        modes = ((ENGINE_XRAY, "Xray"), (ENGINE_POW, "PoW"), (ENGINE_DIRECT, "Direct"), (ENGINE_TOR, "Tor"))
         for (engine_key, engine_label), stretch in zip(modes, _layout.ENGINE_SWITCH_STRETCH):
             option = QPushButton(engine_label); option.setObjectName("engineOption"); option.setCheckable(True); option.setCursor(Qt.PointingHandCursor); option.setProperty("engine", engine_key)
             option.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
@@ -3227,6 +3276,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             ("direct-settings", "تنظیمات Direct", "Direct Settings"),
             ("xray-settings", "تنظیمات Xray", "Xray Settings"),
             ("direct-dns", "آزمایشگاه DNS", "DNS Lab"),
+            ("tor-settings", "تنظیمات Tor", "Tor Settings"),
         )
         for index, (icon_name, name, english) in enumerate(entries):
             button = navigation_button(icon_name, name, english)
@@ -3235,7 +3285,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.xray_settings_button = self.nav[self.XRAY_SETTINGS_PAGE]
         ordered_nav = (*self.nav[:7], self.nav[self.GLOBAL_SETTINGS_PAGE],
                        self.nav[self.POW_SETTINGS_PAGE], self.nav[self.DIRECT_SETTINGS_PAGE],
-                       self.nav[self.DIRECT_DNS_PAGE], self.xray_settings_button, self.nav[8])
+                       self.nav[self.DIRECT_DNS_PAGE], self.nav[self.TOR_SETTINGS_PAGE],
+                       self.xray_settings_button, self.nav[8])
         for button in ordered_nav:
             side.addWidget(button)
         for first, second in zip(ordered_nav, ordered_nav[1:]):
@@ -3276,12 +3327,13 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.direct_routing_view = SharedDirectRoutingView(self)
         pages.extend((self.global_settings_page, self.pow_controller.build_settings_page(),
                       self.direct_controller.build_settings_page(), self.xray_settings_page,
-                      self.dns_lab_page, self.direct_routing_view))
+                      self.dns_lab_page, self.tor_controller.build_settings_page(),
+                      self.direct_routing_view))
         for page, object_name in zip(pages, (
                 "homePage", "configsPage", "sniMakerPage", "sniLabPage",
                 "liveLogsPage", "appBypassPage", "toolsPage", "powPage", "supportPage",
                 "globalSettingsPage", "powSettingsPage", "directSettingsPage", "xraySettingsPage",
-                "directDnsPage", "directRoutingPage")):
+                "directDnsPage", "torSettingsPage", "directRoutingPage")):
             page.setObjectName(object_name)
             self.stack.addWidget(page)
         self.stack.currentChanged.connect(self._place_activity_bar)
@@ -3325,8 +3377,15 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.connection_hint = QLabel("آماده اتصال"); self.connection_hint.setObjectName("heroHint"); self.connection_hint.setWordWrap(True); self.connection_hint.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred); hero_copy.addWidget(self.connection_hint)
         hero_copy.addStretch()
         self.connect_button = GlowButton("اتصال"); self.connect_button.setObjectName("connectButton"); self.connect_button.setProperty("i18nFa", "اتصال"); self.connect_button.setProperty("i18nEn", "Connect"); self.connect_button.setProperty("state", "idle"); self.connect_button.setIcon(cyber_icon("play", "#031422", 21)); self.connect_button.setIconSize(QSize(21, 21)); self.connect_button.setMinimumSize(216, 60); self.connect_button.setMaximumWidth(260); self.connect_button.setCursor(Qt.PointingHandCursor)
+        self.tor_newnym_button = self._action_button("هویت جدید", "New Identity", "refresh", "secondaryAction")
+        self.tor_newnym_button.setFixedHeight(_layout.CONNECT_HEIGHT)
+        self.tor_newnym_button.setToolTip(self.tr("تغییر فوری مدار و IP خروجی Tor", "Rotate Tor circuit & exit IP"))
+        self.tor_newnym_button.clicked.connect(lambda: self.tor_controller.new_identity())
+        self.tor_newnym_button.hide()
         actions = QHBoxLayout()
+        actions.setSpacing(10)
         actions.addWidget(self.connect_button)
+        actions.addWidget(self.tor_newnym_button)
         actions.addStretch(1)
         hero_copy.addLayout(actions)
         hero_layout.addLayout(hero_copy, 3)
@@ -3454,12 +3513,12 @@ class MainWindow(LogsPageMixin, QMainWindow):
         heading.addWidget(stamp)
         self._quick_tiles = []
         for option, toggle, names, color in (
-            (self.auto_option, self.auto_mode, {ENGINE_XRAY: "zap", ENGINE_POW: "shield", ENGINE_DIRECT: "globe"}, "icon"),
+            (self.auto_option, self.auto_mode, {ENGINE_XRAY: "zap", ENGINE_POW: "shield", ENGINE_DIRECT: "globe", ENGINE_TOR: "sparkles"}, "icon"),
             (self.manual_option, self.pick_best, {ENGINE_XRAY: "trending-up"}, "muted_icon"),
             (self.proxy_option, self.proxy_mode, dict.fromkeys(_quick_controls.PALETTES, "layout-grid"), "icon"),
-            (self.tun_option, self.tun_mode, {ENGINE_XRAY: "shield", ENGINE_POW: "square-arrow-right", ENGINE_DIRECT: "shield"}, "muted_icon"),
-            (self.gateway_option, self.gateway_mode, {ENGINE_POW: "layout-grid"}, "muted_icon"),
-            (self.carrier_control, None, {ENGINE_XRAY: "signal", ENGINE_POW: "brick-wall"}, "icon"),
+            (self.tun_option, self.tun_mode, {ENGINE_XRAY: "shield", ENGINE_POW: "square-arrow-right", ENGINE_DIRECT: "shield", ENGINE_TOR: "shield"}, "muted_icon"),
+            (self.gateway_option, self.gateway_mode, {ENGINE_POW: "layout-grid", ENGINE_TOR: "globe"}, "muted_icon"),
+            (self.carrier_control, None, {ENGINE_XRAY: "signal", ENGINE_POW: "brick-wall", ENGINE_TOR: "route"}, "icon"),
         ):
             icon = QLabel(option)
             icon.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -3541,20 +3600,23 @@ class MainWindow(LogsPageMixin, QMainWindow):
         palette = _quick_controls.PALETTES[mode]
         while grid.count():
             grid.takeAt(0)
+        single_row = mode in (ENGINE_DIRECT, ENGINE_TOR)
         if direct:
             rows = ((self.auto_option, self.proxy_option, self.tun_option, self.tune_button),)
+        elif mode == ENGINE_TOR:
+            rows = ((self.proxy_option, self.tun_option, self.carrier_control, self.tune_button),)
         elif mode == ENGINE_POW:
             rows = ((self.auto_option, self.gateway_option, self.carrier_control),
                     (self.proxy_option, self.tun_option, self.tune_button))
         else:
             rows = ((self.auto_option, self.manual_option, self.gateway_option),
                     (self.proxy_option, self.tun_option, self.carrier_control, self.tune_button))
-        margins = _layout.DIRECT_QUICK_MARGINS if direct else _layout.QUICK_GRID_MARGINS
-        tile_height = _layout.DIRECT_QUICK_TILE_HEIGHT if direct else _layout.QUICK_TILE_HEIGHT
+        margins = _layout.DIRECT_QUICK_MARGINS if single_row else _layout.QUICK_GRID_MARGINS
+        tile_height = _layout.DIRECT_QUICK_TILE_HEIGHT if single_row else _layout.QUICK_TILE_HEIGHT
         grid.equal_columns = len(rows[-1])
         grid.setContentsMargins(*margins)
-        grid.setHorizontalSpacing(9 if direct else _layout.QUICK_GRID_GAP)
-        grid.setVerticalSpacing(7 if direct else _layout.QUICK_GRID_GAP)
+        grid.setHorizontalSpacing(9 if single_row else _layout.QUICK_GRID_GAP)
+        grid.setVerticalSpacing(7 if single_row else _layout.QUICK_GRID_GAP)
         grid.setAlignment(Qt.AlignVCenter)
         for column in range(4):
             grid.setColumnStretch(column, int(column < grid.equal_columns))
@@ -3573,7 +3635,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             if name:
                 icon.setPixmap(_raw_cyber_pixmap(name, palette[color], 16, lucide=True))
         self.carrier_layout.setStretch(self.carrier_layout.indexOf(self.carrier_label), 1)
-        self.carrier.setFixedSize(*_layout.QUICK_DROPDOWN_SIZE)
+        self.carrier.setFixedSize(*(106, 33) if mode == ENGINE_TOR else _layout.QUICK_DROPDOWN_SIZE)
         self.carrier.arrow_color = palette["icon"] if mode == ENGINE_XRAY else None
         self.tune_button.setFixedHeight(tile_height)
         self.tune_button.quick_palette = palette
@@ -4637,6 +4699,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             ENGINE_XRAY: ("Spoofer", "XRAY ENGINE"),
             ENGINE_POW: ("PoW", "PoW ENGINE"),
             ENGINE_DIRECT: ("Direct", "DIRECT ENGINE"),
+            ENGINE_TOR: ("Tor", "TOR ENGINE"),
         }[mode]
         brand.setText(f"UAC <span style='color:{accent}'>{name}</span>")
         self.engine_badge.setText(f"<span style='color:{accent}'>\u25cf</span>&nbsp;&nbsp;{badge}")
@@ -4654,6 +4717,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             ENGINE_XRAY: self.tr("موتور Xray: کانفیگ‌های VLESS/Trojan با اسپوف SNI", "Xray engine: VLESS/Trojan configs with SNI spoofing"),
             ENGINE_POW: self.tr("موتور UAC PoW: سایفون روی WARP", "UAC PoW engine: Psiphon over WARP"),
             ENGINE_DIRECT: self.tr("وایرگارد روی HTTP/2 یا TLS مستقیم", "WireGuard over HTTP/2 or direct TLS"),
+            ENGINE_TOR: self.tr("موتور UAC Tor: شبکه تور با WebTunnel، Snowflake، obfs4 و دریافت خودکار پل (OOB)", "UAC Tor engine: Tor with WebTunnel, Snowflake, obfs4 and OOB bridge fetching"),
         }
         for key, button in buttons.items():
             button.blockSignals(True)
@@ -4729,16 +4793,34 @@ class MainWindow(LogsPageMixin, QMainWindow):
         mode = getattr(self, "engine_mode", ENGINE_XRAY)
         pow_on = mode == ENGINE_POW
         direct_on = mode == ENGINE_DIRECT
+        tor_on = mode == ENGINE_TOR
         subtitle = self.home_header.findChild(QLabel, "pageSubtitle")
         self.orb.set_direct_appearance(direct_on)
         self.hero_card.set_atmosphere(mode)
-        self.orb_caption.setText("DIRECT CORE" if direct_on else "NETWORK CORE")
+        self.orb_caption.setText("DIRECT CORE" if direct_on else "TOR CORE" if tor_on else "NETWORK CORE")
         self.pow_country_button.refresh_chevron(direct_on)
         self.network_metrics.set_engine(mode)
         self._refresh_app_routing_notice()
-        self.gateway_option.setVisible(not direct_on)
+        self.auto_option.setVisible(not tor_on)
+        self.gateway_option.setVisible(mode in (ENGINE_XRAY, ENGINE_POW))
         self.carrier_control.setVisible(not direct_on)
         self.manual_option.setVisible(mode == ENGINE_XRAY)
+        if hasattr(self, "tor_newnym_button"):
+            self.tor_newnym_button.setVisible(tor_on and self.tor_controller.coordinator.status.phase == "connected")
+        if tor_on:
+            self._set_bilingual(subtitle, "شبکه ناشناس Tor با WebTunnel، Snowflake و obfs4", "Tor anonymity network with WebTunnel, Snowflake, and obfs4")
+            self._set_bilingual(self.hero_badge, "موتور ناشناس TOR", "TOR ANONYMITY ENGINE")
+            self._set_bilingual(self.carrier_label, "ترابری", "Transport")
+            self._set_bilingual(self.tune_button, "تنظیمات Tor", "Tor Settings")
+            self.gateway_devices_badge.setVisible(False)
+            self.route_source_tabs.hide()
+            self.country_count.hide()
+            self.country_combo.hide()
+            self.original_configs_label.hide()
+            self.pow_country_button.show()
+            self._relayout_control_bar()
+            self.tor_controller.refresh()
+            return
         if direct_on:
             self._set_bilingual(subtitle, "مدیریت هوشمند ارتباطات شبکه", "Intelligent network management")
             self._set_bilingual(self.hero_badge, "موتور ارتباط مستقیم", "Direct connection engine")
@@ -4813,6 +4895,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.auto_mode.setChecked(settings.exit_mode == "chain")
             self.pick_best.setChecked(bool(settings.optimized_mode))
             self.gateway_mode.setChecked(bool(controller.h2_fragment_display()[0]))
+            if [self.carrier.itemText(i) for i in range(self.carrier.count())] != ["auto", "mci", "irancell"]:
+                self.carrier.clear()
+                self.carrier.addItems(["auto", "mci", "irancell"])
             firewall = settings.firewall_profile if settings.firewall_profile in ("auto", "mci", "irancell") else "auto"
             self.carrier.setCurrentText(firewall)
             automatic = not (settings.exit_country_code or "").strip()
@@ -4926,6 +5011,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
             self.direct_controller.open_country_picker()
             return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self.tor_controller.open_country_picker()
+            return
         from .pow_ui import PowCountryPicker
         controller = getattr(self, "pow_controller", None)
         if controller is None:
@@ -4959,6 +5047,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.proxy_mode.setChecked(bool(self._proxy_mode_enabled()))
             self.tun_mode.setChecked(bool(self._tun_mode_enabled()))
             self.gateway_mode.setChecked(False)
+            # restore Xray carrier dropdown items
+            if [self.carrier.itemText(i) for i in range(self.carrier.count())] != ["auto", "mci", "irancell"]:
+                self.carrier.clear()
+                self.carrier.addItems(["auto", "mci", "irancell"])
             self.carrier.setCurrentText(self.storage.tuning.carrier_mode)
             route_source = str(self.storage.settings.get("route_source", "suggested") or "suggested").lower()
             self.route_source_tabs.setCurrentIndex(1 if route_source == "user-config" else 0)
@@ -4990,7 +5082,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _nav_icon(name):
         if name == "direct-dns":
             return "database"
-        return "settings" if name in ("xray-settings", "pow-settings", "direct-settings") else name
+        return "settings" if name in ("xray-settings", "pow-settings", "direct-settings", "tor-settings") else name
 
     def _nav_visible(self, icon: str) -> bool:
         engine = getattr(self, "engine_mode", ENGINE_XRAY)
@@ -5002,6 +5094,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             return engine == ENGINE_POW
         if icon in ("direct-settings", "direct-dns"):
             return engine == ENGINE_DIRECT
+        if icon == "tor-settings":
+            return engine == ENGINE_TOR
         return engine == ENGINE_XRAY
 
     def _sync_engine_nav(self):
@@ -5228,9 +5322,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
             busy_pow = False
         engine = getattr(self, "engine", None)
         direct = getattr(self, "direct_controller", None)
+        tor = getattr(self, "tor_controller", None)
         worker = getattr(self, "_connect_thread", None)
-        return bool(busy_pow or (direct is not None and direct.busy) or getattr(engine, "running", False)
-                    or getattr(self, "connecting", False) or (worker is not None and worker.is_alive()))
+        return bool(busy_pow or (direct is not None and direct.busy) or (tor is not None and tor.busy)
+                    or getattr(engine, "running", False) or getattr(self, "connecting", False)
+                    or (worker is not None and worker.is_alive()))
 
     def _confirm_engine_switch(self):
         """True = disconnect and switch. Tests may inject _switch_guard_fn."""
@@ -5286,8 +5382,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.bridge.log.emit("ENGINE SWITCH: disconnecting before switch")
         self._set_connection_visual("disconnecting")
         direct = getattr(self, "direct_controller", None)
+        tor = getattr(self, "tor_controller", None)
         controller = getattr(self, "pow_controller", None)
         stopping_direct = direct is not None and direct.busy
+        stopping_tor = tor is not None and tor.busy
         stopping_pow = controller is not None and controller.busy
 
         def fail(reason):
@@ -5303,6 +5401,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         try:
             if stopping_direct and direct.stop() is False:
                 return fail("Direct could not stop")
+            if stopping_tor and tor.stop() is False:
+                return fail("Tor could not stop")
             if stopping_pow and controller.disconnect() is False:
                 return fail("PoW could not stop")
             if self.engine.running or self.connecting:
@@ -5320,6 +5420,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
                     QTimer.singleShot(200, poll)
                 return
             if ((stopping_direct and direct.coordinator.status.disconnect_failed)
+                    or (stopping_tor and tor.coordinator.status.disconnect_failed)
                     or (stopping_pow and controller.disconnect_failed)):
                 fail("connection cleanup failed")
                 return
@@ -5405,6 +5506,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self._reset_connection_ui()
         if self.engine_mode == ENGINE_DIRECT:
             self.direct_controller.refresh()
+        elif self.engine_mode == ENGINE_TOR:
+            self.tor_controller.refresh()
         self._sync_wizard_restart_button()
         if (getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_XRAY
                 and QApplication.platformName() != "offscreen"):
@@ -5453,6 +5556,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.direct_controller.refresh()
         elif index == self.DIRECT_DNS_PAGE:
             self.dns_lab_page.refresh()
+        elif index == self.TOR_SETTINGS_PAGE:
+            self.tor_controller.refresh()
         elif index == self.DIRECT_ROUTING_PAGE and previous_index != index:
             self.direct_routing_view.open()
         self._sync_nav_selection(index)
@@ -5518,7 +5623,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         self.show_toast(str(message), "danger")
 
     def _ip_checked(self, value):
-        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+        if getattr(self, "engine_mode", ENGINE_XRAY) in (ENGINE_DIRECT, ENGINE_TOR):
             return
         self.ip_button.setEnabled(True)
         if not str(value).startswith("{"):
@@ -5577,7 +5682,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
 
     def _refresh_ip_card(self, force=False):
         """Direct IP when disconnected, Xray exit IP when connected (PoW owns its own)."""
-        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+        if getattr(self, "engine_mode", ENGINE_XRAY) in (ENGINE_DIRECT, ENGINE_TOR):
             return
         mode = self._ip_mode()
         controller = getattr(self, "pow_controller", None)
@@ -5653,6 +5758,14 @@ class MainWindow(LogsPageMixin, QMainWindow):
                 result = trace(route.probe_port or route.socks_port)
                 return {"ip": result.get("ip"), "country": result.get("loc"), "source": "UAC Direct"}
             label = "UAC Direct"
+        elif engine == ENGINE_TOR:
+            coordinator = self.tor_controller.coordinator
+            status = coordinator.status
+            if status.phase != "connected" or not status.http_port:
+                return
+            tor_port = status.http_port
+            loader = lambda p=tor_port: fetch_details(p)
+            label = "UAC Tor"
         elif mode == "xray":
             port = getattr(self.engine, "probe_http_port", getattr(self.engine, "http_port", None))
             from .ip_info import cache_get as _cg, cache_put as _cp
@@ -6122,6 +6235,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self._pow_sync_home_visuals()
         elif self.engine_mode == ENGINE_DIRECT:
             self.direct_controller.refresh()
+        elif self.engine_mode == ENGINE_TOR:
+            self.tor_controller.refresh()
 
     def _refresh_app_routing_notice(self):
         if hasattr(self, "app_routing_view") and self.app_routing_view.isVisible():
@@ -6209,9 +6324,26 @@ class MainWindow(LogsPageMixin, QMainWindow):
                                "Direct is reconnecting to change its output.", "running", True)
             self.direct_controller.restart_if_active()
 
+    def _set_tor_output(self, mode):
+        if mode == "vpn" and not self.tor_controller.ensure_admin_for_tun():
+            self.tor_controller.refresh()
+            return
+        if not self._change_global_settings(connection_mode=mode):
+            self.tor_controller.refresh()
+            return
+        if mode == "local":
+            self.tor_controller.stop()
+            self.tor_controller.refresh()
+        elif (self.tor_controller.busy
+              and self.tor_controller.coordinator.session_vpn != (mode == "vpn")):
+            self._set_activity("اتصال Tor برای تغییر نوع خروجی دوباره برقرار می‌شود.",
+                               "Tor is reconnecting to change its output.", "running", True)
+            self.tor_controller.restart_if_active()
+
     def _set_windows_proxy_preference(self, enabled):
-        direct = self.engine_mode == ENGINE_DIRECT
-        controller = self.direct_controller if direct else self.pow_controller
+        mode = self.engine_mode
+        controller = (self.direct_controller if mode == ENGINE_DIRECT
+                      else self.tor_controller if mode == ENGINE_TOR else self.pow_controller)
         preferences = self.global_settings.snapshot()
         try:
             if preferences.connection_mode == "vpn":
@@ -6224,13 +6356,13 @@ class MainWindow(LogsPageMixin, QMainWindow):
             self.show_toast(self.tr("تغییر پروکسی ویندوز اعمال نشد.", "Could not change Windows Proxy."), "warning")
             self.bridge.engine_log.emit(f"Windows Proxy: {exc}", self.engine_mode)
         finally:
-            if direct:
+            if mode in (ENGINE_DIRECT, ENGINE_TOR):
                 controller.refresh_output_controls()
             else:
                 self._pow_sync_home_visuals()
 
     def _proxy_mode_changed(self, enabled):
-        if getattr(self, "engine_mode", ENGINE_XRAY) in (ENGINE_DIRECT, ENGINE_POW):
+        if getattr(self, "engine_mode", ENGINE_XRAY) in (ENGINE_DIRECT, ENGINE_POW, ENGINE_TOR):
             if not getattr(self, "_pow_home_loading", False):
                 self._set_windows_proxy_preference(bool(enabled))
             return
@@ -6639,6 +6771,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def _tun_mode_changed(self, enabled):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
             self._set_direct_output("vpn" if enabled else "local")
+            return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self._set_tor_output("vpn" if enabled else "local")
             return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if getattr(self, "_pow_home_loading", False):
@@ -7113,7 +7248,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
             set_position(1.0 if checked else 0.0)
 
     def _sync_gateway_controls(self):
-        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+        if getattr(self, "engine_mode", ENGINE_XRAY) in (ENGINE_DIRECT, ENGINE_TOR):
             return
         requested = bool(getattr(self, "_gateway_requested", False))
         active = self._gateway_runtime_active()
@@ -7293,6 +7428,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         return requested or active or pending_enable
 
     def _gateway_mode_changed(self, enabled):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self.tor_controller.save("strict_nodes", bool(enabled))
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if not getattr(self, "_pow_home_loading", False):
                 # On = force; off = auto (adaptive may turn it on again).
@@ -7597,6 +7735,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
             self.direct_controller.refresh_country()
             return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self.tor_controller.refresh_country()
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW and hasattr(self, "pow_country_button"):
             self._update_pow_country_selector()
             return
@@ -7842,7 +7983,7 @@ class MainWindow(LogsPageMixin, QMainWindow):
         return selected
 
     def _sync_auto_mode_ui(self, select_profile=False):
-        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
+        if getattr(self, "engine_mode", ENGINE_XRAY) in (ENGINE_DIRECT, ENGINE_TOR):
             return
         enabled = self.auto_mode.isChecked()
         self.country_combo.setEnabled(enabled)
@@ -7885,6 +8026,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
             self.direct_controller.save("auto_select_dns", bool(enabled))
             return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self.tor_controller.save("auto_fetch_bridges", bool(enabled))
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if not getattr(self, "_pow_home_loading", False):
                 self._pow_setting(exit_mode="chain" if enabled else "warp")
@@ -7903,6 +8047,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
         )
 
     def _carrier_changed(self, carrier):
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            val = str(carrier or "auto").strip().lower()
+            if val in ("auto", "webtunnel", "snowflake", "obfs4", "custom", "direct"):
+                self.tor_controller.save("transport", val)
+            return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             if not getattr(self, "_pow_home_loading", False):
                 value = str(carrier or "auto").strip().lower()
@@ -10422,6 +10571,11 @@ class MainWindow(LogsPageMixin, QMainWindow):
             if direct.busy or not self._engine_busy():
                 direct.toggle()
             return
+        tor = getattr(self, "tor_controller", None)
+        if tor is not None and (tor.busy or self.engine_mode == ENGINE_TOR):
+            if tor.busy or not self._engine_busy():
+                tor.toggle()
+            return
         try:
             pow_controller = getattr(self, "pow_controller", None)
             pow_busy = bool(pow_controller is not None and pow_controller.busy)
@@ -11147,7 +11301,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
             if state == "connected" and not direct:
                 QTimer.singleShot(0, self._queue_target_latency_probe)
                 QTimer.singleShot(0, self._poll_traffic)
-        if not direct and state in ("connected", "disconnected"):
+        if hasattr(self, "tor_newnym_button"):
+            self.tor_newnym_button.setVisible(self.engine_mode == ENGINE_TOR and state == "connected")
+        if not direct and self.engine_mode != ENGINE_TOR and state in ("connected", "disconnected"):
             self._schedule_ip_refresh(1500 if state == "connected" else 900)
         self.status.setObjectName("heroStatusOn" if state == "connected" else "heroStatusError" if state == "error" else "heroStatus")
         self.status.setText(_accent_state_word(self.status.text()))
@@ -11588,6 +11744,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def open_tuning(self):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
             self.direct_controller.open_settings()
+            return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self.tor_controller.open_settings()
             return
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW:
             self.pow_controller._open_settings()
@@ -12432,6 +12591,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
             return False
         if engine == ENGINE_DIRECT:
             active_vpn = self.direct_controller.coordinator.session_vpn
+        elif engine == ENGINE_TOR:
+            active_vpn = self.tor_controller.coordinator.session_vpn
         elif engine == ENGINE_POW:
             active_proxy = self.pow_controller.coordinator.session_proxy_mode
             active_vpn = None if active_proxy is None else not active_proxy
@@ -12458,6 +12619,8 @@ class MainWindow(LogsPageMixin, QMainWindow):
         if self._routing_selection_reconnects(self.global_settings.snapshot()):
             if self.engine_mode == ENGINE_DIRECT:
                 self.direct_controller.restart_if_active()
+            elif self.engine_mode == ENGINE_TOR:
+                self.tor_controller.restart_if_active()
             else:
                 self._bypass_apply_timer.start()
 
@@ -12513,6 +12676,9 @@ class MainWindow(LogsPageMixin, QMainWindow):
     def check_ip(self, proxy=None):
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_DIRECT:
             self.direct_controller.coordinator.request_exit_refresh()
+            return
+        if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_TOR:
+            self.tor_controller.coordinator.request_exit_refresh()
             return
         controller = getattr(self, "pow_controller", None)
         if getattr(self, "engine_mode", ENGINE_XRAY) == ENGINE_POW and controller is not None and controller.coordinator.running:
@@ -12584,6 +12750,10 @@ class MainWindow(LogsPageMixin, QMainWindow):
             direct = getattr(self, "direct_controller", None)
             if direct is not None:
                 if direct.shutdown() is False:
+                    self._update_shutdown_ok = False
+            tor = getattr(self, "tor_controller", None)
+            if tor is not None:
+                if tor.shutdown() is False:
                     self._update_shutdown_ok = False
             controller = getattr(self, "pow_controller", None)
             if controller is not None:
@@ -13273,6 +13443,12 @@ def combined_app_style(language: str) -> str:
                 _theme.map_css(STYLE, direct=True) + _direct_theme.STYLE
                 + _quick_controls.style(ENGINE_DIRECT) + shared_global_settings_style(ENGINE_DIRECT)
                 + _eswitch.brand_style(ENGINE_DIRECT) + app_routing_style(ENGINE_DIRECT),
+                language,
+            ),
+            ENGINE_TOR: _fonts.localize_style(
+                _theme.map_css(STYLE, tor=True) + _tor_theme.STYLE
+                + _quick_controls.style(ENGINE_TOR) + shared_global_settings_style(ENGINE_TOR)
+                + _eswitch.brand_style(ENGINE_TOR) + app_routing_style(ENGINE_TOR),
                 language,
             ),
         })

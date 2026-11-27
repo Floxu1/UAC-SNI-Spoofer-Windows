@@ -152,7 +152,7 @@ else:
             root = Path(bin_dir or BIN).resolve()
         except Exception:
             root = Path(bin_dir).resolve() if bin_dir else None
-        images = ("uac-psiphon.exe", "uac_psiphon.exe", "aether.exe")
+        images = ("uac-psiphon.exe", "uac_psiphon.exe", "aether.exe", "tor.exe", "lyrebird.exe", "snowflake-client.exe")
         for image in images:
             try:
                 listed = subprocess.run(
@@ -191,7 +191,7 @@ else:
                     exe_path = exe[0].strip() if exe else ""
                     if not exe_path:
                         continue
-                    if Path(exe_path).resolve().parent == root:
+                    if Path(exe_path).resolve().parent in (root, root / "tor"):
                         kill_process_tree(pid)
                 except Exception:
                     continue
