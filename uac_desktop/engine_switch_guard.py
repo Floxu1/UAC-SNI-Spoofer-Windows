@@ -12,7 +12,7 @@ from .icons import icon, pixmap
 from .theme import APP_ROUTING_PALETTES, ENGINE_BRAND_PALETTES, IP_DETAILS_PALETTES
 
 
-_NAMES = {"xray": "Xray", "pow": "UAC PoW", "direct": "UAC Direct"}
+_NAMES = {"xray": "Xray", "pow": "UAC PoW", "direct": "UAC Direct", "tor": "UAC Tor"}
 _STATES = {
     "connected": ("اتصال فعال", "Connected"),
     "connecting": ("در حال اتصال", "Connecting"),

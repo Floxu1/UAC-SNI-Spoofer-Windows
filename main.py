@@ -1,5 +1,44 @@
 from __future__ import annotations
 
+# --- UAC-TOR-RELAUNCH-WAIT-START ---
+def _uac_wait_relaunch_parent() -> None:
+    import ctypes as _ct
+    import os as _os
+    import tempfile as _tf
+    import time as _tm
+    from pathlib import Path as _P
+
+    marker = _P(_tf.gettempdir()) / "uac_spoofer_relaunch.pid"
+    if not marker.is_file():
+        return
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+        pid_s, _, ts_s = raw.partition(":")
+        old_pid = int(pid_s)
+        ts = float(ts_s or 0)
+        if old_pid == _os.getpid():
+            return
+        if abs(_tm.time() - ts) <= 30.0 and _os.name == "nt":
+            handle = _ct.windll.kernel32.OpenProcess(0x00100000, False, old_pid)
+            if handle:
+                try:
+                    _ct.windll.kernel32.WaitForSingleObject(handle, 12000)
+                finally:
+                    _ct.windll.kernel32.CloseHandle(handle)
+                _tm.sleep(0.2)
+    except Exception:
+        pass
+    finally:
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+_uac_wait_relaunch_parent()
+# --- UAC-TOR-RELAUNCH-WAIT-END ---
+
+
 import os
 import sys
 import ctypes

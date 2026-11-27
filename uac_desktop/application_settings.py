@@ -100,6 +100,13 @@ class ConnectionPreferences:
                        routing_mode=self.routing_mode, iran_direct=self.iran_direct,
                        kill_switch=self.kill_switch, domains_direct=self.domains_direct, ips_direct=self.ips_direct)
 
+    def for_tor(self, settings):
+        return replace(settings, connection_mode=self.connection_mode,
+                       routing_mode=self.routing_mode, iran_direct=self.iran_direct,
+                       kill_switch=False, domains_direct=self.domains_direct, ips_direct=self.ips_direct,
+                       dns_sinkhole=self.dns_sinkhole, webrtc_block=self.webrtc_block,
+                       quic_block=self.quic_block, ipv6_block=self.ipv6_block)
+
 
 class ApplicationSettings:
     """Application preferences backed by the existing desktop settings file."""
@@ -108,6 +115,9 @@ class ApplicationSettings:
     direct_legacy_fields = frozenset(("connection_mode", "routing_mode", "iran_direct", "kill_switch",
                                       "domains_direct", "ips_direct"))
     pow_legacy_fields = frozenset(asdict(ConnectionPreferences())) | {"exit_proxy_mode"}
+    tor_legacy_fields = frozenset(("connection_mode", "routing_mode", "iran_direct",
+                                   "kill_switch", "domains_direct", "ips_direct",
+                                   "dns_sinkhole", "webrtc_block", "quic_block", "ipv6_block"))
 
     def __init__(self, storage):
         self._storage = storage

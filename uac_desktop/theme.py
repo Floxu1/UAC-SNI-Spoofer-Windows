@@ -33,6 +33,11 @@ ENGINE_BRAND_PALETTES = {
         "edge": "#69452F", "tray": "#101316", "glass": "#5D3925",
         "pill_light": "#FFC293", "pill_dark": "#F7893E",
     },
+    "tor": {
+        "accent": "#B47AFF", "surface": "#120E1B", "tint": "#2A1B42",
+        "edge": "#533580", "tray": "#0C0914", "glass": "#42276B",
+        "pill_light": "#D7B8FF", "pill_dark": "#8F4DF0",
+    },
 }
 
 XRAY_DASHBOARD = {
@@ -90,6 +95,21 @@ DIRECT_PALETTE = {
     "steel": "#9b9089",
 }
 
+TOR_PALETTE = {
+    "background": "#0b0911",
+    "surface": "#14111d",
+    "border": "#2a233b",
+    "primary": "#9d5cff",
+    "accent": "#c08cff",
+    "text": "#f3effa",
+    "secondary": "#9e96b3",
+    "sidebar": "#100d18",
+    "raised": "#1d182b",
+    "selected": "#261b3d",
+    "violet_border": "#583d8a",
+    "steel": "#988eae",
+}
+
 IP_DETAILS_PALETTES = {
     "xray": dict(background="#0C1826", panel="#0D1F2E", wash="#133342", edge="#214657",
                  accent=XRAY_DASHBOARD["accent"], muted=XRAY_DASHBOARD["secondary"],
@@ -100,6 +120,9 @@ IP_DETAILS_PALETTES = {
     "direct": dict(background="#141618", panel="#1B1D1F", wash="#322820", edge="#493B30",
                    accent=ENGINE_BRAND_PALETTES["direct"]["accent"], muted="#ABB0B8",
                    text=DIRECT_PALETTE["text"], button_text="#22160D", error="#F18A98"),
+    "tor": dict(background="#100C18", panel="#171224", wash="#2A1C42", edge="#4B3475",
+                accent=ENGINE_BRAND_PALETTES["tor"]["accent"], muted="#AFA5C4",
+                text=TOR_PALETTE["text"], button_text="#160B26", error="#FF9BA9"),
 }
 
 NETWORK_METRICS = {
@@ -110,6 +133,8 @@ NETWORK_METRICS = {
     "pow": ("#0C1921", "#172832", "#11212B", "#29404C", "#173039", "#43DCBB", "#F0F6F8", "#A7B9C2"),
     "direct": ("#111214", "#202224", "#191C1E", "#303236", "#302720", DIRECT_PALETTE["primary"],
                DIRECT_PALETTE["text"], "#ABB0B8"),
+    "tor": ("#0F0C17", "#1D162B", "#151121", "#33284A", "#2A1E42", TOR_PALETTE["accent"],
+            TOR_PALETTE["text"], "#ABA0C2"),
 }
 
 APP_ROUTING_PALETTES = {
@@ -132,6 +157,13 @@ APP_ROUTING_PALETTES = {
         "accent": ENGINE_BRAND_PALETTES["direct"]["accent"], "text": DIRECT_PALETTE["text"], "muted": "#A6ABB2",
         "vpn": "#9CC6B6", "track_off": "#383B40", "thumb_on": "#FFF2E9",
     },
+    "tor": {
+        "background": TOR_PALETTE["background"], "surface": TOR_PALETTE["surface"],
+        "tile": TOR_PALETTE["raised"], "border": "#332A47",
+        "hover": "#231B36", "selected": "#261B3D", "selected_border": "#6F4AB3",
+        "accent": ENGINE_BRAND_PALETTES["tor"]["accent"], "text": TOR_PALETTE["text"], "muted": "#A89EC0",
+        "vpn": "#BFA3F5", "track_off": "#322A45", "thumb_on": "#F3EBFF",
+    },
 }
 
 def connection_wave_colors(engine):
@@ -139,6 +171,8 @@ def connection_wave_colors(engine):
         return POW_PALETTE["accent2"], POW_PALETTE["accent"]
     if engine == "xray":
         return XRAY_BLUE, XRAY_HUD_BLUE
+    if engine == "tor":
+        return TOR_PALETTE["primary"], TOR_PALETTE["accent"]
     return ()
 
 
@@ -159,6 +193,10 @@ def is_pow() -> bool:
 
 def is_direct() -> bool:
     return _STATE["engine"] == "direct"
+
+
+def is_tor() -> bool:
+    return _STATE["engine"] == "tor"
 
 
 def palette_version() -> int:
@@ -243,7 +281,26 @@ def _hex(rgb: tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 
-def map_hex(value: str, direct: bool = False) -> str:
+@lru_cache(maxsize=8192)
+def tor_rgba(r: int, g: int, b: int, alpha: int = 255) -> tuple[int, int, int]:
+    """Translate shared chrome colors to obsidian and violet for Tor."""
+    h, light, saturation = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+    if saturation < .10 or h * 360 < 74 or h * 360 > 326:
+        return r, g, b
+    if light < .27:
+        shade = min(44, round(12 + 110 * light))
+        return shade, max(8, shade - 4), min(68, shade + 14)
+    if light > .86:
+        return _hex_rgb(TOR_PALETTE["text"])
+    if saturation >= .52 and .39 <= light <= .83:
+        if alpha < 115:
+            return _hex_rgb(TOR_PALETTE["steel"])
+        role = "primary" if light < .65 else "accent"
+        return _hex_rgb(TOR_PALETTE[role])
+    return _hex_rgb(TOR_PALETTE["secondary"])
+
+
+def map_hex(value: str, direct: bool = False, tor: bool = False) -> str:
     text = value.strip()
     if not text.startswith("#"):
         return value
@@ -256,14 +313,14 @@ def map_hex(value: str, direct: bool = False) -> str:
         rgb = _hex_rgb(digits)
     except ValueError:
         return value
-    mapper = direct_rgba if direct else map_rgba
+    mapper = tor_rgba if tor else (direct_rgba if direct else map_rgba)
     return _hex(mapper(*rgb))
 
 
 def themed(value):
     """Colour string for the active theme (non-strings pass through)."""
-    if isinstance(value, str) and (is_pow() or is_direct()):
-        return map_hex(value, direct=is_direct())
+    if isinstance(value, str) and (is_pow() or is_direct() or is_tor()):
+        return map_hex(value, direct=is_direct(), tor=is_tor())
     return value
 
 
@@ -271,12 +328,12 @@ _HEX_RE = re.compile(r"(?<=[\s:,(])#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})\b")
 _RGB_RE = re.compile(r"rgba?\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*(?:,\s*([\d.]+)\s*)?\)")
 
 
-def map_css(text: str, direct: bool = False) -> str:
+def map_css(text: str, direct: bool = False, tor: bool = False) -> str:
     """Remap literal colors in the shared Qt stylesheet to an engine palette."""
-    mapper = direct_rgba if direct else map_rgba
+    mapper = tor_rgba if tor else (direct_rgba if direct else map_rgba)
 
     def _hex_sub(match: re.Match) -> str:
-        return map_hex("#" + match.group(1), direct=direct)
+        return map_hex("#" + match.group(1), direct=direct, tor=tor)
 
     def _rgb_sub(match: re.Match) -> str:
         r, g, b = (min(255, int(match.group(i))) for i in (1, 2, 3))

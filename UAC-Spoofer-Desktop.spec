@@ -33,6 +33,9 @@ datas = [
         'third_party/patterniha_sni_spoofing',
     ),
 ]
+import os as _os
+if _os.path.isdir('bin/tor'):
+    datas.append(('bin/tor', 'bin/tor'))
 datas += collect_data_files('pydivert.windivert_dll')
 
 a = Analysis(

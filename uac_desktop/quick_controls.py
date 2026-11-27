@@ -35,6 +35,15 @@ PALETTES = {
         "dropdown_hover": "#162A35", "dropdown_text": "#D1E7EB",
         "radius": 8,
     },
+    "tor": {
+        "surface": "#14111D", "tile": "#1B1629", "border": "#33294A",
+        "hover": "#231B36", "hover_border": "#583D8A", "action": "#261B3D",
+        "icon": "#C08CFF", "muted_icon": "#A396BD", "text": "#F3EFFA", "secondary": "#9E96B3",
+        "track_off": "#322A45", "track_on": "#8F4DF0", "thumb_off": "#A396BD", "thumb_on": "#F3EBFF",
+        "dropdown_surface": "#120E1B", "dropdown_border": "#423363", "dropdown_focus": "#B47AFF",
+        "dropdown_hover": "#231B36", "dropdown_text": "#E8DCFF",
+        "radius": 8,
+    },
 }
 
 _TILE_SELECTORS = (

@@ -49,7 +49,8 @@ def _file_description(path, version):
 
 def running_apps():
     protected = {os.path.basename(sys.executable).casefold(), "xray.exe", "sing-box.exe",
-                 "aether.exe", "uac-psiphon.exe", "uac_psiphon.exe"}
+                 "aether.exe", "uac-psiphon.exe", "uac_psiphon.exe",
+                 "tor.exe", "lyrebird.exe", "snowflake-client.exe", "conjure-client.exe"}
     processes = {}
     for process in psutil.process_iter(["name", "exe"]):
         name, path = process.info.get("name"), process.info.get("exe") or ""
@@ -68,7 +69,7 @@ def running_apps():
 def supports_process_routing(engine, output, mode):
     if mode == "all":
         return True
-    if engine == "pow":
+    if engine in ("pow", "tor"):
         return True
     if engine == "xray":
         return mode == "bypass"

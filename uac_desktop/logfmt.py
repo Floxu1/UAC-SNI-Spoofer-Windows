@@ -35,6 +35,8 @@ CATEGORY_TAGS: dict[str, tuple[str, str]] = {
     "SET": ("SET", "#b0bccb"),
     "APP": ("APP", "#8394a6"),
     "XRAY": ("XRAY", "#8fb8d8"),
+    "TOR": ("TOR", "#c08cff"),
+    "BRIDGE": ("BRIDGE", "#9f8cff"),
 }
 
 #: phase -> (English title, Persian title)
@@ -45,6 +47,7 @@ PHASES: dict[str, tuple[str, str]] = {
     "psiphon": ("Psiphon", "سایفون"),
     "speed": ("Speed features", "قابلیت‌های سرعت"),
     "direct": ("Direct route", "مسیر Direct"),
+    "tor": ("Tor network", "شبکه تور"),
     "connected": ("Connected", "وصل"),
     "drop": ("Drops / reconnects", "قطعی و اتصال دوباره"),
     "app": ("App", "برنامه"),
@@ -55,6 +58,7 @@ _CATEGORY_PHASE = {
     "PSIPHON": "psiphon", "PARALLEL": "speed", "LOWLAT": "speed", "H3": "speed",
     "DIRECT": "speed", "SPEED": "speed", "STATE": "connected", "DROP": "drop",
     "DIRECT_ENGINE": "direct",
+    "TOR": "tor", "BRIDGE": "tor",
     "NET": "connected", "SET": "app", "APP": "app", "XRAY": "app",
 }
 
@@ -82,6 +86,10 @@ _CATEGORY_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"^Direct (?:connected|paused|stopped)$"), "STATE"),
     (re.compile(r"^Direct IP (?:scan|sweep|\d)|^Direct range summary:"), "SCAN"),
     (re.compile(r"^Direct[ :]"), "DIRECT_ENGINE"),
+    (re.compile(r"^Tor bridge", re.I), "BRIDGE"),
+    (re.compile(r"^Tor (?:failed|disconnect error):"), "DROP"),
+    (re.compile(r"^Tor (?:connected|stopped)"), "STATE"),
+    (re.compile(r"^Tor[ :]"), "TOR"),
     (re.compile(r"^Speed options"), "SPEED"),
     (re.compile(r"^(?:Key|Cert)\b|^Key fetch|^Clean IP for key|^Clean-IP scan for the key|certificate", re.I), "KEY"),
     (re.compile(r"^Scan|^Rejected |^Accepted |^Saved clean|^Clean (?:HTTP|list)|clean address|^Trying saved clean", re.I), "SCAN"),
@@ -122,6 +130,11 @@ _REWRITES: list[tuple[re.Pattern, str, str, str, str]] = [
     (re.compile(r"^Direct recovering: (.+)$"), "Direct recovering: {1}", "بازیابی اتصال Direct: {1}", "warning", "reconnect"),
     (re.compile(r"^Direct failed: (.+)$"), "Direct failed: {1}", "اتصال Direct ناموفق بود: {1}", "error", "failed"),
     (re.compile(r"^Direct IP scan (\d+)$"), "Direct scanning {1} addresses", "Direct در حال اسکن {1} آدرس", "info", ""),
+    (re.compile(r"^Tor connecting: (.+)$"), "Tor connecting: {1}", "در حال اتصال Tor: {1}", "info", "start"),
+    (re.compile(r"^Tor bootstrap (\d+)% \(([^)]+)\): (.+)$"), "Tor bootstrap {1}% ({2}): {3}", "راه‌اندازی Tor {1}٪ ({2}): {3}", "info", ""),
+    (re.compile(r"^Tor connected (.+)$"), "Tor connected {1}", "Tor متصل شد {1}", "success", "connected"),
+    (re.compile(r"^Tor stopped$"), "Tor disconnected", "اتصال Tor قطع شد", "info", "stopped"),
+    (re.compile(r"^Tor failed: (.+)$"), "Tor failed: {1}", "اتصال Tor ناموفق بود: {1}", "error", "failed"),
     (re.compile(r"^TUN verified: DNS (\d+) ms, HTTPS (\d+) ms, exit (\S+) \((\S+)\)$"), "System tunnel verified ✔ (DNS {1} ms, HTTPS {2} ms, exit {3} {4})", "تونل سیستم بررسی شد ✔ (DNS {1} ms، HTTPS {2} ms، خروجی {3} {4})", "success", ""),
     (re.compile(r"^Another VPN is active: (.+)$"), "Another VPN is active ({1}); it can block the system tunnel. Turn it off for TUN", "یک VPN دیگر روشن است ({1}) و جلوی تونل سیستم را می‌گیرد؛ برای حالت TUN خاموشش کنید", "warning", ""),
     (re.compile(r"^UAC PoW leg lost: (.+)$"), "Tunnel leg lost: {1}", "یک بخش تونل قطع شد: {1}", "warning", ""),

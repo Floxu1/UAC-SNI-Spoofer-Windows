@@ -725,8 +725,8 @@ class SharedGlobalSettings(QWidget):
                 enabled = mode == "vpn"
                 note = (next_connect if busy else "") if enabled else tun_only
                 if key == "kill_switch":
-                    enabled = enabled and window.engine_mode != "xray" and not busy
-                    if window.engine_mode == "xray":
+                    enabled = enabled and window.engine_mode in ("pow", "direct") and not busy
+                    if window.engine_mode not in ("pow", "direct"):
                         note = window._ui_text("برای قطع اضطراری، PoW یا Direct را در حالت TUN انتخاب کنید.",
                                                "Use PoW or Direct in TUN mode for the kill switch.")
                     elif busy and mode == "vpn":
